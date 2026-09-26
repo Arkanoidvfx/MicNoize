@@ -3,12 +3,12 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    process::{ChildStdin, Command, Stdio},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 const CORE_MANIFEST_URL: &str =
@@ -30,8 +30,70 @@ const DRIVER_INSTANCE: &str = r"Root\ThinAudioGateway_4d699d4a\0000";
 const DRIVER_HARDWARE_ID: &str = "ThinAudioGateway_4d699d4a-65a5-40ec-9875-8e6d5fc01e0c";
 const DRIVER_DIR: &str = "vendor/tag-2.0.0.1903-demo";
 const NO_WINDOW: u32 = 0x08000000; // A GUI parent would otherwise flash a console.
+/// Bytes of the current phase done and in total; `STAGE` is `item << 8 | phase`.
 static DONE: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
+static STAGE: AtomicU32 = AtomicU32::new(0);
+
+/// Which component `install` works on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Item {
+    None,
+    Core,
+    Models,
+    Rvc,
+}
+/// What `install` does now. Every phase but `Connect` and `Place` counts bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    Connect,
+    Download,
+    /// The parts are joined into the archive and its SHA-256 checked in the same pass.
+    Verify,
+    /// The archive is fed to tar through its standard input: the bytes fed are the progress.
+    Unpack,
+    Place,
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Status {
+    pub item: Item,
+    pub phase: Phase,
+    pub done: u64,
+    pub total: u64,
+}
+impl Status {
+    pub fn share(&self) -> Option<f32> {
+        (self.total > 0).then(|| (self.done as f64 / self.total as f64).min(1.0) as f32)
+    }
+}
+impl Phase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Phase::Connect => "подключаемся",
+            Phase::Download => "скачиваем",
+            Phase::Verify => "проверяем",
+            Phase::Unpack => "распаковываем",
+            Phase::Place => "устанавливаем",
+        }
+    }
+}
+pub fn status() -> Status {
+    let stage = STAGE.load(Ordering::Relaxed);
+    let item = [Item::None, Item::Core, Item::Models, Item::Rvc][(stage >> 8).min(3) as usize];
+    let phase = [Phase::Connect, Phase::Download, Phase::Verify, Phase::Unpack, Phase::Place][(stage & 0xFF).min(4) as usize];
+    Status { item, phase, done: DONE.load(Ordering::Relaxed), total: TOTAL.load(Ordering::Relaxed) }
+}
+/// For the design snapshots.
+#[cfg(test)]
+pub fn fake_status(item: Item, phase: Phase, done: u64, total: u64) {
+    set_stage(item, phase, total);
+    DONE.store(done, Ordering::Relaxed);
+}
+fn set_stage(item: Item, phase: Phase, total: u64) {
+    DONE.store(0, Ordering::Relaxed);
+    TOTAL.store(total, Ordering::Relaxed);
+    STAGE.store((item as u32) << 8 | phase as u32, Ordering::Relaxed);
+}
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -75,6 +137,55 @@ pub fn models_installed(root: &Path, arch: &str) -> bool {
         && version.as_deref().map_or("3.0.0", str::trim) == MODELS_VERSION
 }
 
+/// The GPU architectures with NVIDIA denoiser models.
+pub const MODEL_ARCHS: [&str; 4] = ["turing", "ampere", "ada", "blackwell"];
+/// Nothing to download for `arch`: its models are current, or there are none for it.
+pub fn models_present(root: &Path, arch: Option<&str>) -> bool {
+    arch.is_none_or(|a| !MODEL_ARCHS.contains(&a) || models_installed(root, a))
+}
+
+/// A dead server fails the install instead of hanging it. The body has no limit: a gigabyte on a
+/// slow line takes long, and ureq has no idle timeout (the setup card shows a stall instead).
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into()
+}
+
+/// Why an install failed, in a few words for the setup card; app.log keeps the full text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reason {
+    Network,
+    Disk,
+    Corrupt,
+    Access,
+    Other,
+}
+pub fn reason(error: &str) -> Reason {
+    let e = error.to_lowercase();
+    let any = |needles: &[&str]| needles.iter().any(|n| e.contains(n));
+    if any(&["os error 112", "os error 39"]) {
+        Reason::Disk
+    } else if any(&["sha-256", "размер загруженной", "подпись"]) {
+        Reason::Corrupt
+    } else if any(&["os error 5)", "access is denied", "отказано в доступе"]) {
+        Reason::Access
+    } else if any(&["os error 100", "os error 110", "dns", "timeout", "timed out", "connection", "tls", "http status", "io:"]) {
+        Reason::Network
+    } else {
+        Reason::Other
+    }
+}
+
+/// Bytes per second over (time, bytes done) samples at least a second apart.
+pub fn rate(samples: &[(std::time::Instant, u64)]) -> Option<f64> {
+    let (&(t0, d0), &(t1, d1)) = (samples.first()?, samples.last()?);
+    let seconds = t1.duration_since(t0).as_secs_f64();
+    (seconds >= 1.0 && d1 > d0).then(|| (d1 - d0) as f64 / seconds)
+}
+
 pub fn driver_installed() -> bool {
     Command::new("reg")
         .args(["query", DRIVER_KEY, "/v", "Service"])
@@ -102,8 +213,8 @@ pub fn install_driver(root: &Path) -> Result<(), String> {
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
-        return Err("Виртуальный микрофон не установлен: нужны права администратора. \
-                    Перезапустите Mic Noize и подтвердите запрос Windows."
+        return Err("Установка отменена: нужны права администратора. \
+                    Нажмите кнопку ещё раз и подтвердите запрос Windows."
             .into());
     }
     if !driver_installed() {
@@ -136,13 +247,9 @@ fn quoted(path: &Path) -> String {
     path.display().to_string().replace('\'', "''")
 }
 
-pub fn progress() -> Option<u8> {
-    let total = TOTAL.load(Ordering::Relaxed);
-    (total > 0).then(|| ((DONE.load(Ordering::Relaxed).saturating_mul(100) / total).min(100)) as u8)
-}
-
 pub fn install_rvc(components: &Path) -> Result<String, String> {
     install(
+        Item::Rvc,
         RVC_MANIFEST_URL,
         components,
         "vendor/vcclient-2.1.4-alpha/dist/main/mnr_vcclient_server.exe",
@@ -156,6 +263,7 @@ pub fn install_core(components: &Path, arch: Option<&str>) -> Result<String, Str
     let mut version = String::new();
     if !core_installed(components) {
         version = install(
+            Item::Core,
             CORE_MANIFEST_URL,
             components,
             "vendor/nvidia-afx-3.0.0/bin/NVAudioEffects.dll",
@@ -165,11 +273,12 @@ pub fn install_core(components: &Path, arch: Option<&str>) -> Result<String, Str
             ],
         )?;
     }
-    if let Some(arch) = arch.filter(|a| ["turing", "ampere", "ada", "blackwell"].contains(a))
+    if let Some(arch) = arch.filter(|a| MODEL_ARCHS.contains(a))
         && !models_installed(components, arch)
     {
         let entry = format!("{MODELS_DIR}/{arch}");
         let models = install(
+            Item::Models,
             &format!("{MODELS_RELEASE}/models-{arch}.json"),
             components,
             &format!("{entry}/denoiser_48k.trtpkg"),
@@ -184,13 +293,14 @@ pub fn install_core(components: &Path, arch: Option<&str>) -> Result<String, Str
 }
 
 fn install(
+    item: Item,
     manifest_url: &str,
     components: &Path,
     expected: &str,
     entries: &[&str],
 ) -> Result<String, String> {
-    DONE.store(0, Ordering::Relaxed);
-    let mut response = ureq::get(manifest_url).call().map_err(|e| e.to_string())?;
+    set_stage(item, Phase::Connect, 0);
+    let mut response = agent().get(manifest_url).call().map_err(|e| e.to_string())?;
     let envelope: Envelope = serde_json::from_str(
         &response
             .body_mut()
@@ -203,10 +313,8 @@ fn install(
     if manifest.parts.is_empty() {
         return Err("Манифест не содержит частей архива".into());
     }
-    TOTAL.store(
-        manifest.parts.iter().map(|p| p.size).sum(),
-        Ordering::Relaxed,
-    );
+    let total = manifest.parts.iter().map(|p| p.size).sum();
+    set_stage(item, Phase::Download, total);
     let work = components.join(".download-rvc");
     let stage = components.join(".stage-rvc");
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -215,23 +323,17 @@ fn install(
     }
     std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
     let archive = work.join("rvc-runtime.tar.zst");
-    let _ = std::fs::remove_file(&archive);
+    let mut paths = Vec::with_capacity(manifest.parts.len());
     for (index, part) in manifest.parts.iter().enumerate() {
         let path = work.join(format!("part-{index:03}"));
         download(part, &path)?;
-        append(&path, &archive)?;
+        paths.push(path);
     }
-    check_hash(&archive, &manifest.archive_sha256)?;
-    let status = std::process::Command::new("tar.exe")
-        .args(["-xf"])
-        .arg(&archive)
-        .arg("-C")
-        .arg(&stage)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Не удалось распаковать компонент".into());
-    }
+    set_stage(item, Phase::Verify, total);
+    assemble(&paths, &archive, &manifest.archive_sha256)?;
+    set_stage(item, Phase::Unpack, total);
+    unpack(&archive, &stage)?;
+    set_stage(item, Phase::Place, 0);
     if !stage.join(expected).is_file() {
         return Err("Архив компонента не содержит ожидаемый файл".into());
     }
@@ -284,7 +386,7 @@ fn download(part: &Part, path: &Path) -> Result<(), String> {
         DONE.fetch_add(part.size, Ordering::Relaxed);
         return Ok(());
     }
-    let response = ureq::get(&part.url).call().map_err(|e| e.to_string())?;
+    let response = agent().get(&part.url).call().map_err(|e| e.to_string())?;
     let mut reader = response.into_parts().1.into_reader();
     let mut output = File::create(path).map_err(|e| e.to_string())?;
     let mut buffer = [0_u8; 1024 * 1024];
@@ -311,15 +413,60 @@ fn cached_part_is_valid(part: &Part, path: &Path) -> bool {
         && check_hash(path, &part.sha256).is_ok()
 }
 
-fn append(part: &Path, archive: &Path) -> Result<(), String> {
-    let mut input = File::open(part).map_err(|e| e.to_string())?;
-    let mut output = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(archive)
+/// Joins the parts into the archive and checks the archive's SHA-256 in the same pass.
+fn assemble(parts: &[PathBuf], archive: &Path, expected: &str) -> Result<(), String> {
+    let mut output = File::create(archive).map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for part in parts {
+        let mut input = File::open(part).map_err(|e| e.to_string())?;
+        loop {
+            let count = input.read(&mut buffer).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count]).map_err(|e| e.to_string())?;
+            hash.update(&buffer[..count]);
+            DONE.fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+    if hex::encode(hash.finalize()).eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!("SHA-256 не совпадает: {}", archive.display()))
+    }
+}
+
+/// Unpacks through tar's standard input; tar reads as it writes, so the bytes fed track it.
+fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
+    let mut tar = Command::new("tar.exe")
+        .args(["-xf", "-", "-C"])
+        .arg(stage)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(NO_WINDOW)
+        .spawn()
         .map_err(|e| e.to_string())?;
-    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
-    Ok(())
+    let fed = feed(archive, tar.stdin.take().ok_or("tar без stdin")?);
+    let status = tar.wait().map_err(|e| e.to_string())?;
+    match fed {
+        Ok(()) if status.success() => Ok(()),
+        _ => Err("Не удалось распаковать компонент".into()),
+    }
+}
+/// A tar that stops early breaks the pipe; its exit status then tells the error.
+fn feed(archive: &Path, mut input: ChildStdin) -> std::io::Result<()> {
+    let mut file = File::open(archive)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        input.write_all(&buffer[..count])?;
+        DONE.fetch_add(count as u64, Ordering::Relaxed);
+    }
 }
 
 fn check_hash(path: &Path, expected: &str) -> Result<(), String> {
@@ -386,6 +533,58 @@ mod tests {
         std::fs::write(dir.join("version.txt"), format!("{MODELS_VERSION}\r\n")).unwrap();
         assert!(models_installed(&root, "ada"));
         assert!(!models_installed(&root, "turing"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn rate_needs_a_second_and_progress() {
+        let t = std::time::Instant::now();
+        let at = |ms| t + std::time::Duration::from_millis(ms);
+        assert_eq!(rate(&[]), None);
+        assert_eq!(rate(&[(t, 0), (at(500), 10)]), None, "too short to tell");
+        assert_eq!(rate(&[(t, 5), (at(2000), 5)]), None, "stalled");
+        assert_eq!(rate(&[(t, 0), (at(700), 1), (at(2000), 4_000_000)]), Some(2_000_000.0));
+        assert!(models_present(Path::new("nowhere"), None) && models_present(Path::new("nowhere"), Some("pascal")));
+        assert!(!models_present(Path::new("nowhere"), Some("ada")));
+    }
+    #[test]
+    fn install_errors_get_a_reason() {
+        assert_eq!(reason("io: Connection reset by peer (os error 10054)"), Reason::Network);
+        assert_eq!(reason("dns failed: No such host is known. (os error 11001)"), Reason::Network);
+        assert_eq!(reason("timeout: connect"), Reason::Network);
+        assert_eq!(reason("http status: 404"), Reason::Network);
+        assert_eq!(reason("There is not enough space on the disk. (os error 112)"), Reason::Disk);
+        assert_eq!(reason(r"SHA-256 не совпадает: C:\x\part-000"), Reason::Corrupt);
+        assert_eq!(reason("Access is denied. (os error 5)"), Reason::Access);
+        assert_eq!(reason("Не удалось распаковать компонент"), Reason::Other);
+    }
+    #[test]
+    fn archive_is_joined_checked_and_unpacked_with_progress() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.tmp/component-unpack-test").join(std::process::id().to_string());
+        let (source, out) = (root.join("src"), root.join("out"));
+        std::fs::create_dir_all(source.join("vendor")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(source.join("vendor/x.dll"), vec![7_u8; 300_000]).unwrap();
+        let packed = root.join("whole.tar.zst");
+        let packing = Command::new("tar.exe").arg("--zstd").arg("-cf").arg(&packed).arg("-C").arg(&source).arg("vendor").status().unwrap();
+        assert!(packing.success());
+        let bytes = std::fs::read(&packed).unwrap();
+        let (a, b) = bytes.split_at(bytes.len() / 2);
+        std::fs::write(root.join("part-000"), a).unwrap();
+        std::fs::write(root.join("part-001"), b).unwrap();
+        let parts = [root.join("part-000"), root.join("part-001")];
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let archive = root.join("archive.tar.zst");
+        assert!(assemble(&parts, &archive, &"0".repeat(64)).is_err(), "a wrong hash is refused");
+        set_stage(Item::Core, Phase::Verify, bytes.len() as u64);
+        assemble(&parts, &archive, &sha).unwrap();
+        assert_eq!(status().share(), Some(1.0));
+        set_stage(Item::Core, Phase::Unpack, bytes.len() as u64);
+        unpack(&archive, &out).unwrap();
+        assert_eq!(status(), Status { item: Item::Core, phase: Phase::Unpack, done: bytes.len() as u64, total: bytes.len() as u64 });
+        assert_eq!(std::fs::read(out.join("vendor/x.dll")).unwrap().len(), 300_000);
+        std::fs::write(&archive, b"not an archive").unwrap();
+        std::fs::create_dir_all(root.join("bad")).unwrap();
+        assert!(unpack(&archive, &root.join("bad")).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]

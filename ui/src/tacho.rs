@@ -78,8 +78,17 @@ pub struct Tacho<'a, Message> {
     phase: f32,
     clock: Clock,
     enabled: bool,
+    /// Overload is on (boost's hard clipping): the lit segments run hot and judder.
+    overdrive: bool,
+    /// The mouse wheel moves it a step per notch; off inside scrolling lists.
+    wheel: bool,
     width: Length,
 }
+/// Drag pixels per step where the track has fewer than this many pixels per step: there the
+/// value follows the drag's distance, not the cursor, so every step can be hit.
+const FINE_PX: f32 = 2.0;
+/// Touchpad pixels per wheel step.
+const WHEEL_PX: f32 = 24.0;
 
 pub fn tacho<'a, Message>(
     range: RangeInclusive<f32>,
@@ -102,6 +111,8 @@ pub fn tacho<'a, Message>(
         phase: 0.0,
         clock,
         enabled: true,
+        overdrive: false,
+        wheel: true,
         width: Length::Fill,
     }
 }
@@ -117,6 +128,8 @@ impl<'a, Message> Tacho<'a, Message> {
     /// Milliseconds the idle wave lags behind the shared clock, to chain sliders.
     pub fn phase(mut self, ms: f32) -> Self { self.phase = ms; self }
     pub fn enabled(mut self, enabled: bool) -> Self { self.enabled = enabled; self }
+    pub fn overdrive(mut self, on: bool) -> Self { self.overdrive = on; self }
+    pub fn wheel(mut self, on: bool) -> Self { self.wheel = on; self }
     pub fn width(mut self, width: impl Into<Length>) -> Self { self.width = width.into(); self }
 
     fn frac(&self, v: f32) -> f32 {
@@ -166,8 +179,25 @@ impl<'a, Message> Tacho<'a, Message> {
     fn locate(&self, track: Rectangle, x: f32) -> f32 {
         let (min, max) = (*self.range.start(), *self.range.end());
         let t = ((x - track.x) / track.width).clamp(0.0, 1.0);
-        let v = min + t * (max - min);
-        ((v - min) / self.step).round() * self.step + min
+        self.snap(min + t * (max - min))
+    }
+    /// The nearest step, inside the range.
+    fn snap(&self, v: f32) -> f32 {
+        let (min, max) = (*self.range.start(), *self.range.end());
+        (((v - min) / self.step).round() * self.step + min).clamp(min, max)
+    }
+    /// The value a drag to `x` sets, and the anchor for the next move. The press anchors the
+    /// drag at (x, value). On a dense track the value moves a step per `FINE_PX` from there;
+    /// past an end the anchor moves along, so turning back answers at once.
+    fn dragged(&self, track: Rectangle, anchor: (f32, f32), x: f32) -> (f32, (f32, f32)) {
+        let steps = ((*self.range.end() - *self.range.start()) / self.step).max(1.0);
+        if track.width / steps >= FINE_PX {
+            return (self.locate(track, x), anchor);
+        }
+        let (x0, v0) = anchor;
+        let v = v0 + ((x - x0) / FINE_PX).round() * self.step;
+        let snapped = self.snap(v);
+        (snapped, if (snapped - v).abs() > self.step * 0.5 { (x, snapped) } else { anchor })
     }
 }
 
@@ -184,6 +214,10 @@ struct State {
     peak: Option<(i32, Instant)>,
     touched: Option<Instant>,
     frame: Option<Instant>,
+    /// Where the drag was pressed or last re-anchored: (x, value).
+    anchor: (f32, f32),
+    /// Wheel notches not applied yet (touchpads send fractions).
+    wheel: f32,
     painted: Painted,
 }
 
@@ -224,8 +258,10 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                     if state.mods.command() {
                         publish(self.default, shell);
                     } else {
-                        publish(self.locate(track, p.x), shell);
+                        let v = self.locate(track, p.x);
+                        publish(v, shell);
                         state.drag = true;
+                        state.anchor = (p.x, v);
                     }
                     state.touched = Some(Instant::now());
                     shell.capture_event();
@@ -238,8 +274,25 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 shell.request_redraw();
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => {
-                publish(self.locate(track, position.x), shell);
+                let (v, anchor) = self.dragged(track, state.anchor, position.x);
+                state.anchor = anchor;
+                publish(v, shell);
                 state.touched = Some(Instant::now());
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if self.enabled && self.wheel && cursor.is_over(hit) => {
+                state.wheel += match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / WHEEL_PX,
+                };
+                let whole = state.wheel.trunc();
+                if whole != 0.0 {
+                    state.wheel -= whole;
+                    publish(self.snap(self.value + whole * self.step), shell);
+                    state.touched = Some(Instant::now());
+                    shell.request_redraw();
+                }
+                // Over a slider the wheel is the slider's: the page does not scroll under it.
                 shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.mods = *m,
@@ -315,6 +368,13 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         let press = if state.drag { 1.2 } else { 1.0 };
         let w = self.seg_width();
         let mut shapes = Vec::with_capacity(n * 6);
+        // Overdrive judders at about 15 frames a second, like a clipping signal.
+        let judder = (now.saturating_duration_since(self.clock.epoch).as_millis() / 66) as u32;
+        let overdrive = self.overdrive && self.enabled;
+        if overdrive && ignition.is_none() {
+            // The ceiling the clipped signal keeps hitting.
+            slant(&mut shapes, track.x - 2.0, track.y - 4.0, track.width + 4.0, 1.5, 0.0, Color { a: 0.55, ..HOT });
+        }
         for i in 0..n {
             let ii = i as i32;
             let mut lit = ii >= lo && ii < hi;
@@ -347,6 +407,13 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             let x = self.seg_x(track, i);
             let mut height = track.height * press;
+            if overdrive && lit && ignition.is_none() {
+                // Hot from the first lit segment, with ragged, flickering tops.
+                let t = (i as f32 / n as f32).powf(0.7);
+                let base = if is_head { Color::from_rgb8(0xFF, 0xD0, 0xC8) } else { Color { r: TAG.r + (HOT.r - TAG.r) * t, g: TAG.g + (HOT.g - TAG.g) * t, b: TAG.b + (HOT.b - TAG.b) * t, a: 1.0 } };
+                color = brighten(base, grain(i as u32 + 31, judder) * 0.5);
+                height *= 0.8 + 0.2 * grain(i as u32, judder);
+            }
             let mut lift = 0.0;
             let mut glow = 0.0;
             if is_head && let Some(t) = flash {
@@ -362,7 +429,9 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 color = brighten(color, glow);
             }
             let y = track.y + track.height + lift - height;
-            if self.enabled && is_head {
+            if overdrive && is_head {
+                halo(&mut shapes, x, y, w, height, if self.compact { 8.0 } else { 12.0 }, Color { a: 0.6, ..HOT });
+            } else if self.enabled && is_head {
                 halo(&mut shapes, x, y, w, height, if self.compact { 7.0 } else { 11.0 }, Color { a: 0.6, ..GLOW });
             } else if self.enabled && hot {
                 halo(&mut shapes, x, y, w, height, 6.0, Color { a: 0.35 * pulse, ..HOT });
@@ -381,7 +450,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             let shown = if state.ready { state.shown } else { self.value };
             (self.format)((shown / self.step).round() * self.step)
         };
-        let red_text = in_red && ignition.is_none();
+        let red_text = (in_red || overdrive) && ignition.is_none();
         if self.compact {
             state.painted.draw(renderer, bounds.expand(24.0), shapes);
             put(
@@ -467,7 +536,7 @@ impl<Message> Tacho<'_, Message> {
         if busy {
             return Some(frame_after(now));
         }
-        if self.in_red(self.value) && self.enabled {
+        if (self.in_red(self.value) || self.overdrive) && self.enabled {
             return Some(soon(33));
         }
         if let Some(t) = state.touched {
@@ -1177,12 +1246,23 @@ pub struct Mosaic {
 pub const MOSAIC_CELL: f32 = 4.0;
 const BLOCK_MAX: f32 = 48.0;
 /// The page switch: the new page is drawn sharp from the very first frame, as without the
-/// effect, and its own mosaic lies over it and resolves: (block side in logical px, opacity).
-/// Nothing waits for the animation; it only marks the change.
-const SHIFT: [(f32, f32); 2] = [(12.0, 0.85), (7.0, 0.4)];
-/// How long each step stays. The whole switch takes 2 × 11 ms, about one 74 Hz refresh a step;
-/// a missed step only shortens the fade.
-const SHIFT_STEP: Duration = Duration::from_millis(11);
+/// effect, and its own mosaic lies over it and dissolves in a wave from left to right while the
+/// blocks shrink. Nothing waits for the animation; it only marks the change. Two bare steps
+/// read as a rendering glitch, so the dissolve takes ten.
+const SHIFT_STEPS: usize = 10;
+/// How long each step stays: the whole switch takes 10 × 12 ms. A late frame skips ahead.
+const SHIFT_STEP: Duration = Duration::from_millis(12);
+/// Step `step`: the block side in logical px, and the mosaic's opacity at `u` (0 left edge, 1 right).
+fn shift_step(step: usize, u: f32) -> (f32, f32) {
+    let t = step as f32 / (SHIFT_STEPS - 1) as f32;
+    let ease = t * t * (3.0 - 2.0 * t);
+    let block = 16.0 - 11.0 * ease;
+    // The wave crosses the page over the whole switch; each column fades evenly behind it.
+    let local = (t * 1.5 - u * 0.5).clamp(0.0, 1.0);
+    // Opacity in steps of 0.1: neighbours in one band merge into one shape.
+    let alpha = (0.9 * (1.0 - local) * 10.0).round() / 10.0;
+    (block, alpha)
+}
 /// The page area's last laid-out size, so pages can be painted offscreen at the same size.
 // ponytail: one window, one page area; a per-window map if the UI ever opens a second one.
 static PAGE_AREA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1239,7 +1319,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
             let state = tree.state.downcast_mut::<ShiftState>();
             let step = state.frame(*start, *now);
             match state.first {
-                Some(first) if step < SHIFT.len() => shell.request_redraw_at(RedrawRequest::At(first + SHIFT_STEP * (step as u32 + 1))),
+                Some(first) if step < SHIFT_STEPS => shell.request_redraw_at(RedrawRequest::At(first + SHIFT_STEP * (step as u32 + 1))),
                 _ => shell.publish(self.done.clone()),
             }
         }
@@ -1254,27 +1334,29 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
         } else {
             (Instant::now().saturating_duration_since(*start).as_millis() / SHIFT_STEP.as_millis()) as usize
         };
-        let Some(&(block, alpha)) = SHIFT.get(step) else { return };
+        if step >= SHIFT_STEPS {
+            return;
+        }
         // Any whole-pixel block size, sampled from the fixed small mosaic.
-        let side = block.round().max(MOSAIC_CELL);
+        let side = shift_step(step, 0.0).0.round().max(MOSAIC_CELL);
         let (cols, rows) = ((b.width / side).ceil() as usize, (b.height / side).ceil() as usize);
         // One cached geometry for the whole mosaic: the window then repaints a single region per
         // frame. Thousands of separate quads made it repaint the page dozens of times a frame.
         let mut shapes = Vec::new();
         for row in 0..rows {
-            // Merge equal neighbours into one shape: flat backgrounds cost one per row.
-            let mut run: Option<(usize, [u8; 3])> = None;
+            // Merge equal neighbours of one opacity band into one shape.
+            let mut run: Option<(usize, [u8; 3], f32)> = None;
             for col in 0..=cols {
-                let color = (col < cols).then(|| {
+                let cell = (col < cols).then(|| {
                     let (u0, v0) = (col as f32 * side / b.width, row as f32 * side / b.height);
                     let (u1, v1) = (((col + 1) as f32 * side / b.width).min(1.0), ((row + 1) as f32 * side / b.height).min(1.0));
-                    sample(page, u0, v0, u1, v1).map(|v| v.round() as u8)
+                    (sample(page, u0, v0, u1, v1).map(|v| v.round() as u8), shift_step(step, (u0 + u1) / 2.0).1)
                 });
                 let same = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 3);
-                match (run, color) {
-                    (Some((_, c)), Some(next)) if same(c, next) => {}
+                match (run, cell) {
+                    (Some((_, c, a)), Some((next, alpha))) if a == alpha && same(c, next) => {}
                     (current, next) => {
-                        if let Some((first, c)) = current {
+                        if let Some((first, c, alpha)) = current.filter(|r| r.2 > 0.0) {
                             // A hair of overlap hides anti-aliased seams.
                             slant(
                                 &mut shapes,
@@ -1286,7 +1368,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
                                 Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) },
                             );
                         }
-                        run = next.map(|c| (col, c));
+                        run = next.map(|(c, alpha)| (col, c, alpha));
                     }
                 }
             }
@@ -1311,6 +1393,8 @@ pub enum BarStage {
     /// Installed; the new version is starting. The full green bar carries a sweeping gleam timed
     /// by the wall clock, so the watcher and the new UI draw the very same frame at hand-over.
     Launching,
+    /// A known share (0..1) lit from the left, its last segment brightest.
+    Filled(f32),
 }
 const GLEAM_MS: u128 = 1400;
 /// Where the gleam is (0..1 over the bar, beyond it between sweeps), from the wall clock.
@@ -1321,18 +1405,32 @@ fn gleam() -> f32 {
 
 /// The update window's bar in the sliders' segment style.
 pub fn run_bar<'a, Message: 'a>(stage: BarStage) -> Element<'a, Message> {
-    Element::new(RunBar { stage })
+    Element::new(RunBar { stage, compact: false })
+}
+/// The setup card's bar: the same segments, smaller, as many as fit the width.
+pub fn progress_bar<'a, Message: 'a>(stage: BarStage) -> Element<'a, Message> {
+    Element::new(RunBar { stage, compact: true })
 }
 struct RunBar {
     stage: BarStage,
+    compact: bool,
 }
 const BAR_SEGMENTS: usize = 24;
 const BAR_BLOCK: usize = 5;
 const BAR_STEP_MS: u64 = 30;
 impl RunBar {
-    fn position(&self, now: Instant) -> usize {
+    /// Segment width and height.
+    fn cell(&self) -> (f32, f32) {
+        if self.compact { (9.0, 12.0) } else { (13.0, 20.0) }
+    }
+    fn segments(&self, width: f32) -> usize {
+        let (_, h) = self.cell();
+        if self.compact { ((width - h * SKEW) / 13.0).floor().max(8.0) as usize } else { BAR_SEGMENTS }
+    }
+    /// The running block's head (one past its last lit segment) over `n` segments.
+    fn position(&self, now: Instant, n: usize) -> usize {
         match self.stage {
-            BarStage::Running(since) => (now.saturating_duration_since(since).as_millis() as u64 / BAR_STEP_MS) as usize % (BAR_SEGMENTS + BAR_BLOCK),
+            BarStage::Running(since) => (now.saturating_duration_since(since).as_millis() as u64 / BAR_STEP_MS) as usize % (n + n * BAR_BLOCK / BAR_SEGMENTS),
             _ => 0,
         }
     }
@@ -1341,10 +1439,10 @@ impl<Message> Widget<Message, Theme, Renderer> for RunBar {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<Painted>() }
     fn state(&self) -> tree::State { tree::State::new(Painted::default()) }
     fn size(&self) -> Size<Length> {
-        Size { width: Length::Fill, height: Length::Fixed(20.0) }
+        Size { width: Length::Fill, height: Length::Fixed(self.cell().1) }
     }
     fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
-        layout::atomic(limits, Length::Fill, Length::Fixed(20.0))
+        layout::atomic(limits, Length::Fill, Length::Fixed(self.cell().1))
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
         if let (Event::Window(window::Event::RedrawRequested(now)), BarStage::Launching) = (event, self.stage) {
@@ -1359,22 +1457,29 @@ impl<Message> Widget<Message, Theme, Renderer> for RunBar {
     }
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
-        let (w, h) = (13.0, 20.0);
-        let pos = self.position(Instant::now());
-        let mut shapes = Vec::with_capacity(BAR_SEGMENTS * 2);
+        let (w, h) = self.cell();
+        let n = self.segments(b.width);
+        let block = n * BAR_BLOCK / BAR_SEGMENTS;
+        let pos = self.position(Instant::now(), n);
+        let mut shapes = Vec::with_capacity(n * 2);
         let green = |t: f32| {
             let (lo, hi) = ([36.0, 84.0, 52.0], [111.0, 217.0, 138.0]);
             let c = |i: usize| (lo[i] + (hi[i] - lo[i]) * t) / 255.0;
             Color::from_rgb(c(0), c(1), c(2))
         };
-        for i in 0..BAR_SEGMENTS {
-            let x = b.x + (h * SKEW / 2.0) + (b.width - w - h * SKEW) * i as f32 / (BAR_SEGMENTS - 1) as f32;
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            let x = b.x + (h * SKEW / 2.0) + (b.width - w - h * SKEW) * i as f32 / (n - 1) as f32;
             let lit = match self.stage {
-                BarStage::Running(_) => (i < pos && i + BAR_BLOCK >= pos).then(|| if i + 1 == pos { HEAD } else { lerp(i as f32 / BAR_SEGMENTS as f32) }),
-                BarStage::Done => Some(if i + 1 == BAR_SEGMENTS { Color::from_rgb8(0xD9, 0xFF, 0xE2) } else { green(i as f32 / BAR_SEGMENTS as f32) }),
+                BarStage::Running(_) => (i < pos && i + block >= pos).then(|| if i + 1 == pos { HEAD } else { lerp(t) }),
+                BarStage::Done => Some(if i + 1 == n { Color::from_rgb8(0xD9, 0xFF, 0xE2) } else { green(t) }),
                 BarStage::Launching => {
-                    let d = ((i as f32 + 0.5) / BAR_SEGMENTS as f32 - gleam()).abs() / 0.12;
-                    Some(brighten(green(0.35 + 0.65 * i as f32 / BAR_SEGMENTS as f32), (1.0 - d).max(0.0) * 1.6))
+                    let d = ((i as f32 + 0.5) / n as f32 - gleam()).abs() / 0.12;
+                    Some(brighten(green(0.35 + 0.65 * t), (1.0 - d).max(0.0) * 1.6))
+                }
+                BarStage::Filled(share) => {
+                    let lit = (share.clamp(0.0, 1.0) * n as f32).ceil() as usize;
+                    (i < lit).then(|| if i + 1 == lit && lit < n { HEAD } else { lerp(t) })
                 }
                 BarStage::Waiting => None,
             };
@@ -1636,17 +1741,41 @@ mod tests {
         assert_eq!(s.lit(6.0), (8, 12, 11));
     }
     #[test]
+    fn dense_sliders_drag_a_step_at_a_time() {
+        let clock = Clock { epoch: Instant::now(), opened: None, animate: false, idle: false };
+        let track = Rectangle { x: 0.0, y: 0.0, width: 190.0, height: 16.0 };
+        // Boost: 1900 steps on 190 px; the press lands on 300, then every 2 px is one step.
+        let boost = tacho(100.0..=2000.0, 300.0, |v| v, clock);
+        let anchor = (20.0, 300.0);
+        assert_eq!(boost.dragged(track, anchor, 22.0).0, 301.0);
+        assert_eq!(boost.dragged(track, anchor, 20.8).0, 300.0, "less than a step stays");
+        assert_eq!(boost.dragged(track, anchor, 12.0).0, 296.0);
+        let (end, moved) = boost.dragged(track, anchor, -2000.0);
+        assert_eq!(end, 100.0);
+        assert_eq!(boost.dragged(track, moved, moved.0 + 2.0).0, 101.0, "turning back at the end answers at once");
+        // Pitch: 24 steps on 190 px follow the cursor itself.
+        let pitch = tacho(-12.0..=12.0, 0.0, |v| v, clock);
+        assert_eq!(pitch.dragged(track, (95.0, 0.0), 190.0).0, 12.0);
+        assert_eq!(boost.snap(299.6), 300.0);
+        assert_eq!(boost.snap(5000.0), 2000.0);
+    }
+    #[test]
     fn page_shift_starts_at_its_first_frame() {
         let start = Instant::now();
         let ms = |v: u64| start + Duration::from_millis(v);
         let mut s = ShiftState::default();
         assert_eq!(s.frame(start, ms(9)), 0, "a late first frame still shows the first step");
         assert_eq!(s.frame(start, ms(14)), 0, "an early redraw keeps the step");
-        assert_eq!(s.frame(start, ms(18)), 1, "2 ms early still counts");
-        assert!(s.frame(start, ms(80)) >= SHIFT.len(), "a late frame ends the fade, never stretches it");
-        assert_eq!(s.frame(start + Duration::from_millis(1), ms(90)), 0, "a new switch starts over");
-        assert!(SHIFT.windows(2).all(|w| w[0].0 > w[1].0 && w[0].1 > w[1].1), "blocks and opacity only resolve");
-        assert!(SHIFT[0].1 < 1.0, "the new page shows through from the first frame");
+        assert_eq!(s.frame(start, ms(19)), 1, "2 ms early still counts");
+        assert!(s.frame(start, ms(200)) >= SHIFT_STEPS, "a late frame ends the fade, never stretches it");
+        assert_eq!(s.frame(start + Duration::from_millis(1), ms(210)), 0, "a new switch starts over");
+        for u in [0.0, 0.5, 1.0] {
+            let steps: Vec<_> = (0..SHIFT_STEPS).map(|i| shift_step(i, u)).collect();
+            assert!(steps.windows(2).all(|w| w[0].0 >= w[1].0 && w[0].1 >= w[1].1), "blocks and opacity only resolve at {u}");
+            assert!(steps[0].1 < 1.0, "the new page shows through from the first frame");
+            assert_eq!(steps[SHIFT_STEPS - 1].1, 0.0, "the last step leaves the page clean");
+        }
+        assert!(shift_step(4, 0.0).1 < shift_step(4, 1.0).1, "the left edge dissolves first");
     }
     #[test]
     fn morph_events_restart_with_each_morph() {

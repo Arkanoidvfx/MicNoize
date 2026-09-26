@@ -30,8 +30,6 @@ use std::{
 };
 
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-const DRIVER_INSTALL_MESSAGE: &str =
-    "Устанавливаем виртуальный микрофон: подтвердите запрос Windows…";
 const DEVICE_REPAIRED: &str = "Устройство восстановлено";
 const DEVICE_REPAIRING: &str = "Проверяем и восстанавливаем виртуальное устройство…";
 const EXIT_EVENT: u32 = 2;
@@ -292,6 +290,10 @@ mod focus {
         pub const HEADPHONE_GEAR: usize = 81;
         pub const ROUTE: usize = 82;
         pub const REVERSE_WORD: usize = 83;
+        /// The first-run setup card: retry the download, install the virtual microphone.
+        pub const SETUP_RETRY: usize = 84;
+        pub const SETUP_DRIVER: usize = 85;
+        pub const SETUP_SETTINGS: usize = 86;
     }
     pub mod rvc {
         pub const ENABLE: usize = 24;
@@ -316,6 +318,7 @@ mod focus {
         pub const VOLUME: usize = 54;
         pub const PITCH: usize = 55;
         pub const REVERSE: usize = 56;
+        pub const LINES: usize = 87;
     }
 }
 static RESTART: AtomicBool = AtomicBool::new(false);
@@ -492,7 +495,11 @@ enum Msg {
     RvcInstall,
     RvcInstalled(Result<String, String>),
     CoreInstalled(Result<String, String>),
+    /// The setup card's «Повторить» after a failed component download.
+    RetryCore,
     InstallDriver,
+    /// The headphone panel's «Освободить место»: device repair with the line transfer ticked.
+    HeadphoneLines,
     Repair,
     RepairReinstall(bool),
     RepairLines(bool),
@@ -686,6 +693,18 @@ struct App {
     core_installing: bool,
     driver_installing: bool,
     driver_ready: bool,
+    /// The device lists arrived once: before that a missing microphone is no problem yet.
+    devices_known: bool,
+    core_present: bool,
+    /// This GPU's denoiser models are on disk, or it has none to download.
+    models_present: bool,
+    setup_error: String,
+    driver_error: String,
+    /// Recent (time, bytes done) of the running install phase, for its speed.
+    transfer: Vec<(Instant, u64)>,
+    transfer_stage: Option<(components::Item, components::Phase)>,
+    /// When the install's bytes last moved: a long pause shows as a stall.
+    transfer_moved: Instant,
     device_state: engine::DeviceState,
     device_detail: String,
     repair_confirm: bool,
@@ -994,9 +1013,9 @@ impl App {
         let gpu = if cfg!(test) { Err(String::new()) } else { engine::gpu() };
         let arch = gpu.as_ref().ok().map(|(arch, _)| arch.clone());
         // Missing models for this GPU are downloaded like the core: the engine waits for both.
-        let core_installing = !cfg!(test)
-            && (!components::core_installed(&runtime_root)
-                || arch.as_ref().is_some_and(|a| !components::models_installed(&runtime_root, a)));
+        let core_present = cfg!(test) || components::core_installed(&runtime_root);
+        let models_present = cfg!(test) || components::models_present(&runtime_root, arch.as_deref());
+        let core_installing = !core_present || !models_present;
         let tag_task_enabled = !cfg!(test) && engine::tag_autostart(-1).unwrap_or(false);
         let autostart = tag_autostart_default(&settings, tag_task_enabled);
         let autostart_busy = !cfg!(test) && !core_installing && autostart != tag_task_enabled;
@@ -1103,6 +1122,14 @@ impl App {
                 core_installing,
                 driver_installing,
                 driver_ready,
+                devices_known: false,
+                core_present,
+                models_present,
+                setup_error: String::new(),
+                driver_error: String::new(),
+                transfer: Vec::new(),
+                transfer_stage: None,
+                transfer_moved: Instant::now(),
                 device_state:if driver_ready{engine::DeviceState::Starting}else{engine::DeviceState::WaitingDriver},
                 device_detail:String::new(),
                 repair_confirm:args.iter().any(|s|s=="--ui-repair"),
@@ -1137,13 +1164,7 @@ impl App {
                 effects_monitor,
                 boost_monitor,
                 monitor_message: String::new(),
-                message: if core_installing {
-                    "Загружаем компоненты NVIDIA/TAG…".into()
-                } else if driver_installing {
-                    DRIVER_INSTALL_MESSAGE.into()
-                } else {
-                    String::new()
-                },
+                message: String::new(),
                 details: args.iter().any(|s| s == "--ui-settings" || s=="--ui-repair"),
                 rvc_page: args.iter().any(|s| s == "--ui-rvc"),
                 rvc_advanced: false,
@@ -1371,6 +1392,36 @@ impl App {
     }
     fn running(&self) -> bool {
         matches!(self.snapshot.state, 1..=4)
+    }
+    /// Shows a headphone failure in the panel and keeps it in app.log once: the host swallows the
+    /// reason, so the log is all a report from another PC carries.
+    fn headphone_failed(&mut self, error: String) {
+        if error != self.headphone_message && !cfg!(test) {
+            logs::note(&self.runtime_root, &format!("Наушники: {error}"));
+        }
+        self.headphone_message = error;
+    }
+    /// The host refused the headphone line. On a fresh install the driver's three lines are its
+    /// own two defaults and the microphone, so there is no slot; the device repair frees one.
+    fn headphone_needs_lines(&self) -> bool {
+        self.headphone_message.contains("Headphone host rejected request")
+    }
+    /// Something the voice needs is still missing or failed to install.
+    fn setup_pending(&self) -> bool {
+        self.core_installing || !self.setup_error.is_empty() || !self.driver_ready || self.driver_installing
+    }
+    /// Everything is installed, yet the voice cannot start until the user picks a device:
+    /// `auto_start` needs a microphone and TAG or Voicemeeter as the output.
+    fn start_blocked(&self) -> bool {
+        self.devices_known
+            && !self.running()
+            && !self.busy
+            && (self.input.is_none() || self.output.as_ref().is_none_or(|o| o.id != "TAG" && !o.name.contains("Voicemeeter")))
+    }
+    /// The setup card shows only for a problem (or an install running): once everything is in
+    /// place it leaves the page, and it comes back if something goes missing later.
+    fn setup_visible(&self) -> bool {
+        self.setup_pending() || self.start_blocked()
     }
     /// After the shrink: the real update, or the rehearsal's stand-in watcher.
     fn hand_over(&self, center: Option<iced::Point>) -> Task<Msg> {
@@ -1785,15 +1836,27 @@ impl App {
                     }
                 }
                 self.log_message();
+                let status = components::status();
                 if self.rvc_runtime_installing
-                    && let Some(progress) = components::progress()
+                    && let Some(share) = status.share()
                 {
-                    self.rvc_import_note = format!("Загрузка RVC runtime: {progress}%");
+                    self.rvc_import_note = format!("RVC runtime: {} {}%", status.phase.label(), (share * 100.0) as u8);
                 }
-                if self.core_installing
-                    && let Some(progress) = components::progress()
-                {
-                    self.message = format!("Загрузка компонентов NVIDIA/TAG: {progress}%");
+                if self.core_installing {
+                    let now = Instant::now();
+                    let last = self.transfer.last().map(|&(_, done)| done);
+                    // A new phase starts over; so does a jump no line could make in one tick: the
+                    // parts already on disk after a restart count at once and are no speed.
+                    if self.transfer_stage != Some((status.item, status.phase)) || last.is_some_and(|done| status.done > done + 32 * 1_048_576) {
+                        self.transfer.clear();
+                        self.transfer_stage = Some((status.item, status.phase));
+                        self.transfer_moved = now;
+                    }
+                    if last.is_some_and(|done| status.done != done) {
+                        self.transfer_moved = now;
+                    }
+                    self.transfer.retain(|&(at, _)| now.duration_since(at) < Duration::from_secs(4));
+                    self.transfer.push((now, status.done));
                 }
                 if self.benchmark {
                     if self.ticks==4 && self.repair_confirm {
@@ -1900,7 +1963,7 @@ impl App {
                         Reply::Headphones(result) => {
                             self.headphone_busy = false;
                             if let Err(e) = result {
-                                self.headphone_message = e;
+                                self.headphone_failed(e);
                                 self.headphone_state = 3;
                             }
                             self.engine.refresh();
@@ -1919,6 +1982,7 @@ impl App {
                         }
                         Reply::Devices(result) => match result {
                             Ok((i, o)) => {
+                                self.devices_known = true;
                                 let input_id = self
                                     .input
                                     .as_ref()
@@ -1969,7 +2033,7 @@ impl App {
                         self.headphone_state = headphone_state;
                     }
                     if !headphone_error.is_empty() {
-                        self.headphone_message = headphone_error;
+                        self.headphone_failed(headphone_error);
                     }
                 }
                 let (snapshot, error) = self.engine.snapshot(self.ui_active());
@@ -2429,6 +2493,16 @@ impl App {
                 }
                 self.focus = focus::headphones::NOISE;
             }
+            Msg::HeadphoneLines => {
+                // Settings' device repair with the line transfer already ticked; it still asks.
+                self.headphone_page = false;
+                let page = self.update(Msg::Page(2));
+                let _ = self.update(Msg::Repair);
+                if self.repair_confirm {
+                    self.repair_lines = true;
+                }
+                return Task::batch([page, view::reveal_focus()]);
+            }
             Msg::HeadphoneReverse(enabled) => {
                 self.headphone_reverse = enabled;
                 self.headphone_changed();
@@ -2628,22 +2702,35 @@ impl App {
             }
             Msg::CoreInstalled(result) => {
                 self.core_installing = false;
-                self.message = match &result {
+                self.transfer.clear();
+                // The setup card shows the outcome; app.log keeps it.
+                let note = match &result {
                     Ok(version) => format!("Основной runtime {version} установлен"),
                     Err(error) => format!("Основной runtime: {error}"),
                 };
+                if !cfg!(test) {
+                    logs::note(&self.runtime_root, &note);
+                }
+                self.setup_error = result.err().unwrap_or_default();
                 // A failed model download must not keep a fresh PC without its virtual
                 // microphone: the driver only needs the core files.
                 if components::core_installed(&self.component_root) {
                     self.runtime_root = self.component_root.clone();
                     unsafe { std::env::set_var("MNR_RUNTIME_ROOT", &self.runtime_root) };
+                    self.core_present = true;
+                    self.models_present = components::models_present(&self.runtime_root, self.gpu.as_ref().ok().map(|(arch, _)| arch.as_str()));
                     self.rvc_runtime_installed = components::rvc_installed(&self.runtime_root);
+                    // Voice already running means these are retried models: it runs without them
+                    // (on the CPU) until it restarts, which the device refresh below starts.
+                    if self.models_present && self.setup_error.is_empty() && matches!(self.snapshot.state, 2 | 3) && !self.busy {
+                        self.engine.cancel_start();
+                        self.snapshot.state = 0;
+                        self.recovery = Recovery::default();
+                        self.auto_started = false;
+                    }
                     self.engine.refresh();
                     if !components::driver_installed() {
-                        // The driver prompt replaces the status line; keep the result in app.log.
-                        self.log_message();
-                        self.driver_ready=false;
-                        self.message="Установите виртуальный микрофон кнопкой в настройках; Windows запросит права администратора.".into();
+                        self.driver_ready = false;
                     }
                     if !self.autostart_busy && engine::tag_autostart(-1).ok() != Some(self.autostart) {
                         self.autostart_busy = true;
@@ -2652,11 +2739,25 @@ impl App {
                     }
                 }
             }
+            Msg::RetryCore => {
+                self.focus = focus::effects::SETUP_RETRY;
+                // RVC shares the download folder and the progress counters.
+                if !self.core_installing && !self.rvc_runtime_installing && !self.quitting {
+                    self.core_installing = true;
+                    self.setup_error.clear();
+                    self.transfer.clear();
+                    self.transfer_stage = None;
+                    self.transfer_moved = Instant::now();
+                    let root = self.component_root.clone();
+                    let arch = self.gpu.as_ref().ok().map(|(arch, _)| arch.clone());
+                    return Task::perform(async move { components::install_core(&root, arch.as_deref()) }, Msg::CoreInstalled);
+                }
+            }
             Msg::InstallDriver => {
-                self.focus = focus::settings::DRIVER;
+                self.focus = if self.details { focus::settings::DRIVER } else { focus::effects::SETUP_DRIVER };
                 if !self.driver_installing && !self.driver_ready && !self.core_installing {
                     self.driver_installing = true;
-                    self.message = DRIVER_INSTALL_MESSAGE.into();
+                    self.driver_error.clear();
                     let root = self.runtime_root.clone();
                     return Task::perform(
                         async move { components::install_driver(&root) },
@@ -2742,10 +2843,18 @@ impl App {
                     // opens it on the next engine start.
                     Ok(()) => {
                         self.driver_ready = true;
-                        self.message = "Виртуальный микрофон Mic Noize установлен".into();
+                        if !cfg!(test) {
+                            logs::note(&self.runtime_root, "Виртуальный микрофон Mic Noize установлен");
+                        }
                         self.engine.refresh();
                     }
-                    Err(error) => self.message = error,
+                    // Shown next to the button that repeats the request.
+                    Err(error) => {
+                        if !cfg!(test) {
+                            logs::note(&self.runtime_root, &error);
+                        }
+                        self.driver_error = error;
+                    }
                 }
             }
             Msg::RvcModel(model) => {
@@ -3647,10 +3756,23 @@ impl App {
                 items
             } else {
                 use focus::effects::*;
-                let mut items = vec![INPUT, focus::headphones::OUTPUT, HEADPHONE_GEAR];
+                let mut items = vec![];
+                if !self.setup_error.is_empty() && !self.core_installing {
+                    items.push(SETUP_RETRY);
+                }
+                if self.core_present && !self.core_installing && !self.driver_ready && !self.driver_installing {
+                    items.push(SETUP_DRIVER);
+                }
+                if !self.setup_pending() && self.start_blocked() && (self.inputs.is_empty() || self.input.is_some()) {
+                    items.push(SETUP_SETTINGS);
+                }
+                items.extend([INPUT, focus::headphones::OUTPUT, HEADPHONE_GEAR]);
                 if self.headphone_page {
                     use focus::headphones::*;
                     items.extend([TOGGLE, NOISE, INTENSITY, VOLUME, PITCH, REVERSE]);
+                    if self.headphone_needs_lines() {
+                        items.push(LINES);
+                    }
                 }
                 items.extend([ROUTE, INTENSITY, NOISE_BIND, ALT_INTENSITY]);
                 items.extend(tabs);
@@ -3802,6 +3924,7 @@ impl App {
                     Msg::HeadphonePitch(self.headphone_pitch as f32 + delta as f32)
                 }
                 REVERSE if activate => Msg::HeadphoneReverse(!self.headphone_reverse),
+                LINES if activate => Msg::HeadphoneLines,
                 _ => Msg::Noop,
             }
         } else if self.details {
@@ -3885,6 +4008,9 @@ impl App {
                 MONITOR if activate => Msg::Monitor,
                 HEADPHONE_GEAR if activate => Msg::HeadphonePanel(!self.headphone_page),
                 ROUTE if activate => Msg::RouteToggle,
+                SETUP_RETRY if activate => Msg::RetryCore,
+                SETUP_DRIVER if activate => Msg::InstallDriver,
+                SETUP_SETTINGS if activate => Msg::Page(2),
                 REVERSE_WORD if activate && !self.reverse_edit => Msg::ReverseEdit(true),
                 EFFECTS_MONITOR if activate => Msg::EffectsMonitor(!self.effects_monitor),
                 BOOST_MONITOR if activate => Msg::BoostMonitor(!self.boost_monitor),
@@ -3912,7 +4038,7 @@ impl App {
                     Msg::RvcIndex(self.controls.rvc_options.index as f32 + delta as f32)
                 }
                 focus::rvc::GAIN if delta != 0 => {
-                    Msg::RvcGain(self.controls.rvc_options.gain as f32 + delta as f32 * 5.0)
+                    Msg::RvcGain(self.controls.rvc_options.gain as f32 + delta as f32)
                 }
                 focus::rvc::CHUNK if delta != 0 || activate => {
                     let i = rvc::CHUNKS
@@ -3931,11 +4057,11 @@ impl App {
                 focus::rvc::ADVANCED if activate => Msg::RvcAdvanced,
                 SLOW if delta != 0 => {
                     // The slider is mirrored (slower = right), so Right slows down.
-                    Msg::Slow((self.controls.slow * 100.0 - delta as f32 * 5.0).clamp(50.0, 95.0))
+                    Msg::Slow((self.controls.slow * 100.0 - delta as f32).round().clamp(50.0, 95.0))
                 }
                 SLOW_BIND if activate => Msg::Bind(2),
                 FAST if delta != 0 => {
-                    Msg::Fast((self.controls.fast * 100.0 + delta as f32 * 5.0).clamp(105.0, 200.0))
+                    Msg::Fast((self.controls.fast * 100.0 + delta as f32).round().clamp(105.0, 200.0))
                 }
                 FAST_BIND if activate => Msg::Bind(3),
                 CANCEL_PHRASE if activate => Msg::CancelPhrase,
@@ -3955,7 +4081,7 @@ impl App {
                 ),
                 NOISE_BIND if activate => Msg::Bind(12),
                 BOOST if delta != 0 => Msg::Boost(
-                    (self.controls.boost * 100.0 + delta as f32 * 10.0).clamp(100.0, 2000.0),
+                    (self.controls.boost * 100.0 + delta as f32).round().clamp(100.0, 2000.0),
                 ),
                 BOOST_BIND if activate => Msg::Bind(0),
                 PITCH if delta != 0 => {
@@ -4914,6 +5040,28 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn setup_card_shows_only_for_a_problem() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        assert!(!app.setup_visible(), "everything installed: no card");
+        app.driver_ready = false;
+        assert!(app.setup_visible(), "a missing virtual microphone shows it");
+        app.driver_ready = true;
+        app.setup_error = "io: Connection reset by peer (os error 10054)".into();
+        assert!(app.setup_visible(), "a failed download shows it");
+        app.setup_error.clear();
+        assert!(!app.setup_visible(), "no microphone before the device list came is no problem yet");
+        app.devices_known = true;
+        assert!(app.setup_visible(), "no microphone to start with shows it");
+        app.input = Some(Device { id: "mic".into(), name: "Mic".into() });
+        app.output = Some(Device { id: "dac".into(), name: "Speakers".into() });
+        assert!(app.setup_visible(), "an output auto-start refuses shows it");
+        app.output = Some(Device { id: "TAG".into(), name: "Mic Noize Microphone".into() });
+        assert!(!app.setup_visible(), "all set: the card leaves");
+        app.output = None;
+        app.snapshot.state = 2;
+        assert!(!app.setup_visible(), "running voice: nothing to fix");
+    }
+    #[test]
     fn restart_event_does_not_override_session_exit() {
         assert!(restart_requested(RESTART_EVENT));
         assert!(!restart_requested(EXIT_EVENT));
@@ -5185,7 +5333,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         // The slow slider is mirrored on screen (slower = right), so Right slows down.
         let _ = app.update(Msg::Slow(70.0));
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
-        assert!((app.controls.slow - 0.65).abs() < 0.0001);
+        assert!((app.controls.slow - 0.69).abs() < 0.0001, "one step, as the slider");
         let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
         assert!((app.controls.slow - 0.70).abs() < 0.0001);
         app.details = false;

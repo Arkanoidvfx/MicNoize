@@ -147,6 +147,26 @@ fn title<'a>(s: &'a str) -> widget::Text<'a> {
 fn numbers<'a>(s: impl Into<String>, size: u32, color: Color) -> widget::Text<'a> {
     label(s, size, color).font(tacho::numbers())
 }
+const MB: u64 = 1_048_576;
+fn speed_text(bytes_per_second: f64) -> String {
+    format!("{:.1} МБ/с", bytes_per_second / MB as f64).replace('.', ",")
+}
+/// Rounded up to 5 s under a minute, to 10 s under ten minutes, then to whole minutes.
+fn eta_text(seconds: f64) -> String {
+    let s = seconds.max(1.0).ceil() as u64;
+    match s {
+        0..60 => format!("≈ {} с", s.div_ceil(5) * 5),
+        60..600 => match s.div_ceil(10) * 10 {
+            s if s % 60 == 0 => format!("≈ {} мин", s / 60),
+            s => format!("≈ {} мин {} с", s / 60, s % 60),
+        },
+        _ => format!("≈ {} мин", s.div_ceil(60)),
+    }
+}
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
 fn outline(focused: bool) -> Border {
     Border {
         color: if focused { ORANGE } else { EDGE },
@@ -369,7 +389,13 @@ fn input_style(_: &Theme, status: text_input::Status) -> text_input::Style {
         selection: Color { a: 0.35, ..ORANGE },
     }
 }
-fn switch<'a>(on: bool, message: impl Fn(bool) -> Msg + 'a, enabled: bool) -> widget::Toggler<'a, Msg> {
+/// tiny-skia repaints a changed quad only inside its bounds, so the pill's anti-aliased edge
+/// kept the old colour: a ring around a switch that was just flipped. A padded invisible
+/// background keyed on the state (see [`repaint`]) repaints the edge with it.
+fn switch<'a>(on: bool, message: impl Fn(bool) -> Msg + 'a, enabled: bool) -> Element<'a, Msg> {
+    repaint((on, enabled), container(toggler(on, message, enabled)).padding(2))
+}
+fn toggler<'a>(on: bool, message: impl Fn(bool) -> Msg + 'a, enabled: bool) -> widget::Toggler<'a, Msg> {
     widget::toggler(on)
         .size(18)
         .on_toggle_maybe(enabled.then_some(message))
@@ -911,13 +937,12 @@ impl App {
             ]
             .spacing(10),
         );
-        let mut body = column![
-            title("Шумодав"),
-            devices,
-            meters,
-            row![noise_card, hold_card].spacing(14),
-        ]
-        .spacing(14);
+        let mut body = column![title("Шумодав")]
+            .push(self.setup_card())
+            .push(devices)
+            .push(meters)
+            .push(row![noise_card, hold_card].spacing(14))
+            .spacing(14);
         // Without NVIDIA the sliders do nothing; say so next to them, not in the error line.
         let note = if self.denoiser.0 == 2 && self.running() {
             Some((format!("Шумодав выключен: {}. Голос, эффекты и виртуальный микрофон работают.", self.denoiser.1), ORANGE))
@@ -934,7 +959,10 @@ impl App {
         if !open {
             return body.into();
         }
-        // The headphone settings open over the page, anchored under the gear.
+        // The headphone settings open over the page, anchored under the gear. A stack is as
+        // tall as its first layer, so the page gets room below for the panel's last rows (the
+        // mixer hint, a failure and its button); it still fits a 1040×740 window unscrolled.
+        let body = body.push(Space::new().height(150));
         let panel = self.headphone_panel();
         widget::stack![
             body,
@@ -943,6 +971,286 @@ impl App {
                 .align_right(Length::Fill),
         ]
         .into()
+    }
+
+    /// The setup card on Шумодав (canvas variant C): a tile per step, like the device cards; the
+    /// current one lit, with its numbers and bar. The header names the problem and how to solve it,
+    /// or the install and about how long it takes. Every failure keeps its fix on its own tile.
+    /// Shown only while something is missing, installing or blocks the voice (`setup_visible`). Compact: the
+    /// page under it still fits the smallest window (960×680) without scrolling, so names stay
+    /// short enough for one line of a tile there.
+    fn setup_card(&self) -> Option<Element<'_, Msg>> {
+        use components::{Item, Phase, Reason};
+        use focus::effects::{SETUP_DRIVER, SETUP_RETRY, SETUP_SETTINGS};
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Done,
+            Active,
+            Waiting,
+            Failed,
+            /// Not needed on this PC.
+            Off,
+        }
+        struct Tile {
+            mark: Mark,
+            glyph: &'static str,
+            name: String,
+            /// One line: the number or the short state; numeric ones use the numbers face.
+            main: String,
+            numeric: bool,
+            bar: Option<tacho::BarStage>,
+            button: Option<(&'static str, Msg, usize)>,
+        }
+        if !self.setup_visible() {
+            return None;
+        }
+        let status = components::status();
+        let rate = components::rate(&self.transfer);
+        let arch = self.gpu.as_ref().ok().map(|(arch, _)| arch.as_str()).filter(|a| components::MODEL_ARCHS.contains(a));
+        let running = matches!(self.snapshot.state, 2 | 3);
+        // What install_core works on; before its first phase, the core if it is missing.
+        let current = self.core_installing.then_some(match status.item {
+            Item::None if self.core_present => Item::Models,
+            Item::None => Item::Core,
+            item => item,
+        });
+        let stalled = self.transfer_moved.elapsed().as_secs();
+        let stalled = (current.is_some() && matches!(status.phase, Phase::Connect | Phase::Download) && stalled >= 15).then_some(stalled);
+        let failed = !self.core_installing && !self.setup_error.is_empty();
+        let why = components::reason(&self.setup_error);
+        let why_short = match why {
+            Reason::Network => "нет связи с сервером",
+            Reason::Disk => "нет места на диске",
+            Reason::Corrupt => "файл повредился",
+            Reason::Access => "нет доступа к папке",
+            Reason::Other => "не установилось",
+        };
+        let tile = |mark, glyph, name: String| Tile { mark, glyph, name, main: String::new(), numeric: false, bar: None, button: None };
+        let with = |mut t: Tile, main: &str| {
+            t.main = main.into();
+            t
+        };
+        // The running download of `item`, whichever phase it is in.
+        let installing = |glyph, name: String| -> Tile {
+            let share = status.share().unwrap_or(0.0);
+            let percent = format!("{}%", (share * 100.0) as u8);
+            let phase = if status.item == Item::None { Phase::Connect } else { status.phase };
+            let mut t = tile(Mark::Active, glyph, name);
+            // The speed stands by the time left in the header; a stall is said there too.
+            match phase {
+                Phase::Connect => {
+                    t.main = "подключаемся".into();
+                    t.bar = Some(tacho::BarStage::Running(self.epoch));
+                }
+                Phase::Download => {
+                    t.main = format!("{} / {} МБ", status.done / MB, status.total / MB);
+                    t.numeric = true;
+                    t.bar = Some(tacho::BarStage::Filled(share));
+                }
+                Phase::Verify | Phase::Unpack => {
+                    t.main = format!("{} {percent}", if phase == Phase::Verify { "проверка" } else { "распаковка" });
+                    t.bar = Some(tacho::BarStage::Filled(share));
+                }
+                Phase::Place => {
+                    t.main = "установка файлов".into();
+                    t.bar = Some(tacho::BarStage::Running(self.epoch));
+                }
+            }
+            t
+        };
+        let done = |glyph, name: String| {
+            let mut t = with(tile(Mark::Done, glyph, name), "готово");
+            t.bar = Some(tacho::BarStage::Done);
+            t
+        };
+        let retry = |glyph, name: String| {
+            let mut t = with(tile(Mark::Failed, glyph, name), why_short);
+            t.button = Some(("Повторить", Msg::RetryCore, SETUP_RETRY));
+            t
+        };
+
+        let core_name = "Компоненты".to_owned();
+        let core = if current == Some(Item::Core) {
+            installing(glyph::SAVE, core_name)
+        } else if self.core_present {
+            done(glyph::SAVE, core_name)
+        } else if failed {
+            retry(glyph::SAVE, core_name)
+        } else {
+            with(tile(Mark::Waiting, glyph::SAVE, core_name), "ждёт")
+        };
+        let models_name = "Модели NVIDIA".to_owned();
+        let models = if arch.is_none() {
+            with(tile(Mark::Off, glyph::CHIP, models_name), "шумодав на процессоре")
+        } else if current == Some(Item::Models) {
+            installing(glyph::CHIP, models_name)
+        } else if self.models_present {
+            done(glyph::CHIP, models_name)
+        } else if failed && self.core_present {
+            retry(glyph::CHIP, models_name)
+        } else {
+            with(tile(Mark::Waiting, glyph::CHIP, models_name), "после компонентов")
+        };
+        let mic_name = "Вирт. микрофон".to_owned();
+        let refused = self.driver_error.starts_with("Установка отменена");
+        let driver = if self.driver_ready {
+            done(glyph::MIC, mic_name)
+        } else if self.driver_installing {
+            let mut t = with(tile(Mark::Active, glyph::MIC, mic_name), "подтвердите запрос");
+            t.bar = Some(tacho::BarStage::Running(self.epoch));
+            t
+        } else if !self.core_present || self.core_installing {
+            with(tile(Mark::Waiting, glyph::MIC, mic_name), "после загрузки")
+        } else if !self.driver_error.is_empty() {
+            let mut t = with(tile(Mark::Failed, glyph::MIC, mic_name), if refused { "отменено" } else { "не установился" });
+            t.button = Some(("Повторить", Msg::InstallDriver, SETUP_DRIVER));
+            t
+        } else {
+            let mut t = with(tile(Mark::Active, glyph::MIC, mic_name), "нужно разрешение");
+            t.button = Some(("Установить", Msg::InstallDriver, SETUP_DRIVER));
+            t
+        };
+        let wrong_output = self.output.as_ref().is_none_or(|o| o.id != "TAG" && !o.name.contains("Voicemeeter"));
+        let settings = |mut t: Tile| {
+            t.button = Some(("Настройки", Msg::Page(2), SETUP_SETTINGS));
+            t
+        };
+        let voice_name = "Обработка голоса".to_owned();
+        let start = if running {
+            done(glyph::VOLUME, voice_name)
+        } else if self.setup_pending() {
+            with(tile(Mark::Waiting, glyph::VOLUME, voice_name), "включится сама")
+        } else if self.snapshot.state == 5 {
+            with(tile(Mark::Failed, glyph::VOLUME, voice_name), "не запустилась")
+        } else if self.input.is_none() && self.inputs.is_empty() && self.devices_known {
+            settings(with(tile(Mark::Failed, glyph::VOLUME, voice_name), "микрофон не найден"))
+        } else if self.input.is_none() {
+            with(tile(Mark::Active, glyph::VOLUME, voice_name), "выберите микрофон")
+        } else if wrong_output && !self.busy {
+            settings(with(tile(Mark::Active, glyph::VOLUME, voice_name), "выберите выход TAG"))
+        } else {
+            let label = match self.device_state {
+                engine::DeviceState::WaitingEndpoint => "ждём устройство",
+                engine::DeviceState::Recovering => "восстанавливаем связь",
+                engine::DeviceState::UserAction => "нужно действие",
+                _ => "запускаем",
+            };
+            let mut t = with(tile(Mark::Active, glyph::VOLUME, voice_name), label);
+            t.bar = Some(tacho::BarStage::Running(self.epoch));
+            t
+        };
+
+        // The header: the problem and its fix, or the install; in priority of what needs the user.
+        let drive = match self.component_root.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => format!(" {}", prefix.as_os_str().to_string_lossy()),
+            _ => String::new(),
+        };
+        let (headline, line, alarm): (&str, String, bool) = if failed && !self.core_present {
+            ("Установка остановилась", match why {
+                Reason::Network => "Нет связи с сервером. Проверьте интернет и нажмите «Повторить», скачанное сохранится.".into(),
+                Reason::Disk => format!("Не хватает места на диске{drive}. Освободите место и нажмите «Повторить»."),
+                Reason::Corrupt => "Файл повредился при загрузке. Нажмите «Повторить»: он скачается заново.".into(),
+                Reason::Access => "Нет доступа к папке компонентов. Нажмите «Повторить»; если не поможет, отправьте логи из настроек.".into(),
+                Reason::Other => format!("{}. Нажмите «Повторить».", self.setup_error.trim_end_matches('.')),
+            }, true)
+        } else if failed {
+            ("Модели не скачались", format!("{}. Без моделей шумодав работает на процессоре. Нажмите «Повторить».", capitalized(why_short)), true)
+        } else if self.core_installing {
+            let what = if current == Some(Item::Models) { "Скачиваем модели NVIDIA" } else { "Скачиваем компоненты" };
+            match stalled {
+                Some(seconds) => (what, format!("Сервер загрузки молчит {seconds} с. Проверьте интернет: загрузка продолжится сама."), true),
+                None => (what, "Без них голос не обработать. Окно можно закрыть: загрузка продолжится в трее.".into(), false),
+            }
+        } else if self.driver_installing {
+            ("Устанавливаем виртуальный микрофон", "Подтвердите запрос Windows: если окна не видно, оно мигает на панели задач.".into(), false)
+        } else if refused {
+            ("Виртуальный микрофон не установлен", "Windows не дала права администратора. Нажмите «Повторить» и подтвердите запрос.".into(), true)
+        } else if !self.driver_error.is_empty() {
+            ("Виртуальный микрофон не установлен", format!("{}. Нажмите «Повторить».", self.driver_error.trim_end_matches('.')), true)
+        } else if !self.driver_ready {
+            ("Нет виртуального микрофона", "Без него голос не дойдёт до Discord. Нажмите «Установить», Windows спросит права.".into(), false)
+        } else if self.input.is_none() && self.inputs.is_empty() {
+            ("Микрофон не найден", "Подключите микрофон и нажмите «Обновить устройства» в настройках.".into(), true)
+        } else if self.input.is_none() {
+            ("Микрофон не выбран", "Выберите его в карточке ниже: обработка включится сама.".into(), false)
+        } else if wrong_output {
+            ("Выход не TAG", "Автозапуск ждёт выход TAG или Voicemeeter: выберите его в настройках.".into(), false)
+        } else {
+            ("Запускаем обработку голоса", "Это несколько секунд.".into(), false)
+        };
+        // ponytail: byte phases still ahead are guessed at 150 MB/s each until they run and measure
+        // themselves; the models' size is unknown until their download starts.
+        let eta = rate.filter(|_| current.is_some() && status.item != Item::None && stalled.is_none()).and_then(|rate| {
+            let ahead = match status.phase {
+                Phase::Download => 2.0,
+                Phase::Verify => 1.0,
+                Phase::Unpack => 0.0,
+                _ => return None,
+            };
+            Some(status.total.saturating_sub(status.done) as f64 / rate + ahead * status.total as f64 / 150e6)
+        });
+
+        let render = |t: Tile| -> Element<'static, Msg> {
+            let (fill, edge, tint, icon_fill) = match t.mark {
+                Mark::Done => (Color::from_rgb8(0x1D, 0x1F, 0x1E), Color::from_rgb8(0x2B, 0x3A, 0x2F), GREEN, Color { a: 0.12, ..GREEN }),
+                Mark::Active => (Color::from_rgb8(0x24, 0x1F, 0x1B), ORANGE, ORANGE, Color { a: 0.13, ..ORANGE }),
+                Mark::Failed => (Color::from_rgb8(0x24, 0x1C, 0x1D), Color { a: 0.6, ..RED }, RED, Color { a: 0.12, ..RED }),
+                Mark::Waiting | Mark::Off => (CARD, Color::from_rgb8(0x2A, 0x2B, 0x30), FAINT, Color::from_rgb8(0x25, 0x26, 0x2A)),
+            };
+            let quiet = matches!(t.mark, Mark::Waiting | Mark::Off);
+            let main_color = match t.mark {
+                Mark::Done => GREEN,
+                Mark::Failed => RED,
+                _ if quiet => DIM,
+                _ => INK,
+            };
+            // Icon and name on one line, then the state, then the button or the bar.
+            let top = row![
+                container(icon(t.glyph, 11, tint)).width(22).height(22).center(22).style(move |_| container::Style {
+                    background: Some(icon_fill.into()),
+                    border: Border { radius: 7.0.into(), ..Border::default() },
+                    ..Default::default()
+                }),
+                bold(t.name, 13, if quiet { DIM } else { INK }).width(Length::Fill).wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .push((t.mark == Mark::Done).then(|| icon(glyph::CHECK, 11, GREEN)))
+            .spacing(8)
+            .align_y(iced::Center);
+            let state: Element<'static, Msg> = if t.numeric { numbers(t.main, 13, main_color).into() } else { label(t.main, 12, main_color).into() };
+            let bottom: Element<'static, Msg> = match (t.button, t.bar) {
+                (Some((text, message, id)), _) => action(label(text, 12, ORANGE_DARK), message, self.focus == id, true).padding([4, 12]).into(),
+                (None, Some(stage)) => tacho::progress_bar(stage),
+                (None, None) => tacho::progress_bar(tacho::BarStage::Waiting),
+            };
+            container(column![top, state, Space::new().height(Length::Fill), bottom].spacing(4))
+                .padding(8)
+                .width(Length::Fill)
+                .height(90)
+                .clip(true)
+                .style(move |_| container::Style {
+                    background: Some(fill.into()),
+                    border: Border { color: edge, width: 1.0, radius: 10.0.into() },
+                    ..Default::default()
+                })
+                .into()
+        };
+        let speed = rate.filter(|_| status.phase == Phase::Download).map_or(String::new(), |r| format!(" · {}", speed_text(r)));
+        let header = row![
+            column![bold(headline, 14, INK), label(line, 12, if alarm { RED } else { DIM })]
+                .spacing(2)
+                .width(Length::Fill),
+        ]
+        .push(eta.map(|seconds| {
+            column![label(format!("осталось{speed}"), 11, FAINT), numbers(eta_text(seconds), 18, ORANGE)]
+                .align_x(iced::alignment::Horizontal::Right)
+        }))
+        .spacing(16)
+        .align_y(iced::Center);
+        Some(
+            card(column![header, row![render(core), render(models), render(driver), render(start)].spacing(8)].spacing(8))
+                .padding([10, 14])
+                .into(),
+        )
     }
 
     /// Что слышите вы: processing of the sound you hear, opened from the gear.
@@ -1009,7 +1317,11 @@ impl App {
             ),
         ]
         .spacing(10);
-        if !self.headphone_message.is_empty() {
+        if self.headphone_needs_lines() {
+            content = content
+                .push(label("Наушникам не хватило линии в виртуальном драйвере: на новой установке её занимает стандартная линия TAG. Освободите её, звук микрофона не пострадает.", 12, RED))
+                .push(action(label("Освободить место", 13, ORANGE_DARK), Msg::HeadphoneLines, self.focus == LINES, true));
+        } else if !self.headphone_message.is_empty() {
             content = content.push(label(&self.headphone_message, 12, RED));
         }
         content = content.push(label("Выход в микшере Windows: Mic Noize Headphones. После остановки верните физические наушники.", 11, FAINT));
@@ -1057,12 +1369,12 @@ impl App {
                         .into(),
                     frame(
                         tacho(100.0..=2000.0, self.controls.boost * 100.0, Msg::Boost, clock)
-                            .step(10.0)
                             .default(300.0)
                             .red_above(1600.0)
                             .segments(16)
                             .compact()
-                            .phase(0.0),
+                            .phase(0.0)
+                            .overdrive(self.controls.overload),
                         self.ring(self.focus == BOOST),
                     ),
                     BOOST_BIND,
@@ -1093,7 +1405,6 @@ impl App {
                     label("запись, пока держите", 11, FAINT).into(),
                     frame(
                         tacho(-95.0..=-50.0, -self.controls.slow * 100.0, |v| Msg::Slow(-v), clock)
-                            .step(5.0)
                             .default(-70.0)
                             .segments(16)
                             .compact()
@@ -1110,7 +1421,6 @@ impl App {
                     label("запись, пока держите", 11, FAINT).into(),
                     frame(
                         tacho(105.0..=200.0, self.controls.fast * 100.0, Msg::Fast, clock)
-                            .step(5.0)
                             .default(150.0)
                             .segments(16)
                             .compact()
@@ -1575,7 +1885,7 @@ impl App {
                 .push(label("Влияние индекса", 12, DIM))
                 .push(index)
                 .push(label("Вход модели", 12, DIM))
-                .push(frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(16).compact().phase(1800.0), self.ring(self.focus == GAIN)))
+                .push(frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).default(100.0).segments(16).compact().phase(1800.0), self.ring(self.focus == GAIN)))
                 .push(
                     row![
                         label("Блок аудио, мс", 12, DIM),
@@ -1958,8 +2268,10 @@ impl App {
             });
             let volume: Element<'_, Msg> = if volume_active {
                 frame(
+                    // No wheel: the list scrolls under the cursor, and a passing slider must not
+                    // catch the wheel and change a volume.
                     tacho(0.0..=200.0, sound.volume as f32, move |v| Msg::SoundVolume(i, v), Clock { animate: false, ..clock })
-                        .step(5.0)
+                        .wheel(false)
                         .default(100.0)
                         .segments(12)
                         .compact(),
@@ -2096,8 +2408,11 @@ impl App {
         if !self.driver_ready {
             device = device.push(label("Виртуальный микрофон не установлен: Windows запросит права администратора.", 12, DIM)).push(
                 action(label(if self.driver_installing { "Устанавливаем…" } else { "Установить виртуальный микрофон" }, 13, INK), Msg::InstallDriver, self.focus == DRIVER, false)
-                    .on_press_maybe((!self.driver_installing).then_some(Msg::InstallDriver)),
+                    .on_press_maybe((!self.driver_installing && !self.core_installing).then_some(Msg::InstallDriver)),
             );
+            if !self.driver_error.is_empty() {
+                device = device.push(label(&self.driver_error, 12, RED));
+            }
         }
         let device = if self.repair_confirm {
             device.push(
@@ -2273,6 +2588,15 @@ fn clock_text(seconds: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_times_round_up() {
+        assert_eq!(eta_text(0.2), "≈ 5 с");
+        assert_eq!(eta_text(41.0), "≈ 45 с");
+        assert_eq!(eta_text(121.0), "≈ 2 мин 10 с");
+        assert_eq!(eta_text(175.0), "≈ 3 мин");
+        assert_eq!(eta_text(900.5), "≈ 16 мин");
+        assert_eq!(speed_text(8.4 * MB as f64), "8,4 МБ/с");
+    }
     #[test]
     fn soundpad_scroll_timing() {
         use iced::advanced::{Renderer as _, Layout, graphics::{damage, Viewport}};
@@ -2582,7 +2906,7 @@ mod tests {
                 eprintln!("windowed frame {:3} ms: {regions} damage regions, {took:.1} ms", step * 16);
             }
         }
-        for ms in [2u64, 13, 24] {
+        for ms in [2u64, 14, 26, 38, 50, 62, 74, 86, 98, 110] {
             app.page_shift = Some((to.clone(), Instant::now() - Duration::from_millis(ms)));
             let (pixels, took) = frame(&app);
             eprintln!("frame at {ms} ms: {took:.1} ms");
@@ -2601,8 +2925,9 @@ mod tests {
     fn design_snapshots() {
         use iced::advanced::{Renderer as _, Layout, graphics::{damage, Viewport}};
         let dir = PathBuf::from(std::env::var("MNR_DESIGN_DIR").expect("MNR_DESIGN_DIR"));
+        let window = std::cell::Cell::new((1040.0_f32, 740.0_f32));
         let render = |app: &App, name: &str| {
-            let (w, h) = (1040.0_f32, 740.0_f32);
+            let (w, h) = window.get();
             let size = Size::new(w as u32, h as u32);
             let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
             let mut tree = iced::advanced::widget::Tree::empty();
@@ -2653,13 +2978,78 @@ mod tests {
         app.route_open = false;
         app.headphone_page = true;
         render(&app, "headphones");
+        app.headphone_message = "Headphone host rejected request; see results/tag-headphones.log".into();
+        render(&app, "headphones-no-line");
+        app.headphone_message.clear();
         app.headphone_page = false;
+        {
+            use components::{Item, Phase, fake_status};
+            // First run on an Ada card: the core downloads, the models wait for it.
+            let gpu = std::mem::replace(&mut app.gpu, Ok(("ada".into(), "NVIDIA GeForce RTX 4070".into())));
+            let now = Instant::now();
+            (app.core_present, app.models_present, app.core_installing, app.driver_ready) = (false, false, true, false);
+            (app.snapshot.state, app.denoiser.0) = (0, 0);
+            app.transfer = vec![(now - Duration::from_secs(3), 380 * MB), (now, 412 * MB)];
+            fake_status(Item::Core, Phase::Download, 412 * MB, 1130 * MB);
+            render(&app, "setup-download");
+            app.transfer_moved = now - Duration::from_secs(23);
+            app.transfer = vec![(now - Duration::from_secs(3), 412 * MB), (now, 412 * MB)];
+            render(&app, "setup-stalled");
+            app.transfer_moved = now;
+            app.transfer = vec![(now - Duration::from_secs(2), 500 * MB), (now, 820 * MB)];
+            fake_status(Item::Core, Phase::Unpack, 820 * MB, 1130 * MB);
+            render(&app, "setup-unpack");
+            (app.core_present, app.transfer) = (true, vec![]);
+            fake_status(Item::Models, Phase::Connect, 0, 0);
+            render(&app, "setup-models");
+            // A PC without NVIDIA whose download broke off, then one whose disk is full.
+            app.gpu = Err("NVIDIA GPU не найден".into());
+            (app.core_present, app.core_installing) = (false, false);
+            app.setup_error = "io: Connection reset by peer (os error 10054)".into();
+            render(&app, "setup-failed");
+            app.component_root = PathBuf::from(r"C:\Users\a\AppData\Roaming\Mic Noize\Components");
+            app.setup_error = "There is not enough space on the disk. (os error 112)".into();
+            render(&app, "setup-disk-full");
+            // The core is in, the models broke off, the voice runs on the CPU meanwhile.
+            app.gpu = Ok(("ada".into(), "NVIDIA GeForce RTX 4070".into()));
+            app.core_present = true;
+            app.setup_error = "модели NVIDIA для ada: io: Connection reset by peer (os error 10054)".into();
+            render(&app, "setup-models-failed");
+            app.models_present = true;
+            app.setup_error.clear();
+            render(&app, "setup-driver");
+            window.set((960.0, 680.0));
+            render(&app, "setup-driver-smallest-window");
+            window.set((1040.0, 740.0));
+            app.driver_installing = true;
+            render(&app, "setup-driver-installing");
+            app.driver_installing = false;
+            app.driver_error = "Установка отменена: нужны права администратора. Нажмите кнопку ещё раз и подтвердите запрос Windows.".into();
+            render(&app, "setup-driver-refused");
+            // Everything installed: the card leaves unless a device choice blocks the voice.
+            (app.driver_error, app.driver_ready, app.devices_known) = (String::new(), true, true);
+            render(&app, "setup-all-installed");
+            let (input, output, inputs) = (app.input.take(), app.output.clone(), app.inputs.clone());
+            render(&app, "setup-no-microphone");
+            app.inputs.clear();
+            render(&app, "setup-no-microphone-found");
+            (app.input, app.inputs) = (input, inputs);
+            app.output = app.outputs.get(1).cloned();
+            render(&app, "setup-wrong-output");
+            (app.output, app.devices_known, app.gpu) = (output, false, gpu);
+        }
         app.effects_page = true;
         app.clips = (0..6).map(|i| Sound {
             name: format!("Запись 2026-09-25 14-2{i}-0{i} (mix).wav"), path: PathBuf::new(),
             key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
         }).collect();
         render(&app, "effects");
+        app.controls.overload = true;
+        let boost = app.controls.boost;
+        app.controls.boost = 15.0;
+        render(&app, "effects-overload");
+        app.controls.boost = boost;
+        app.controls.overload = false;
         app.keys_down[0] = 1 << 0x11;
         render(&app, "effects-ctrl-held");
         app.keys_down = [0; 4];
