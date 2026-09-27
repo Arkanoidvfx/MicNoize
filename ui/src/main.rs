@@ -247,8 +247,17 @@ mod focus {
         pub const STOP: usize = 30007;
         pub const HEAR: usize = 30008;
         pub const CURSOR: usize = 30009;
+        pub const LOOP: usize = 30014;
+        pub const LOOP_START: usize = 30015;
+        pub const LOOP_END: usize = 30016;
+        pub const ZOOM: usize = 30017;
+        pub const VOLUME: usize = 30018;
+        pub const DELETE_CONFIRM: usize = 30019;
+        pub const DELETE_CANCEL: usize = 30020;
+        pub const LIBRARY: usize = 30021;
         pub const BAR_BASE: usize = 30010;
         pub const SAMPLE_BASE: usize = 30100;
+        pub const DELETE_BASE: usize = 31000;
         pub const CELL_BASE: usize = 32000;
     }
     pub mod settings {
@@ -557,9 +566,20 @@ enum Msg {
     ScrollFrame(Instant),
     SoundpadStop,
     StudioBpm(u32),
+    StudioVolume(u32),
+    StudioZoom(usize),
+    StudioLoopEnabled(bool),
+    StudioLoopStart(usize),
+    StudioLoopEnd(usize),
+    StudioLoopGrab(usize),
+    StudioLoopMove(usize),
     StudioBar(usize),
     StudioSelect(String),
     StudioCell(usize, u8),
+    StudioDrawStart(usize, u8),
+    StudioCellEnter(usize, u8),
+    StudioEraseStart(usize, u8),
+    StudioRightEnd,
     StudioGrab(usize),
     StudioDrag(usize),
     StudioScroll(f32, f32),
@@ -571,6 +591,11 @@ enum Msg {
     StudioRender(bool),
     StudioRendered(bool, Result<Option<PathBuf>, String>),
     StudioClear,
+    StudioDeleteAsk(String),
+    StudioDeleteConfirm,
+    StudioDeleteCancel,
+    StudioDeleted(String, Result<(), String>),
+    StudioLibraryToggle,
     SectionSelect(usize),
     SectionAdd,
     SectionName(String),
@@ -630,6 +655,7 @@ struct SectionItem {
 #[derive(Clone,Copy,serde::Serialize,serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResumeIntent {microphone:bool,headphones:bool,monitor:i32,full_monitor:bool}
+struct StudioStroke { anchor: usize, note: u8, sample: String, before: Vec<studio::Event> }
 struct App {
     soundpad_page: bool,
     studio_page: bool,
@@ -638,6 +664,16 @@ struct App {
     studio_selected: Option<String>,
     studio_events: Vec<studio::Event>,
     studio_bpm: u32,
+    studio_volume: u32,
+    studio_zoom: usize,
+    studio_loop: bool,
+    studio_loop_start: usize,
+    studio_loop_end: usize,
+    studio_loop_drag: Option<bool>, // true adjusts the start; false adjusts the end
+    studio_stroke: Option<StudioStroke>,
+    studio_erasing: bool,
+    studio_delete: Option<String>,
+    studio_library_open: bool,
     studio_bar: usize,
     studio_cursor: f32,
     studio_scrubbing: bool,
@@ -1019,6 +1055,11 @@ impl App {
         let studio_samples = studio::scan(&studio_folder);
         let studio_selected = studio_samples.first().cloned();
         let (studio_bpm, studio_events) = studio::load(&settings);
+        let studio_volume = settings.number("studio", "volume", 100, 0, 200) as u32;
+        let studio_zoom = studio::ZOOMS.iter().position(|&z| z == settings.number("studio", "zoom", 100, 50, 150) as u8).unwrap_or(2);
+        let studio_loop_start = settings.number("studio", "loop_start", 0, 0, 63) as usize;
+        let studio_loop_end = (settings.number("studio", "loop_end", 64, 1, 64) as usize).max(studio_loop_start + 1);
+        let studio_loop = settings.number("studio", "loop", 0, 0, 1) != 0;
         if !cfg!(test) {
             engine.refresh();
         }
@@ -1106,12 +1147,25 @@ impl App {
                 studio_selected,
                 studio_events,
                 studio_bpm,
+                studio_volume,
+                studio_zoom,
+                studio_loop,
+                studio_loop_start,
+                studio_loop_end,
+                studio_loop_drag: None,
+                studio_stroke: None,
+                studio_erasing: false,
+                studio_delete: None,
+                studio_library_open: false,
                 studio_bar: 0,
                 studio_cursor: 0.0,
                 studio_scrubbing: false,
                 studio_follow: true,
                 studio_play_bpm: studio_bpm,
-                studio_scroll: (view::studio_offset(studio::ROOT_NOTE), 360.0),
+                studio_scroll: {
+                    let viewport = if Self::window_size().width < 846.0 { 240.0 } else { 300.0 };
+                    (view::studio_offset(studio::ROOT_NOTE, studio::ZOOMS[studio_zoom], viewport), viewport)
+                },
                 studio_generation: 0,
                 studio_busy: false,
                 studio_note: String::new(),
@@ -1420,6 +1474,11 @@ impl App {
         self.settings
             .set("soundpad", "sounds", soundpad::serialize(&self.sounds));
         self.settings.set("studio", "bpm", self.studio_bpm);
+        self.settings.set("studio", "volume", self.studio_volume);
+        self.settings.set("studio", "zoom", studio::ZOOMS[self.studio_zoom]);
+        self.settings.set("studio", "loop", self.studio_loop as i32);
+        self.settings.set("studio", "loop_start", self.studio_loop_start);
+        self.settings.set("studio", "loop_end", self.studio_loop_end);
         self.settings.set("studio", "events", serde_json::to_string(&self.studio_events).unwrap_or_default());
         self.controls.rvc_options.save(&mut self.settings);
         self.engine
@@ -1520,8 +1579,17 @@ impl App {
         self.window.is_some() && self.window_focused
     }
     fn reveal_studio(&mut self, note: u8) -> Task<Msg> {
-        self.studio_scroll.0 = view::studio_offset(note);
-        view::studio_reveal(note)
+        let zoom = studio::ZOOMS[self.studio_zoom];
+        let viewport = self.studio_scroll.1;
+        self.studio_scroll.0 = view::studio_offset(note, zoom, viewport);
+        view::studio_reveal(note, zoom, viewport)
+    }
+    fn studio_loop_range(&self) -> Option<(usize, usize)> {
+        self.studio_loop.then(|| (studio::frame_at(self.studio_loop_start, self.studio_play_bpm),
+            studio::frame_at(self.studio_loop_end, self.studio_play_bpm)))
+    }
+    fn sync_studio_loop(&self) {
+        self.engine.sound_loop(studio::TRACK_ID, self.studio_loop_range());
     }
     fn seek_studio(&mut self, step: usize) {
         let step = step.min(studio::STEPS - 1);
@@ -1893,6 +1961,9 @@ impl App {
             self.scroll_pending.clear();
             self.sound_hover = None;
             self.studio_scrubbing = false;
+            self.studio_loop_drag = None;
+            self.studio_stroke = None;
+            self.studio_erasing = false;
             // A rebuilt clip list repaints in one pass, as a page swap does. Not on hiding or
             // focus loss (switching to a game): no extra frame there.
             self.repaint_all ^= !matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize | Msg::WindowFocus(..));
@@ -2145,7 +2216,13 @@ impl App {
                     sound.played = soundpad::now();
                     self.dirty = Some(Instant::now());
                 }
+                let studio_finished = self.sound_playing.0 == studio::TRACK_ID
+                    && playing.0 != studio::TRACK_ID && !self.studio_loop;
                 self.sound_playing = playing;
+                if studio_finished {
+                    self.studio_cursor = 0.0;
+                    if self.studio_follow { self.studio_bar = 0; }
+                }
                 if self.studio_page && self.ui_active() && playing.0 == studio::TRACK_ID && !self.studio_scrubbing {
                     self.studio_cursor = (playing.1 * self.studio_play_bpm as f32 / 15.0)
                         .clamp(0.0, studio::STEPS as f32);
@@ -2302,6 +2379,12 @@ impl App {
                 if self.window == Some(id) {
                     self.window_focused = focused;
                     self.own_minimize &= !focused;
+                    if !focused {
+                        self.studio_scrubbing = false;
+                        self.studio_loop_drag = None;
+                        self.studio_stroke = None;
+                        self.studio_erasing = false;
+                    }
                 }
             }
             Msg::Minimized(id) => {
@@ -2325,6 +2408,10 @@ impl App {
                 if !self.tray_ok {
                     return Task::none();
                 }
+                self.studio_scrubbing = false;
+                self.studio_loop_drag = None;
+                self.studio_stroke = None;
+                self.studio_erasing = false;
                 self.engine.capture(false);
                 self.binding = None;
                 if !self.hint_shown {
@@ -3358,6 +3445,8 @@ impl App {
             }
             Msg::DragEnd => {
                 self.studio_scrubbing = false;
+                self.studio_loop_drag = None;
+                self.studio_stroke = None;
                 if let (Some(i), Some(section)) = (self.dragging.take(), self.drag_over.take())
                     && let Some(sound) = self.sounds.get(i)
                     && let Some(target) = self.sections.get_mut(section)
@@ -3387,6 +3476,53 @@ impl App {
                 self.focus = focus::studio::BPM;
                 self.dirty = Some(Instant::now());
             }
+            Msg::StudioVolume(value) => {
+                self.studio_volume = value.min(200);
+                self.engine.sound_gain(studio::TRACK_ID, self.studio_volume as f32 / 100.0);
+                self.focus = focus::studio::VOLUME;
+                self.dirty = Some(Instant::now());
+            }
+            Msg::StudioZoom(index) => {
+                let old_pitch = 28.0 * studio::ZOOMS[self.studio_zoom] as f32 / 100.0;
+                let row = ((self.studio_scroll.0 + self.studio_scroll.1 / 2.0) / old_pitch) as usize;
+                let note = studio::FIRST_NOTE + (studio::NOTES - 1 - row.min(studio::NOTES - 1)) as u8;
+                self.studio_zoom = index.min(studio::ZOOMS.len() - 1);
+                self.focus = focus::studio::ZOOM;
+                self.dirty = Some(Instant::now());
+                return self.reveal_studio(note);
+            }
+            Msg::StudioLoopEnabled(enabled) => {
+                self.studio_loop = enabled;
+                self.focus = focus::studio::LOOP;
+                self.sync_studio_loop();
+                self.dirty = Some(Instant::now());
+            }
+            Msg::StudioLoopStart(step) => {
+                self.studio_loop_start = step.min(self.studio_loop_end - 1);
+                self.studio_loop = true;
+                self.focus = focus::studio::LOOP_START;
+                self.sync_studio_loop();
+                self.dirty = Some(Instant::now());
+            }
+            Msg::StudioLoopEnd(step) => {
+                self.studio_loop_end = step.clamp(self.studio_loop_start + 1, studio::STEPS);
+                self.studio_loop = true;
+                self.focus = focus::studio::LOOP_END;
+                self.sync_studio_loop();
+                self.dirty = Some(Instant::now());
+            }
+            Msg::StudioLoopGrab(step) => {
+                let start_distance = step.abs_diff(self.studio_loop_start);
+                let end_distance = step.abs_diff(self.studio_loop_end - 1);
+                let start = start_distance < end_distance;
+                self.studio_loop_drag = Some(start);
+                return self.update(if start { Msg::StudioLoopStart(step) } else { Msg::StudioLoopEnd(step + 1) });
+            }
+            Msg::StudioLoopMove(step) => {
+                if let Some(start) = self.studio_loop_drag {
+                    return self.update(if start { Msg::StudioLoopStart(step) } else { Msg::StudioLoopEnd(step + 1) });
+                }
+            }
             Msg::StudioBar(bar) => {
                 self.studio_bar = bar.min(studio::BARS - 1);
                 self.studio_follow = false;
@@ -3404,7 +3540,12 @@ impl App {
                 if self.studio_samples.contains(&name) {
                     self.focus = focus::studio::SAMPLE_BASE + self.studio_samples.iter().position(|s| s == &name).unwrap();
                     self.studio_selected = Some(name);
+                    if Self::window_size().width < 846.0 { self.studio_library_open = false;self.focus = focus::studio::LIBRARY; }
                 }
+            }
+            Msg::StudioLibraryToggle => {
+                self.studio_library_open = !self.studio_library_open;
+                self.focus = focus::studio::LIBRARY;
             }
             Msg::StudioCell(step, note) => {
                 if step < studio::STEPS && (studio::FIRST_NOTE..studio::FIRST_NOTE + studio::NOTES as u8).contains(&note)
@@ -3414,6 +3555,33 @@ impl App {
                     self.dirty = Some(Instant::now());
                 }
             }
+            Msg::StudioDrawStart(step, note) => {
+                if step >= studio::STEPS || !(studio::FIRST_NOTE..studio::FIRST_NOTE + studio::NOTES as u8).contains(&note) { return Task::none(); }
+                if let Some(sample) = self.studio_selected.clone() {
+                    let before = self.studio_events.clone();
+                    let own = before.iter().find(|e| e.note == note && (e.step as usize..e.step as usize + e.length as usize).contains(&step)
+                        && e.sample == sample);
+                    let anchor = own.map_or(step, |e| e.step as usize);
+                    if own.is_none() { studio::paint(&mut self.studio_events, step, step, note, &sample); }
+                    self.studio_stroke = Some(StudioStroke { anchor, note, sample, before });
+                    self.focus = focus::studio::CELL_BASE + (step % 16) * studio::NOTES + (note - studio::FIRST_NOTE) as usize;
+                    self.dirty = Some(Instant::now());
+                }
+            }
+            Msg::StudioCellEnter(step, note) => {
+                if let Some(stroke) = &self.studio_stroke && stroke.note == note {
+                    self.studio_events = stroke.before.clone();
+                    studio::paint(&mut self.studio_events, stroke.anchor, step, note, &stroke.sample);
+                    self.dirty = Some(Instant::now());
+                } else if self.studio_erasing && studio::erase(&mut self.studio_events, step, note) {
+                    self.dirty = Some(Instant::now());
+                }
+            }
+            Msg::StudioEraseStart(step, note) => {
+                self.studio_erasing = true;
+                if studio::erase(&mut self.studio_events, step, note) { self.dirty = Some(Instant::now()); }
+            }
+            Msg::StudioRightEnd => self.studio_erasing = false,
             Msg::StudioRecord => {
                 self.focus = focus::studio::RECORD;
                 let was_recording = self.engine.studio_recording();
@@ -3467,6 +3635,9 @@ impl App {
                 let folder = self.studio_folder.clone();
                 let events = self.studio_events.clone();
                 let bpm = self.studio_bpm;
+                let volume = self.studio_volume;
+                let loop_range = self.studio_loop.then(|| (studio::frame_at(self.studio_loop_start, bpm),
+                    studio::frame_at(self.studio_loop_end, bpm)));
                 if !export { self.studio_play_bpm = bpm; }
                 let loader = self.engine.sound_loader();
                 return Task::perform(async move {
@@ -3475,10 +3646,13 @@ impl App {
                         let exports = folder.parent().unwrap().join("Треки");
                         std::fs::create_dir_all(&exports).map_err(|e| e.to_string())?;
                         let path = unique_path(&exports, "Трек.wav");
-                        soundpad::write_wav(&path, &audio)?;
+                        let selected = loop_range.map_or(&audio[..], |(start, end)| &audio[start..end]);
+                        let gain = volume as f32 / 100.0;
+                        let selected: Vec<f32> = selected.iter().map(|v| (v * gain).clamp(-1.0, 1.0)).collect();
+                        soundpad::write_wav(&path, &selected)?;
                         Ok(Some(path))
                     } else {
-                        loader.load(studio::TRACK_ID, &audio, 1.0)?;
+                        loader.load_studio(studio::TRACK_ID, &audio, volume as f32 / 100.0, loop_range)?;
                         Ok(None)
                     }
                 }, move |r| Msg::StudioRendered(export, r));
@@ -3489,7 +3663,13 @@ impl App {
                     Ok(Some(path)) => self.studio_note = format!("Сохранено: {}", path.display()),
                     Ok(None) if !export && self.snapshot.state == 3 => {
                         if self.studio_cursor >= studio::STEPS as f32 { self.studio_cursor = 0.0; }
+                        if self.studio_loop && (self.studio_cursor < self.studio_loop_start as f32
+                            || self.studio_cursor >= self.studio_loop_end as f32) {
+                            self.studio_cursor = self.studio_loop_start as f32;
+                        }
                         self.studio_follow = true;
+                        self.sync_studio_loop();
+                        self.engine.sound_gain(studio::TRACK_ID, self.studio_volume as f32 / 100.0);
                         self.engine.sound_restart(studio::TRACK_ID);
                         self.engine.sound_seek(studio::TRACK_ID, self.studio_cursor * 15.0 / self.studio_play_bpm as f32);
                         self.studio_note = "Трек отправлен в виртуальный микрофон".into();
@@ -3501,8 +3681,47 @@ impl App {
             }
             Msg::StudioClear => {
                 self.focus = focus::studio::CLEAR;
-                self.studio_events.retain(|e| e.step as usize / 16 != self.studio_bar);
+                studio::clear_bar(&mut self.studio_events, self.studio_bar);
                 self.dirty = Some(Instant::now());
+            }
+            Msg::StudioDeleteAsk(name) => {
+                if self.studio_samples.contains(&name) {
+                    self.studio_delete = Some(name);
+                    self.focus = focus::studio::DELETE_CANCEL;
+                }
+            }
+            Msg::StudioDeleteCancel => {
+                self.studio_delete = None;
+                self.focus = focus::studio::IMPORT;
+            }
+            Msg::StudioDeleteConfirm => {
+                let Some(name) = self.studio_delete.clone() else { return Task::none(); };
+                if self.studio_busy || !studio::valid_name(&name) { return Task::none(); }
+                self.studio_busy = true;
+                let folder = self.studio_folder.clone();
+                let target_name = name.clone();
+                return Task::perform(async move {
+                    let deleted = folder.parent().unwrap().join("Удалённые");
+                    std::fs::create_dir_all(&deleted).map_err(|e| e.to_string())?;
+                    std::fs::rename(folder.join(&target_name), unique_path(&deleted, &target_name)).map_err(|e| e.to_string())
+                }, move |result| Msg::StudioDeleted(name, result));
+            }
+            Msg::StudioDeleted(name, result) => {
+                self.studio_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.studio_delete = None;
+                        self.studio_samples.retain(|s| s != &name);
+                        self.studio_events.retain(|e| e.sample != name);
+                        if self.studio_selected.as_ref() == Some(&name) {
+                            self.studio_selected = self.studio_samples.first().cloned();
+                        }
+                        if self.sound_playing.0 == studio::TRACK_ID { self.engine.sound_play(0); }
+                        self.studio_note = format!("Звук перемещён в «Удалённые»: {name}");
+                        self.dirty = Some(Instant::now());
+                    }
+                    Err(e) => self.studio_note = format!("Не удалось удалить звук: {e}"),
+                }
             }
             Msg::SoundPlay(i) => {
                 let Some(sound) = self.sounds.get(i) else {
@@ -3890,8 +4109,14 @@ impl App {
                 items
             } else if self.studio_page {
                 use focus::studio::*;
-                let mut items = vec![RECORD, BPM, HEAR, STOP, PLAY, IMPORT];
-                items.extend((0..self.studio_samples.len()).map(|i| SAMPLE_BASE + i));
+                let compact = Self::window_size().width < 846.0;
+                let mut items = vec![RECORD, BPM, LOOP, LOOP_START, LOOP_END, ZOOM, VOLUME, HEAR, STOP, PLAY];
+                if compact { items.push(LIBRARY); }
+                if !compact || self.studio_library_open {
+                    items.push(IMPORT);
+                    for i in 0..self.studio_samples.len() { items.extend([SAMPLE_BASE + i, DELETE_BASE + i]); }
+                    if self.studio_delete.is_some() { items.extend([DELETE_CONFIRM, DELETE_CANCEL]); }
+                }
                 items.extend((0..studio::BARS).map(|i| BAR_BASE + i));
                 items.push(CURSOR);
                 items.push(CLEAR);
@@ -4138,14 +4363,28 @@ impl App {
                 IMPORT if activate => Msg::StudioImport,
                 BPM if delta != 0 => Msg::StudioBpm((self.studio_bpm as i32 + delta).clamp(60, 200) as u32),
                 BPM if activate => Msg::StudioBpm((self.studio_bpm + 1).min(200)),
+                LOOP if activate => Msg::StudioLoopEnabled(!self.studio_loop),
+                LOOP_START if delta != 0 => Msg::StudioLoopStart((self.studio_loop_start as i32 + delta).clamp(0, self.studio_loop_end as i32 - 1) as usize),
+                LOOP_START if activate => Msg::StudioLoopStart(self.studio_cursor as usize),
+                LOOP_END if delta != 0 => Msg::StudioLoopEnd((self.studio_loop_end as i32 + delta).clamp(self.studio_loop_start as i32 + 1, studio::STEPS as i32) as usize),
+                LOOP_END if activate => Msg::StudioLoopEnd(self.studio_cursor as usize + 1),
+                ZOOM if delta != 0 => Msg::StudioZoom((self.studio_zoom as i32 + delta).clamp(0, studio::ZOOMS.len() as i32 - 1) as usize),
+                ZOOM if activate => Msg::StudioZoom((self.studio_zoom + 1).min(studio::ZOOMS.len() - 1)),
+                VOLUME if delta != 0 => Msg::StudioVolume((self.studio_volume as i32 + delta * 10).clamp(0, 200) as u32),
+                VOLUME if activate => Msg::StudioVolume((self.studio_volume + 10).min(200)),
                 HEAR if activate => Msg::SoundpadHear(!self.sound_monitor),
                 STOP if activate => Msg::SoundpadStop,
                 PLAY if activate => Msg::StudioRender(false),
                 EXPORT if activate => Msg::StudioRender(true),
                 CLEAR if activate => Msg::StudioClear,
+                LIBRARY if activate => Msg::StudioLibraryToggle,
+                DELETE_CONFIRM if activate => Msg::StudioDeleteConfirm,
+                DELETE_CANCEL if activate => Msg::StudioDeleteCancel,
                 f if activate && (BAR_BASE..BAR_BASE + studio::BARS).contains(&f) => Msg::StudioBar(f - BAR_BASE),
                 f if activate && (SAMPLE_BASE..SAMPLE_BASE + self.studio_samples.len()).contains(&f) =>
                     Msg::StudioSelect(self.studio_samples[f - SAMPLE_BASE].clone()),
+                f if activate && (DELETE_BASE..DELETE_BASE + self.studio_samples.len()).contains(&f) =>
+                    Msg::StudioDeleteAsk(self.studio_samples[f - DELETE_BASE].clone()),
                 f if activate && (CELL_BASE..CELL_BASE + 16 * studio::NOTES).contains(&f) => {
                     let i = f - CELL_BASE;
                     Msg::StudioCell(self.studio_bar * 16 + i / studio::NOTES, studio::FIRST_NOTE + (i % studio::NOTES) as u8)
@@ -4445,6 +4684,9 @@ impl App {
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
                     )) => Some(Msg::DragEnd),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Right,
+                    )) => Some(Msg::StudioRightEnd),
                     iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
                         iced::mouse::Button::Left,
                     )) => Some(Msg::PointerDown),
@@ -4641,6 +4883,8 @@ mod controller_tests {
         assert_eq!(app.focus, focus::studio::RECORD);
         app.focus = focus::studio::BPM;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::studio::LOOP);
+        for _ in 0..5 { let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false); }
         assert_eq!(app.focus, focus::studio::HEAR);
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
         assert!(app.sound_monitor && app.monitor_mode() == 5);
@@ -4678,6 +4922,33 @@ mod controller_tests {
         assert_eq!(app.studio_events.len(), 2);
         let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
         assert!(!app.studio_page);
+    }
+    #[test]
+    fn studio_drag_loop_zoom_and_delete_confirmation() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.studio_samples.push("tone.wav".into());
+        app.studio_selected = Some("tone.wav".into());
+        let _ = app.update(Msg::StudioDrawStart(8, 60));
+        let _ = app.update(Msg::StudioCellEnter(11, 60));
+        assert_eq!((app.studio_events[0].step, app.studio_events[0].length), (8, 4));
+        let _ = app.update(Msg::StudioCellEnter(9, 60));
+        assert_eq!(app.studio_events[0].length, 2, "dragging back shortens the note");
+        let _ = app.update(Msg::DragEnd);
+        let _ = app.update(Msg::StudioEraseStart(9, 60));
+        assert!(app.studio_events.is_empty());
+        let _ = app.update(Msg::StudioRightEnd);
+        assert!(!app.studio_erasing);
+        let _ = app.update(Msg::StudioLoopStart(16));
+        let _ = app.update(Msg::StudioLoopEnd(32));
+        assert!(app.studio_loop && (app.studio_loop_start, app.studio_loop_end) == (16, 32));
+        let _ = app.update(Msg::StudioVolume(170));
+        assert_eq!(app.studio_volume, 170);
+        let _ = app.update(Msg::StudioZoom(0));
+        assert_eq!(studio::ZOOMS[app.studio_zoom], 50);
+        let _ = app.update(Msg::StudioDeleteAsk("tone.wav".into()));
+        assert_eq!(app.studio_delete.as_deref(), Some("tone.wav"));
+        let _ = app.update(Msg::StudioDeleteCancel);
+        assert!(app.studio_delete.is_none());
     }
     #[test]
     fn repair_requires_confirmation_and_exit_prevents_resume() {

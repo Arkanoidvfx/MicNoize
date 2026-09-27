@@ -71,16 +71,17 @@ pub fn reveal_focus() -> Task<Msg> {
         )
     })
 }
-pub fn studio_reveal(note: u8) -> Task<Msg> {
+pub fn studio_reveal(note: u8, zoom: u8, viewport: f32) -> Task<Msg> {
     iced::widget::operation::scroll_to(
         "studio-roll",
-        iced::widget::operation::AbsoluteOffset { x: None, y: Some(studio_offset(note)) },
+        iced::widget::operation::AbsoluteOffset { x: None, y: Some(studio_offset(note, zoom, viewport)) },
     )
 }
-pub fn studio_offset(note: u8) -> f32 {
-    // The roll descends from B5; its 25 px rows have a 3 px gap. Keep the note near center.
+pub fn studio_offset(note: u8, zoom: u8, viewport: f32) -> f32 {
+    // The roll descends from B5. Keep the selected note near the middle at each scale.
     let row = (studio::FIRST_NOTE + studio::NOTES as u8 - 1 - note) as f32;
-    (row * 28.0 - 165.0).max(0.0)
+    let pitch = 28.0 * zoom as f32 / 100.0;
+    (row * pitch - (viewport - pitch) / 2.0).max(0.0)
 }
 fn focus_scroll_delta(top: f32, height: f32, viewport_top: f32, viewport_height: f32) -> f32 {
     if top < viewport_top + 8.0 {
@@ -1976,6 +1977,9 @@ impl App {
         use focus::studio::*;
         let compact = width < 650.0;
         let cell_width = if compact { 16.0 } else { 27.0 };
+        let zoom = studio::ZOOMS[self.studio_zoom];
+        let pitch = 28.0 * zoom as f32 / 100.0;
+        let roll_height = if compact { 240.0 } else { 300.0 };
         let recording = self.engine.studio_recording();
         let mut library = column![
             bold("Звуки", 14, INK),
@@ -1983,21 +1987,59 @@ impl App {
             action(label("Добавить файлы", 12, INK), Msg::StudioImport, self.focus == IMPORT, false)
                 .on_press_maybe((!self.studio_busy).then_some(Msg::StudioImport)),
         ].spacing(7).width(if compact { Length::Fill } else { Length::Fixed(170.0) });
+        if compact {
+            library = library.push(action(label("← К сетке", 11, INK), Msg::StudioLibraryToggle, self.focus == LIBRARY, false));
+        }
+        if let Some(name) = &self.studio_delete {
+            library = library.push(column![
+                label(format!("Убрать «{}» из проекта?", name.chars().take(14).collect::<String>()), 11, INK),
+                row![
+                    action(label("Удалить", 11, RED), Msg::StudioDeleteConfirm, self.focus == DELETE_CONFIRM, false),
+                    action(label("Отмена", 11, INK), Msg::StudioDeleteCancel, self.focus == DELETE_CANCEL, false),
+                ].spacing(5),
+                label("Файл останется в папке «Удалённые».", 10, DIM),
+            ].spacing(5));
+        }
         for (i, name) in self.studio_samples.iter().enumerate() {
             let selected = self.studio_selected.as_ref() == Some(name);
             library = library.push(
-                action(label(name.chars().take(22).collect::<String>(), 12, if selected { ORANGE_DARK } else { INK }),
-                    Msg::StudioSelect(name.clone()), self.focus == SAMPLE_BASE + i, selected)
-                    .width(Length::Fill),
+                row![
+                    action(label(name.chars().take(16).collect::<String>(), 12, if selected { ORANGE_DARK } else { INK }),
+                        Msg::StudioSelect(name.clone()), self.focus == SAMPLE_BASE + i, selected).width(Length::Fill),
+                    action(label("×", 14, RED), Msg::StudioDeleteAsk(name.clone()),
+                        self.focus == DELETE_BASE + i, false).on_press_maybe((!self.studio_busy).then_some(Msg::StudioDeleteAsk(name.clone()))),
+                ].spacing(3),
             );
         }
         if self.studio_samples.is_empty() {
             library = library.push(label("Запишите микрофон или добавьте WAV, MP3, OGG, M4A.", 11, DIM));
         }
-        let mut bars = row![label("Такт", 12, DIM)].spacing(6).align_y(iced::Center);
+        let library = scrollable(library).height(if compact { 160 } else { 330 });
+        let bar_label: Element<'_, Msg> = if compact {
+            action(label("Звуки", 11, INK), Msg::StudioLibraryToggle, self.focus == LIBRARY, false).into()
+        } else { label("Такт", 12, DIM).into() };
+        let mut bars = row![bar_label].spacing(6).align_y(iced::Center);
         for bar in 0..studio::BARS {
             bars = bars.push(action(label(format!("{}", bar + 1), 12, if bar == self.studio_bar { ORANGE_DARK } else { INK }),
                 Msg::StudioBar(bar), self.focus == BAR_BASE + bar, bar == self.studio_bar));
+        }
+        let mut loop_strip = row![container(label("Луп", 10, DIM)).width(50)].spacing(0).align_y(iced::Center);
+        for step in 0..studio::STEPS {
+            let inside = step >= self.studio_loop_start && step < self.studio_loop_end;
+            let edge = step == self.studio_loop_start || step + 1 == self.studio_loop_end;
+            let playing = self.sound_playing.0 == studio::TRACK_ID && self.studio_cursor as usize == step;
+            let cell = container(Space::new().height(10)).width(Length::FillPortion(1)).height(10)
+                .style(move |_| container::Style {
+                    background: Some((if playing { INK } else if inside && edge { ORANGE }
+                        else if inside && self.studio_loop { Color::from_rgb8(0xA6, 0x68, 0x39) }
+                        else { CARD2 }).into()),
+                    ..Default::default()
+                });
+            loop_strip = loop_strip.push(mouse_area(cell)
+                .on_press(Msg::StudioLoopGrab(step))
+                .on_right_press(Msg::StudioLoopStart(step))
+                .on_enter(Msg::StudioLoopMove(step))
+                .interaction(iced::mouse::Interaction::Grab));
         }
         let cursor_bar = (self.studio_cursor as usize / 16).min(studio::BARS - 1);
         let cursor_here = cursor_bar == self.studio_bar;
@@ -2022,21 +2064,24 @@ impl App {
         let focused_row = self.focus.checked_sub(CELL_BASE)
             .filter(|&i| i < 16 * studio::NOTES)
             .map(|i| studio::NOTES - 1 - i % studio::NOTES);
-        let mounted = sound_rows(studio::NOTES, self.studio_scroll.0, self.studio_scroll.1, 28.0, focused_row);
+        let mounted = sound_rows(studio::NOTES, self.studio_scroll.0, self.studio_scroll.1, pitch, focused_row);
         let mut events = [None; 16 * studio::NOTES];
-        for event in self.studio_events.iter().filter(|e| e.step as usize / 16 == self.studio_bar) {
-            let cell = event.step as usize % 16;
+        for event in self.studio_events.iter().filter(|e| (e.step as usize) < (self.studio_bar + 1) * 16
+            && e.step as usize + e.length as usize > self.studio_bar * 16) {
             if let Some(row_note) = event.note.checked_sub(studio::FIRST_NOTE)
                 && (row_note as usize) < studio::NOTES
             {
-                events[cell * studio::NOTES + row_note as usize] = Some(event);
+                for step in (event.step as usize).max(self.studio_bar * 16)
+                    ..(event.step as usize + event.length as usize).min((self.studio_bar + 1) * 16) {
+                    events[(step % 16) * studio::NOTES + row_note as usize] = Some(event);
+                }
             }
         }
         let mut grid: widget::keyed::Column<'_, usize, Msg> = widget::keyed::Column::new().spacing(3);
         let mut next = 0;
         for at in mounted {
             if at > next {
-                grid = grid.push(usize::MAX - next, Space::new().height((at - next) as f32 * 28.0 - 3.0));
+                grid = grid.push(usize::MAX - next, Space::new().height((at - next) as f32 * pitch - 3.0));
             }
             next = at + 1;
             let row_note = studio::NOTES - 1 - at;
@@ -2050,44 +2095,46 @@ impl App {
                 let own = event.is_some_and(|e| Some(&e.sample) == self.studio_selected.as_ref());
                 let focused = self.focus == CELL_BASE + cell * studio::NOTES + row_note;
                 let beat = cell.is_multiple_of(4);
-                line = line.push(button(focus_target(label(if active { "●" } else { "·" }, 13,
+                let tile = container(focus_target(label(if event.is_some_and(|e| e.step as usize == step) { "●" }
+                    else if active { "━" } else { "·" }, if zoom == 50 { 10 } else { 13 },
                     if own { ORANGE_DARK } else if active { INK } else { FAINT }), focused))
-                    .width(cell_width).height(25).padding(0)
-                    .on_press_maybe(self.studio_selected.is_some().then_some(Msg::StudioCell(step, note)))
-                    .style(move |_, status| button::Style {
+                    .width(cell_width).height(pitch - 3.0).center_x(cell_width).center_y(pitch - 3.0)
+                    .style(move |_| container::Style {
                         background: Some((if own { ORANGE } else if active { Color::from_rgb8(0x62, 0x67, 0x70) }
-                            else if matches!(status, button::Status::Hovered | button::Status::Pressed) { HOVER }
                             else if beat { CARD2 } else { Color::from_rgb8(0x20, 0x21, 0x24) }).into()),
-                        text_color: INK,
                         border: outline(focused),
                         ..Default::default()
-                    }));
+                    });
+                line = line.push(mouse_area(tile)
+                    .on_press(Msg::StudioDrawStart(step, note))
+                    .on_right_press(Msg::StudioEraseStart(step, note))
+                    .on_enter(Msg::StudioCellEnter(step, note))
+                    .interaction(iced::mouse::Interaction::Crosshair));
             }
             grid = grid.push(at, line);
         }
         if next < studio::NOTES {
-            grid = grid.push(usize::MAX - next, Space::new().height((studio::NOTES - next) as f32 * 28.0 - 3.0));
+            grid = grid.push(usize::MAX - next, Space::new().height((studio::NOTES - next) as f32 * pitch - 3.0));
         }
         let roll = scrollable(grid).id("studio-roll")
             .on_scroll(|v| Msg::StudioScroll(v.absolute_offset().y, v.bounds().height))
-            .height(360).width(Length::Fill);
+            .height(roll_height).width(Length::Fill);
         let roll: Element<'_, Msg> = if cursor_here {
             let x = 52.0 + (self.studio_cursor - self.studio_bar as f32 * 16.0) * (cell_width + 2.0);
-            let line = row![Space::new().width(x).height(360),
-                container(Space::new().width(2).height(360)).width(2).style(|_| container::Style {
+            let line = row![Space::new().width(x).height(roll_height),
+                container(Space::new().width(2).height(roll_height)).width(2).style(|_| container::Style {
                     background: Some(ORANGE.into()), ..Default::default()
-                })].height(360);
-            widget::stack![roll, line].height(360).width(Length::Fill).into()
+                })].height(roll_height);
+            widget::stack![roll, line].height(roll_height).width(Length::Fill).into()
         } else { roll.into() };
-        let piano = column![
+        let mut piano = column![
             row![bars, Space::new().width(Length::Fill), action(label("Очистить такт", 11, INK), Msg::StudioClear, self.focus == CLEAR, false)]
                 .align_y(iced::Center),
-            label("Нажмите клетку для ноты; тяните метку по линейке для перемотки. C4 — исходная высота.", 11, DIM),
-            header,
-            roll,
-        ].spacing(9);
+        ].spacing(if compact { 5 } else { 7 });
+        if !compact { piano = piano.push(label("ЛКМ: протянуть ноту · ПКМ: стереть · Линейка: перемотка", 11, DIM)); }
+        let piano = piano.push(loop_strip).push(header).push(roll);
         let workspace: Element<'_, Msg> = if compact {
-            column![library, piano].spacing(14).into()
+            if self.studio_library_open { library.into() } else { piano.into() }
         } else {
             row![library, container(piano).width(Length::Fill)].spacing(16).into()
         };
@@ -2107,22 +2154,60 @@ impl App {
                 .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(false))),
         ].spacing(7).align_y(iced::Center);
         let transport: Element<'_, Msg> = if compact {
-            column![row![record, Space::new().width(Length::Fill), bpm].align_y(iced::Center), actions].spacing(8).into()
+            column![
+                row![bpm, Space::new().width(Length::Fill),
+                    action(label("В Discord", 12, ORANGE_DARK), Msg::StudioRender(false), self.focus == PLAY, !self.studio_events.is_empty())
+                        .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(false)))].align_y(iced::Center),
+                row![record, Space::new().width(Length::Fill),
+                    frame(switch(self.studio_loop, Msg::StudioLoopEnabled, true), self.focus == LOOP),
+                    label("Луп", 11, DIM),
+                    frame(switch(self.sound_monitor, Msg::SoundpadHear, true), self.focus == HEAR),
+                    label("Себе", 11, DIM),
+                    action(label("Стоп", 11, INK), Msg::SoundpadStop, self.focus == STOP, false)]
+                    .spacing(5).align_y(iced::Center),
+            ].spacing(7).into()
         } else {
             row![record, Space::new().width(16), bpm, Space::new().width(Length::Fill), actions]
                 .align_y(iced::Center).into()
         };
-        column![
-            row![title("Студия"), Space::new().width(Length::Fill), label("4 такта · C2–B5", 12, DIM)].align_y(iced::Center),
-            label("Соберите короткий трек и отправьте его в виртуальный микрофон.", 12, DIM),
-            card(transport),
-            card(workspace),
-            row![
-                action(label("Сохранить WAV", 12, INK), Msg::StudioRender(true), self.focus == EXPORT, false)
-                    .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(true))),
-                label(&self.studio_note, 12, if self.studio_note.starts_with("Не удалось") || self.studio_note.starts_with("Сборка") { RED } else { DIM }),
-            ].spacing(12).align_y(iced::Center),
-        ].spacing(12).into()
+        let loop_tools = row![
+            frame(switch(self.studio_loop, Msg::StudioLoopEnabled, true), self.focus == LOOP),
+            label("Луп", 12, DIM),
+            action(label(format!("От {:02}", self.studio_loop_start + 1), 11, INK),
+                Msg::StudioLoopStart(self.studio_cursor as usize), self.focus == LOOP_START, false),
+            action(label(format!("До {:02}", self.studio_loop_end), 11, INK),
+                Msg::StudioLoopEnd(self.studio_cursor as usize + 1), self.focus == LOOP_END, false),
+        ].spacing(7).align_y(iced::Center);
+        let zoom_tools = row![
+            label("Ноты", 11, DIM),
+            action(label("−", 14, INK), Msg::StudioZoom(self.studio_zoom.saturating_sub(1)), self.focus == ZOOM, false),
+            numbers(format!("{}%", zoom), 12, ORANGE),
+            action(label("+", 14, INK), Msg::StudioZoom((self.studio_zoom + 1).min(studio::ZOOMS.len() - 1)), self.focus == ZOOM, false),
+        ].spacing(4).align_y(iced::Center);
+        let volume_tools = row![
+            label("Трек", 11, DIM),
+            action(label("−", 14, INK), Msg::StudioVolume(self.studio_volume.saturating_sub(10)), self.focus == VOLUME, false),
+            numbers(format!("{}%", self.studio_volume), 12, ORANGE),
+            action(label("+", 14, INK), Msg::StudioVolume((self.studio_volume + 10).min(200)), self.focus == VOLUME, false),
+        ].spacing(4).align_y(iced::Center);
+        let tools: Element<'_, Msg> = if compact {
+            column![loop_tools, row![zoom_tools, Space::new().width(16), volume_tools]].spacing(8).into()
+        } else {
+            row![loop_tools, Space::new().width(Length::Fill), zoom_tools,
+                Space::new().width(18), volume_tools].align_y(iced::Center).into()
+        };
+        let heading = row![title("Студия"), Space::new().width(Length::Fill), label("4 такта · C2–B5", 12, DIM)].align_y(iced::Center);
+        let footer = row![
+            action(label("Сохранить WAV", 12, INK), Msg::StudioRender(true), self.focus == EXPORT, false)
+                .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(true))),
+            label(&self.studio_note, 12, if self.studio_note.starts_with("Не удалось") || self.studio_note.starts_with("Сборка") { RED } else { DIM }),
+        ].spacing(12).align_y(iced::Center);
+        if compact {
+            column![heading, card(transport), card(workspace), card(tools), footer].spacing(9).into()
+        } else {
+            column![heading, label("Соберите короткий трек и отправьте его в виртуальный микрофон.", 12, DIM),
+                card(column![transport, tools].spacing(10)), card(workspace), footer].spacing(12).into()
+        }
     }
 
     fn soundpad_view(&self) -> Element<'_, Msg> {
@@ -3264,7 +3349,7 @@ mod tests {
     }
     #[test]
     fn studio_roll_mounts_only_visible_notes() {
-        let rows = sound_rows(studio::NOTES, studio_offset(studio::ROOT_NOTE), 360.0, 28.0, Some(47));
+        let rows = sound_rows(studio::NOTES, studio_offset(studio::ROOT_NOTE, 100, 300.0), 300.0, 28.0, Some(47));
         assert!(rows.len() <= 22, "the roll must not rebuild all 48 note rows");
         assert!(rows.contains(&23), "C4 starts in the viewport");
         assert!(rows.contains(&47), "an off-screen keyboard target stays mounted");

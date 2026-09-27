@@ -1120,8 +1120,9 @@ void Engine::preview(const float* audio,const RoutedSample* routed,const uint8_t
         if(!preview_.push(samples.data(),n))break;
     }
 }
-void Engine::soundLoad(unsigned id,std::vector<float> samples,float gain) {
+void Engine::soundLoad(unsigned id,std::vector<float> samples,float gain,unsigned loopStart,unsigned loopEnd,bool independentVolume) {
     auto clip=std::make_shared<SoundClip>();clip->samples=std::move(samples);clip->gain=gain;
+    clip->loopRange=(uint64_t(loopStart)<<32)|loopEnd;clip->independentVolume=independentVolume;
     std::lock_guard lock(soundMutex_);sounds_[id]=std::move(clip);
 }
 bool Engine::soundGain(unsigned id,float gain) {
@@ -1138,6 +1139,11 @@ unsigned Engine::clipCopy(float* out,unsigned capacity,unsigned* generation) {
     const auto count=static_cast<unsigned>(clip_.size());
     if(out&&capacity)std::copy_n(clip_.begin(),std::min(count,capacity),out);
     return count;
+}
+bool Engine::soundLoop(unsigned id,unsigned start,unsigned end) {
+    std::lock_guard lock(soundMutex_);const auto found=sounds_.find(id);
+    if(found==sounds_.end() || (!end && start) || (end && (start>=end || end>found->second->samples.size())))return false;
+    found->second->loopRange=(uint64_t(start)<<32)|end;return true;
 }
 unsigned Engine::studioCopy(float* out,unsigned capacity,unsigned* generation) {
     std::lock_guard lock(studioMutex_);

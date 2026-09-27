@@ -226,6 +226,18 @@ extern "C" int32_t mnr_sound_seek(Mnr* p,uint32_t id,float seconds) {
     if(!p || !id || !std::isfinite(seconds) || seconds<0 || seconds>300)return 0;
     p->engine.soundSeek(id,static_cast<unsigned>(seconds*48000));return 1;
 }
+extern "C" int32_t mnr_studio_load(Mnr* p,uint32_t id,const float* samples,uint32_t count,float gain,uint32_t start,uint32_t end) {
+    if(!p || !id || !samples || !count || count>mic::rate*300 || !std::isfinite(gain) || gain<0 || gain>2
+        || (!end && start) || (end && (start>=end || end>count)))return 0;
+    try {
+        std::vector<float> clip(samples,samples+count);
+        for(auto& v:clip)v=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
+        p->engine.soundLoad(id,std::move(clip),gain,start,end,true);return 1;
+    } catch(...) {return 0;}
+}
+extern "C" int32_t mnr_sound_loop(Mnr* p,uint32_t id,uint32_t start,uint32_t end) {
+    return p && id && p->engine.soundLoop(id,start,end)?1:0;
+}
 extern "C" void mnr_sound_volume(Mnr* p,float volume) {if(std::isfinite(volume)&&volume>=0&&volume<=2)p->engine.soundVolume=volume;}
 extern "C" int32_t mnr_sound_bindings(Mnr* p,const uint32_t* ids,const uint32_t* keys,uint32_t count) {
     if(count && (!ids || !keys)) return 0;

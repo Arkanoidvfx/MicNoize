@@ -96,6 +96,8 @@ unsafe extern "C" {
     fn mnr_replace_file(from: *const u8, fl: u32, to: *const u8, tl: u32) -> i32;
     fn mnr_usage(cpu: *mut u64, memory: *mut u64);
     fn mnr_sound_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32) -> i32;
+    fn mnr_studio_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32, start: u32, end: u32) -> i32;
+    fn mnr_sound_loop(p: usize, id: u32, start: u32, end: u32) -> i32;
     fn mnr_sound_gain(p: usize, id: u32, gain: f32) -> i32;
     fn mnr_sound_clear(p: usize);
     fn mnr_sound_play(p: usize, id: u32);
@@ -130,6 +132,13 @@ impl SoundLoader {
     pub fn load(&self, id: u32, samples: &[f32], gain: f32) -> Result<(), String> {
         if unsafe { mnr_sound_load(self.0, id, samples.as_ptr(), samples.len() as u32, gain) } == 0 {
             return Err("Движок отклонил звук".into());
+        }
+        Ok(())
+    }
+    pub fn load_studio(&self, id: u32, samples: &[f32], gain: f32, loop_range: Option<(usize, usize)>) -> Result<(), String> {
+        let (start, end) = loop_range.unwrap_or((0, 0));
+        if unsafe { mnr_studio_load(self.0, id, samples.as_ptr(), samples.len() as u32, gain, start as u32, end as u32) } == 0 {
+            return Err("Движок отклонил трек".into());
         }
         Ok(())
     }
@@ -650,6 +659,10 @@ impl Engine {
     }
     pub fn sound_seek(&self, id: u32, seconds: f32) -> bool {
         unsafe { mnr_sound_seek(self.p, id, seconds) != 0 }
+    }
+    pub fn sound_loop(&self, id: u32, range: Option<(usize, usize)>) -> bool {
+        let (start, end) = range.unwrap_or((0, 0));
+        unsafe { mnr_sound_loop(self.p, id, start as u32, end as u32) != 0 }
     }
     pub fn sound_volume(&self, volume: f32) {
         unsafe { mnr_sound_volume(self.p, volume) }

@@ -43,6 +43,12 @@ int main(){try{
         float clip[480];for(auto& v:clip)v=0.5f;float bad[1]{std::numeric_limits<float>::quiet_NaN()};
         require(mnr_sound_load(p,0,clip,480,1)==0 && mnr_sound_load(p,1,nullptr,480,1)==0 && mnr_sound_load(p,1,clip,0,1)==0,"Invalid clip accepted");
         require(mnr_sound_load(p,1,bad,1,1)==1 && mnr_sound_load(p,2,clip,480,1.5f)==1,"Clip load failed");
+        require(!mnr_studio_load(p,800000,clip,480,1,400,200)
+            && !mnr_studio_load(p,800000,clip,480,1,1,0)
+            && mnr_studio_load(p,800000,clip,480,1,0,480)
+            && !mnr_sound_loop(p,800000,400,200)
+            && mnr_sound_loop(p,800000,0,240)
+            && mnr_sound_loop(p,800000,0,0),"Studio loop validation");
         require(mnr_sound_gain(p,2,0.5f)==1 && mnr_sound_gain(p,9,0.5f)==0 && mnr_sound_gain(p,2,3)==0,"Clip gain validation");
         uint32_t ids[]={1,2,0};uint32_t soundKeys[]={200,201,202};
         require(mnr_sound_bindings(p,ids,soundKeys,3)==1,"Sound bindings rejected");

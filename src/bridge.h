@@ -63,6 +63,9 @@ int32_t mnr_replace_file(const char* from,uint32_t from_len,const char* to,uint3
 void mnr_usage(uint64_t* cpu_100ns,uint64_t* working_set);
 // Soundpad. Clips are 48 kHz mono float, at most 5 minutes; id 0 means "stop" everywhere.
 int32_t mnr_sound_load(Mnr*,uint32_t id,const float* samples,uint32_t count,float gain);
+// Studio clips bypass the soundpad volume and can loop between sample frames [start,end).
+int32_t mnr_studio_load(Mnr*,uint32_t id,const float* samples,uint32_t count,float gain,uint32_t start,uint32_t end);
+int32_t mnr_sound_loop(Mnr*,uint32_t id,uint32_t start,uint32_t end);
 int32_t mnr_sound_gain(Mnr*,uint32_t id,float gain);
 void mnr_sound_clear(Mnr*);
 void mnr_sound_play(Mnr*,uint32_t id);
