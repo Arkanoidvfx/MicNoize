@@ -221,6 +221,11 @@ extern "C" int32_t mnr_sound_gain(Mnr* p,uint32_t id,float gain) {
 }
 extern "C" void mnr_sound_clear(Mnr* p) {p->engine.soundClear();}
 extern "C" void mnr_sound_play(Mnr* p,uint32_t id) {p->engine.soundPlay(id);}
+extern "C" void mnr_sound_restart(Mnr* p,uint32_t id) {if(id)p->engine.soundPlay(id,true);}
+extern "C" int32_t mnr_sound_seek(Mnr* p,uint32_t id,float seconds) {
+    if(!p || !id || !std::isfinite(seconds) || seconds<0 || seconds>300)return 0;
+    p->engine.soundSeek(id,static_cast<unsigned>(seconds*48000));return 1;
+}
 extern "C" void mnr_sound_volume(Mnr* p,float volume) {if(std::isfinite(volume)&&volume>=0&&volume<=2)p->engine.soundVolume=volume;}
 extern "C" int32_t mnr_sound_bindings(Mnr* p,const uint32_t* ids,const uint32_t* keys,uint32_t count) {
     if(count && (!ids || !keys)) return 0;
@@ -241,6 +246,16 @@ extern "C" uint32_t mnr_sound_state(Mnr* p,float* position,float* length) {
 extern "C" uint32_t mnr_last_clip(Mnr* p,float* out,uint32_t capacity,uint32_t* generation) {
     if(!p)return 0;
     try {return p->engine.clipCopy(out,capacity,generation);} catch(...) {return 0;}
+}
+extern "C" int32_t mnr_studio_record(Mnr* p,int32_t enabled) {
+    if(!p)return 0;
+    if(enabled && (p->engine.state!=3 || p->engine.muted))return 0;
+    p->engine.studioRecording=enabled!=0;return 1;
+}
+extern "C" int32_t mnr_studio_recording(Mnr* p) {return p && p->engine.studioRecording?1:0;}
+extern "C" uint32_t mnr_studio_clip(Mnr* p,float* out,uint32_t capacity,uint32_t* generation) {
+    if(!p)return 0;
+    try {return p->engine.studioCopy(out,capacity,generation);} catch(...) {return 0;}
 }
 extern "C" int32_t mnr_pick_paths(int32_t mode,char* result,uint32_t capacity) {
     if(mode<0 || mode>1 || !result || !capacity) return -1;

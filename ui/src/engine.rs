@@ -99,11 +99,16 @@ unsafe extern "C" {
     fn mnr_sound_gain(p: usize, id: u32, gain: f32) -> i32;
     fn mnr_sound_clear(p: usize);
     fn mnr_sound_play(p: usize, id: u32);
+    fn mnr_sound_restart(p: usize, id: u32);
+    fn mnr_sound_seek(p: usize, id: u32, seconds: f32) -> i32;
     fn mnr_sound_volume(p: usize, volume: f32);
     fn mnr_sound_bindings(p: usize, ids: *const u32, keys: *const u32, count: u32) -> i32;
     fn mnr_sound_state(p: usize, position: *mut f32, length: *mut f32) -> u32;
     fn mnr_pick_paths(mode: i32, result: *mut c_char, capacity: u32) -> i32;
     fn mnr_last_clip(p: usize, out: *mut f32, capacity: u32, generation: *mut u32) -> u32;
+    fn mnr_studio_record(p: usize, enabled: i32) -> i32;
+    fn mnr_studio_recording(p: usize) -> i32;
+    fn mnr_studio_clip(p: usize, out: *mut f32, capacity: u32, generation: *mut u32) -> u32;
 }
 /// Modal Windows picker; blocks the calling thread, so run it from a background task.
 pub fn pick_paths(folder: bool) -> Result<Vec<std::path::PathBuf>, String> {
@@ -640,6 +645,12 @@ impl Engine {
     pub fn sound_play(&self, id: u32) {
         unsafe { mnr_sound_play(self.p, id) }
     }
+    pub fn sound_restart(&self, id: u32) {
+        unsafe { mnr_sound_restart(self.p, id) }
+    }
+    pub fn sound_seek(&self, id: u32, seconds: f32) -> bool {
+        unsafe { mnr_sound_seek(self.p, id, seconds) != 0 }
+    }
     pub fn sound_volume(&self, volume: f32) {
         unsafe { mnr_sound_volume(self.p, volume) }
     }
@@ -665,6 +676,23 @@ impl Engine {
         }
         let mut samples = vec![0.0; count as usize];
         let written = unsafe { mnr_last_clip(self.p, samples.as_mut_ptr(), count, &mut generation) };
+        samples.truncate(written.min(count) as usize);
+        Some((generation, samples))
+    }
+    pub fn studio_record(&self, enabled: bool) -> bool {
+        unsafe { mnr_studio_record(self.p, enabled as i32) != 0 }
+    }
+    pub fn studio_recording(&self) -> bool {
+        unsafe { mnr_studio_recording(self.p) != 0 }
+    }
+    pub fn studio_clip(&self, known: u32) -> Option<(u32, Vec<f32>)> {
+        let mut generation = 0;
+        let count = unsafe { mnr_studio_clip(self.p, std::ptr::null_mut(), 0, &mut generation) };
+        if generation == known || count == 0 { return None; }
+        let expected = generation;
+        let mut samples = vec![0.0; count as usize];
+        let written = unsafe { mnr_studio_clip(self.p, samples.as_mut_ptr(), count, &mut generation) };
+        if generation != expected || written != count { return None; }
         samples.truncate(written.min(count) as usize);
         Some((generation, samples))
     }

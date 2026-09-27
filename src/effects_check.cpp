@@ -79,6 +79,9 @@ int main() {try {
         // and the mix bypasses Discord gain while staying out of the effect-only preview.
         mic::SoundPlayer player;std::array<float,480> sound{};
         auto clip=std::make_shared<mic::SoundClip>();clip->samples.assign(4800,0.5f);clip->gain=1;
+        mic::SoundPlayer fromCursor;fromCursor.start(7,clip);
+        require(fromCursor.seek(7,2400) && std::abs(fromCursor.position()-0.05f)<1e-6f,"Initial seek must start at the cursor");
+        fromCursor.render(sound.data(),480,1);require(sound[0]==0.5f,"Initial seek leaked the clip beginning");
         auto request=[&](unsigned id,uint64_t serial,bool restart){const auto packed=mic::SoundPlayer::pack(id,serial,restart);const auto lookup=player.request(packed);if(lookup){player.commit(packed);player.start(lookup,clip);}return lookup;};
         player.render(sound.data(),480,1);require(sound[0]==0 && player.playing()==0,"Idle player produced audio");
         require(request(3,1,false)==3,"First press must look up the clip");
@@ -86,11 +89,20 @@ int main() {try {
         std::array<uint8_t,480> soundFlags{};
         player.render(sound.data(),480,1.0f,false,soundFlags.data());require(sound[100]==0.5f && soundFlags[100]==0 && player.playing()==3 && player.length()==0.1f,"Clip did not play");
         player.render(sound.data(),480,0.5f);require(std::abs(sound[100]-0.25f)<1e-6,"Volume ignored");
+        require(!player.seek(4,2400) && player.seek(3,2400),"Seek must target the playing clip");
+        player.render(sound.data(),480,1);
+        require(sound[0]==0.5f && sound[239]<0.02f && sound[240]<0.001f
+            && sound[479]>0.49f && player.position()>0.05f && player.position()<0.06f,
+            "Seek must fade out, jump, then fade in");
+        player.render(sound.data(),480,1); // finish the 5 ms fade-in before the restart check
         require(request(3,2,true)==3,"Quick double press must restart");
         player.render(sound.data(),480,1);
         require(sound[0]==0.5f && sound[239]<0.02f && sound[240]<0.001f && sound[241]==0.5f && player.position()<0.006f,"Restart must fade out then start from the beginning");
         require(request(3,3,false)==0,"Second press of the playing clip must stop it");
         player.render(sound.data(),480,1);require(sound[0]==0.5f && sound[120]<0.26f && sound[300]==0 && player.playing()==0,"Stop did not fade to silence");
+        mic::SoundPlayer queued;queued.start(3,clip);queued.render(sound.data(),480,1);
+        queued.start(4,clip);queued.stop();queued.render(sound.data(),480,1);
+        require(queued.playing()==0,"Stop played a queued replacement");
         request(3,4,false);for(int i=0;i<12;++i)player.render(sound.data(),480,1);require(player.playing()==0,"Clip did not end");
         require(request(0,5,false)==0 && request(0,5,false)==0,"Stop request must not look anything up");
         mic::OutputEffects output;std::array<uint8_t,480> sources{};sources.fill(1);std::array<float,480> only{},mixed{};mixed.fill(0.25f);

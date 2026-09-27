@@ -20,6 +20,7 @@ The product and internal app name is **Mic Noize**. Installed program files live
 | Microphone / output / monitor / Discord capture | `src/audio.cpp`, `src/audio.hpp` | `src/check.cpp`; both TAG and WASAPI paths |
 | Hotkeys / stale state / tray / lifecycle | `src/hotkeys.hpp`, `src/bridge.cpp` | `src/bridge_check.cpp`, UI controller |
 | Soundpad clips / folder / clip hotkeys | `ui/src/soundpad.rs`, `SoundPlayer` in `src/audio.hpp` | `mnr_sound_*` in `src/bridge.cpp`, `effects_check`, controller test `soundpad_keys_volumes_and_keyboard` |
+| Studio piano roll / sample recording | `ui/src/studio.rs`, studio handlers in `ui/src/main.rs` and page in `ui/src/view.rs` | bounded microphone capture in `src/audio.cpp`, `mnr_studio_*` C ABI, shared SoundPlayer output |
 | C ABI / control messages | `src/bridge.h`, `src/bridge.cpp`, `ui/src/engine.rs` | all native callers and Rust FFI; fixed-width fields/layout |
 | Persistent virtual microphone | `src/tag_host.cpp`, `src/tag_link.hpp`, `src/tag.hpp`, `src/tag_endpoint.cpp`, `src/tag_task.cpp`, `src/tag_protocol.hpp` | `enable-tag-host.ps1`; host owns the driver connection and endpoint level guard; `tagHostInstalled()` gates the shell before the core component lands |
 | TAG driver capability / measured gain | `src/tag_probe.cpp`, `driver-feasibility.md` | Build `mic_tag_probe`; endpoint inspection is read-only, range/line probes require the host stopped, signal probes require the host running with processing stopped. Not part of ordinary CTest. |

@@ -11,6 +11,9 @@ int main(){try{
     char error[4096]{};Mnr* p=mnr_create(error,sizeof(error));require(p!=nullptr,error);
     struct Guard{Mnr* p;~Guard(){mnr_destroy(p);}}guard{p};
     MnrSnapshot s{};mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0,"Initial state");
+    unsigned studioGeneration=99;
+    require(!mnr_studio_record(p,1) && !mnr_studio_recording(p),"Stopped studio recorder started");
+    require(mnr_studio_clip(p,nullptr,0,&studioGeneration)==0 && studioGeneration==0,"Empty studio clip state");
     require(mnr_monitor_state(p,error,sizeof(error))==0,"Monitor must start off");
     require(!mnr_monitor(p,1,error,sizeof(error)),"Stopped engine must not enable monitoring");
     require(mnr_monitor(p,0,error,sizeof(error))==1,"Monitor off must be idempotent");
@@ -48,7 +51,12 @@ int main(){try{
         soundKeys[1]=0;require(mnr_sound_bindings(p,ids,soundKeys,3)==0,"Empty sound key accepted");
         require(mnr_sound_bindings(p,nullptr,nullptr,0)==1,"Clearing sound bindings failed");
         float position=1,length=1;require(mnr_sound_state(p,&position,&length)==0 && position==0 && length==0,"Stopped engine reports a playing clip");
-        mnr_sound_play(p,2);mnr_sound_volume(p,1.5f);mnr_sound_clear(p);
+        mnr_sound_play(p,2);mnr_sound_volume(p,1.5f);
+        require(mnr_sound_seek(p,2,0.05f)==1 && mnr_sound_seek(p,0,0)==0
+            && mnr_sound_seek(p,2,-1)==0 && mnr_sound_seek(p,2,std::numeric_limits<float>::quiet_NaN())==0,
+            "Sound seek validation");
+        mnr_sound_restart(p,2);
+        mnr_sound_clear(p);
         require(mnr_sound_gain(p,2,0.5f)==0,"Clear kept clips");
         require(mnr_pick_paths(2,error,sizeof(error))==-1,"Invalid picker mode accepted");
     }

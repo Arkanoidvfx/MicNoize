@@ -9,6 +9,7 @@ mod settings;
 mod smooth;
 mod tacho;
 mod soundpad;
+mod studio;
 mod telemetry;
 mod updater;
 mod maintenance;
@@ -202,11 +203,13 @@ mod focus {
     pub const TAB_LOGS: usize = 76;
     /// Page 6 (effects), split from the microphone page in 0.2.8.
     pub const TAB_EFFECTS: usize = 80;
+    pub const TAB_STUDIO: usize = 30000;
     pub fn tab(page: u8) -> usize {
         match page {
             4 => TAB_SOUNDPAD,
             5 => TAB_LOGS,
             6 => TAB_EFFECTS,
+            7 => TAB_STUDIO,
             _ => TAB_BASE + page as usize,
         }
     }
@@ -233,6 +236,20 @@ mod focus {
         pub const ROW_BASE: usize = 1000;
         /// Sidebar entry `i` of `App::section_items`.
         pub const SECTION_BASE: usize = 20000;
+    }
+    pub mod studio {
+        pub const RECORD: usize = 30001;
+        pub const IMPORT: usize = 30002;
+        pub const BPM: usize = 30003;
+        pub const PLAY: usize = 30004;
+        pub const EXPORT: usize = 30005;
+        pub const CLEAR: usize = 30006;
+        pub const STOP: usize = 30007;
+        pub const HEAR: usize = 30008;
+        pub const CURSOR: usize = 30009;
+        pub const BAR_BASE: usize = 30010;
+        pub const SAMPLE_BASE: usize = 30100;
+        pub const CELL_BASE: usize = 32000;
     }
     pub mod settings {
         pub const INPUT: usize = 0;
@@ -539,6 +556,21 @@ enum Msg {
     ScrollProbe(&'static str, Option<(f32, f32, f32)>),
     ScrollFrame(Instant),
     SoundpadStop,
+    StudioBpm(u32),
+    StudioBar(usize),
+    StudioSelect(String),
+    StudioCell(usize, u8),
+    StudioGrab(usize),
+    StudioDrag(usize),
+    StudioScroll(f32, f32),
+    StudioRecord,
+    StudioRecorded(Result<String, String>),
+    StudioImport,
+    StudioPicked(Result<Vec<PathBuf>, String>),
+    StudioImported(Result<(), String>),
+    StudioRender(bool),
+    StudioRendered(bool, Result<Option<PathBuf>, String>),
+    StudioClear,
     SectionSelect(usize),
     SectionAdd,
     SectionName(String),
@@ -600,6 +632,21 @@ struct SectionItem {
 struct ResumeIntent {microphone:bool,headphones:bool,monitor:i32,full_monitor:bool}
 struct App {
     soundpad_page: bool,
+    studio_page: bool,
+    studio_folder: PathBuf,
+    studio_samples: Vec<String>,
+    studio_selected: Option<String>,
+    studio_events: Vec<studio::Event>,
+    studio_bpm: u32,
+    studio_bar: usize,
+    studio_cursor: f32,
+    studio_scrubbing: bool,
+    studio_follow: bool,
+    studio_play_bpm: u32,
+    studio_scroll: (f32, f32),
+    studio_generation: u32,
+    studio_busy: bool,
+    studio_note: String,
     sound_folder: Option<PathBuf>,
     sounds: Vec<Sound>,
     sound_volume: f32,
@@ -968,6 +1015,10 @@ impl App {
             .unwrap_or(Path::new("."))
             .join("Записи");
         let clips = newest_clips(&clips_folder);
+        let studio_folder = settings.path.parent().unwrap_or(Path::new(".")).join("Студия").join("Звуки");
+        let studio_samples = studio::scan(&studio_folder);
+        let studio_selected = studio_samples.first().cloned();
+        let (studio_bpm, studio_events) = studio::load(&settings);
         if !cfg!(test) {
             engine.refresh();
         }
@@ -1049,6 +1100,21 @@ impl App {
             .unwrap_or_default();
         let mut app = Self {
                 soundpad_page: args.iter().any(|s| s == "--ui-soundpad"),
+                studio_page: args.iter().any(|s| s == "--ui-studio"),
+                studio_folder,
+                studio_samples,
+                studio_selected,
+                studio_events,
+                studio_bpm,
+                studio_bar: 0,
+                studio_cursor: 0.0,
+                studio_scrubbing: false,
+                studio_follow: true,
+                studio_play_bpm: studio_bpm,
+                studio_scroll: (view::studio_offset(studio::ROOT_NOTE), 360.0),
+                studio_generation: 0,
+                studio_busy: false,
+                studio_note: String::new(),
                 sound_folder,
                 sounds,
                 sound_volume,
@@ -1353,6 +1419,8 @@ impl App {
         );
         self.settings
             .set("soundpad", "sounds", soundpad::serialize(&self.sounds));
+        self.settings.set("studio", "bpm", self.studio_bpm);
+        self.settings.set("studio", "events", serde_json::to_string(&self.studio_events).unwrap_or_default());
         self.controls.rvc_options.save(&mut self.settings);
         self.engine
             .save(self.settings.path.clone(), self.settings.text());
@@ -1445,11 +1513,25 @@ impl App {
     fn backdrop(&self) -> iced::Color {
         iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ self.repaint_all as u32), ..view::BG }
     }
-    fn page_key(&self) -> [bool; 5] {
-        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page]
+    fn page_key(&self) -> [bool; 6] {
+        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page, self.studio_page]
     }
     fn ui_active(&self) -> bool {
         self.window.is_some() && self.window_focused
+    }
+    fn reveal_studio(&mut self, note: u8) -> Task<Msg> {
+        self.studio_scroll.0 = view::studio_offset(note);
+        view::studio_reveal(note)
+    }
+    fn seek_studio(&mut self, step: usize) {
+        let step = step.min(studio::STEPS - 1);
+        self.studio_cursor = step as f32;
+        self.studio_bar = step / 16;
+        self.studio_follow = true;
+        if self.running() {
+            let bpm = if self.sound_playing.0 == studio::TRACK_ID { self.studio_play_bpm } else { self.studio_bpm };
+            self.engine.sound_seek(studio::TRACK_ID, step as f32 * 15.0 / bpm as f32);
+        }
     }
     /// Native monitor mode: 1 is the full voice, otherwise 1 + mask (1 effects, 2 boost, 4 sounds).
     fn monitor_mode(&self) -> i32 {
@@ -1810,6 +1892,7 @@ impl App {
             self.scroll_anims.clear();
             self.scroll_pending.clear();
             self.sound_hover = None;
+            self.studio_scrubbing = false;
             // A rebuilt clip list repaints in one pass, as a page swap does. Not on hiding or
             // focus loss (switching to a game): no extra frame there.
             self.repaint_all ^= !matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize | Msg::WindowFocus(..));
@@ -2063,6 +2146,13 @@ impl App {
                     self.dirty = Some(Instant::now());
                 }
                 self.sound_playing = playing;
+                if self.studio_page && self.ui_active() && playing.0 == studio::TRACK_ID && !self.studio_scrubbing {
+                    self.studio_cursor = (playing.1 * self.studio_play_bpm as f32 / 15.0)
+                        .clamp(0.0, studio::STEPS as f32);
+                    if self.studio_follow {
+                        self.studio_bar = (self.studio_cursor as usize / 16).min(studio::BARS - 1);
+                    }
+                }
                 let (monitor, monitor_message) = self.engine.monitor_state();
                 if monitor == 3 && self.monitor != 3 {
                     self.message = format!("Прослушивание: {monitor_message}");
@@ -2163,6 +2253,17 @@ impl App {
                         ),
                     ]);
                 }
+                if let Some((generation, samples)) = self.engine.studio_clip(self.studio_generation) {
+                    self.studio_generation = generation;
+                    let folder = self.studio_folder.clone();
+                    let name = clip_name().replace("Запись", "Сэмпл").replace(" (mix)", "");
+                    return Task::batch([next, Task::perform(async move {
+                        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+                        let path = unique_path(&folder, &name);
+                        soundpad::write_wav(&path, &samples)?;
+                        Ok(path.file_name().unwrap().to_string_lossy().into_owned())
+                    }, Msg::StudioRecorded)]);
+                }
                 if self.capture_path.is_some() && !self.capture_started && self.ticks >= 12 {
                     self.capture_started = true;
                     if let Some(id) = self.window {
@@ -2195,6 +2296,7 @@ impl App {
                     });
                     return window::raw_id::<Msg>(id).map(Msg::Keyed);
                 }
+                if self.studio_page { return self.reveal_studio(studio::ROOT_NOTE); }
             }
             Msg::WindowFocus(id, focused) => {
                 if self.window == Some(id) {
@@ -2413,6 +2515,7 @@ impl App {
                 }
                 let before = self.page_key();
                 self.soundpad_page = page == 4;
+                self.studio_page = page == 7;
                 // Page 3 is no longer a page: the headphone panel opens over Шумодав.
                 self.headphone_page = page == 3;
                 self.logs_page = page == 5;
@@ -2435,6 +2538,9 @@ impl App {
                 );
                 if self.logs_page {
                     return Task::batch([snap, self.load_logs(false)]);
+                }
+                if self.studio_page {
+                    return Task::batch([snap, self.reveal_studio(studio::ROOT_NOTE)]);
                 }
                 return snap;
             }
@@ -3090,7 +3196,7 @@ impl App {
             }
             Msg::SoundpadHear(enabled) => {
                 self.sound_monitor = enabled;
-                self.focus = focus::soundpad::HEAR;
+                self.focus = if self.studio_page { focus::studio::HEAR } else { focus::soundpad::HEAR };
                 self.dirty = Some(Instant::now());
                 if !matches!(self.monitor, 1 | 2) {
                     self.monitor_all = false;
@@ -3118,6 +3224,9 @@ impl App {
             }
             Msg::SoundpadScroll(offset, height) => {
                 self.sound_scroll = (offset, height);
+            }
+            Msg::StudioScroll(offset, height) => {
+                self.studio_scroll = (offset, height);
             }
             Msg::SoundHover(i, entered) => {
                 if entered && i < self.sounds.len() {
@@ -3248,6 +3357,7 @@ impl App {
                 }
             }
             Msg::DragEnd => {
+                self.studio_scrubbing = false;
                 if let (Some(i), Some(section)) = (self.dragging.take(), self.drag_over.take())
                     && let Some(sound) = self.sounds.get(i)
                     && let Some(target) = self.sections.get_mut(section)
@@ -3271,6 +3381,128 @@ impl App {
             Msg::SoundpadStop => {
                 self.engine.sound_play(0);
                 self.sound_pending_play = None;
+            }
+            Msg::StudioBpm(bpm) => {
+                self.studio_bpm = bpm.clamp(60, 200);
+                self.focus = focus::studio::BPM;
+                self.dirty = Some(Instant::now());
+            }
+            Msg::StudioBar(bar) => {
+                self.studio_bar = bar.min(studio::BARS - 1);
+                self.studio_follow = false;
+                self.focus = focus::studio::BAR_BASE + self.studio_bar;
+            }
+            Msg::StudioGrab(step) => {
+                self.studio_scrubbing = true;
+                self.focus = focus::studio::CURSOR;
+                self.seek_studio(step);
+            }
+            Msg::StudioDrag(step) => {
+                if self.studio_scrubbing { self.seek_studio(step); }
+            }
+            Msg::StudioSelect(name) => {
+                if self.studio_samples.contains(&name) {
+                    self.focus = focus::studio::SAMPLE_BASE + self.studio_samples.iter().position(|s| s == &name).unwrap();
+                    self.studio_selected = Some(name);
+                }
+            }
+            Msg::StudioCell(step, note) => {
+                if step < studio::STEPS && (studio::FIRST_NOTE..studio::FIRST_NOTE + studio::NOTES as u8).contains(&note)
+                    && let Some(sample) = &self.studio_selected {
+                    studio::toggle(&mut self.studio_events, step, note, sample);
+                    self.focus = focus::studio::CELL_BASE + (step % 16) * studio::NOTES + (note - studio::FIRST_NOTE) as usize;
+                    self.dirty = Some(Instant::now());
+                }
+            }
+            Msg::StudioRecord => {
+                self.focus = focus::studio::RECORD;
+                let was_recording = self.engine.studio_recording();
+                if self.engine.studio_record(!was_recording) {
+                    self.studio_note = if was_recording { "Сохраняем запись…" } else { "Запись микрофона: до 20 секунд" }.into();
+                } else {
+                    self.studio_note = "Сначала запустите микрофон и выключите Mute".into();
+                }
+            }
+            Msg::StudioRecorded(result) => match result {
+                Ok(name) => {
+                    self.studio_samples = studio::scan(&self.studio_folder);
+                    self.studio_selected = Some(name);
+                    self.studio_note = "Сэмпл сохранён".into();
+                }
+                Err(e) => self.studio_note = format!("Не удалось сохранить запись: {e}"),
+            },
+            Msg::StudioImport => {
+                self.focus = focus::studio::IMPORT;
+                if self.studio_busy { return Task::none(); }
+                self.studio_busy = true;
+                return Task::perform(async { engine::pick_paths(false) }, Msg::StudioPicked);
+            }
+            Msg::StudioPicked(result) => {
+                let files = match result {
+                    Ok(files) => files,
+                    Err(e) => {self.studio_busy=false;self.studio_note=e;return Task::none();}
+                };
+                if files.is_empty() { self.studio_busy=false; return Task::none(); }
+                let folder = self.studio_folder.clone();
+                return Task::perform(async move {
+                    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+                    soundpad::import(&folder, &files).map(|_| ())
+                }, Msg::StudioImported);
+            }
+            Msg::StudioImported(result) => {
+                self.studio_busy = false;
+                self.studio_samples = studio::scan(&self.studio_folder);
+                if self.studio_selected.is_none() { self.studio_selected = self.studio_samples.first().cloned(); }
+                self.studio_note = result.map_or_else(|e| format!("Импорт: {e}"), |_| "Звуки добавлены".into());
+            }
+            Msg::StudioRender(export) => {
+                self.focus = if export { focus::studio::EXPORT } else { focus::studio::PLAY };
+                if self.studio_busy || self.studio_events.is_empty() { return Task::none(); }
+                if !export && self.snapshot.state != 3 {
+                    self.studio_note = "Сначала запустите виртуальный микрофон".into();
+                    return Task::none();
+                }
+                self.studio_busy = true;
+                self.studio_note = "Собираем трек…".into();
+                let folder = self.studio_folder.clone();
+                let events = self.studio_events.clone();
+                let bpm = self.studio_bpm;
+                if !export { self.studio_play_bpm = bpm; }
+                let loader = self.engine.sound_loader();
+                return Task::perform(async move {
+                    let audio = studio::render(&folder, bpm, &events)?;
+                    if export {
+                        let exports = folder.parent().unwrap().join("Треки");
+                        std::fs::create_dir_all(&exports).map_err(|e| e.to_string())?;
+                        let path = unique_path(&exports, "Трек.wav");
+                        soundpad::write_wav(&path, &audio)?;
+                        Ok(Some(path))
+                    } else {
+                        loader.load(studio::TRACK_ID, &audio, 1.0)?;
+                        Ok(None)
+                    }
+                }, move |r| Msg::StudioRendered(export, r));
+            }
+            Msg::StudioRendered(export, result) => {
+                self.studio_busy = false;
+                match result {
+                    Ok(Some(path)) => self.studio_note = format!("Сохранено: {}", path.display()),
+                    Ok(None) if !export && self.snapshot.state == 3 => {
+                        if self.studio_cursor >= studio::STEPS as f32 { self.studio_cursor = 0.0; }
+                        self.studio_follow = true;
+                        self.engine.sound_restart(studio::TRACK_ID);
+                        self.engine.sound_seek(studio::TRACK_ID, self.studio_cursor * 15.0 / self.studio_play_bpm as f32);
+                        self.studio_note = "Трек отправлен в виртуальный микрофон".into();
+                    }
+                    Ok(None) if !export => self.studio_note = "Микрофон остановлен — запустите его и повторите".into(),
+                    Ok(None) => {},
+                    Err(e) => self.studio_note = format!("Сборка трека: {e}"),
+                }
+            }
+            Msg::StudioClear => {
+                self.focus = focus::studio::CLEAR;
+                self.studio_events.retain(|e| e.step as usize / 16 != self.studio_bar);
+                self.dirty = Some(Instant::now());
             }
             Msg::SoundPlay(i) => {
                 let Some(sound) = self.sounds.get(i) else {
@@ -3642,17 +3874,34 @@ impl App {
             return Task::none();
         }
         if key == Key::Named(Named::Tab) {
-            // Visual order of the rail: Шумодав, Эффекты, Саундпад, Смена голоса, Настройки.
+            // Visual order of the rail.
             let tabs = [
                 focus::TAB_BASE,
                 focus::TAB_EFFECTS,
                 focus::TAB_SOUNDPAD,
+                focus::TAB_STUDIO,
                 focus::TAB_BASE + 1,
                 focus::TAB_BASE + 2,
             ];
             let order = if self.logs_page {
                 use focus::logs::*;
                 let mut items = vec![BACK, COPY, FOLDER, SEND];
+                items.extend(tabs);
+                items
+            } else if self.studio_page {
+                use focus::studio::*;
+                let mut items = vec![RECORD, BPM, HEAR, STOP, PLAY, IMPORT];
+                items.extend((0..self.studio_samples.len()).map(|i| SAMPLE_BASE + i));
+                items.extend((0..studio::BARS).map(|i| BAR_BASE + i));
+                items.push(CURSOR);
+                items.push(CLEAR);
+                // One Tab stop for the roll; arrows move between its cells.
+                items.push(if (CELL_BASE..CELL_BASE + 16 * studio::NOTES).contains(&self.focus) {
+                    self.focus
+                } else {
+                    CELL_BASE + (studio::ROOT_NOTE - studio::FIRST_NOTE) as usize
+                });
+                items.push(EXPORT);
                 items.extend(tabs);
                 items
             } else if self.soundpad_page {
@@ -3794,8 +4043,15 @@ impl App {
                     }
                 }
             };
+            if self.studio_page && self.focus == focus::studio::CURSOR {
+                self.studio_bar = (self.studio_cursor as usize / 16).min(studio::BARS - 1);
+            }
             return Task::batch([
                 view::reveal_focus(),
+                if self.studio_page && (focus::studio::CELL_BASE..focus::studio::CELL_BASE + 16 * studio::NOTES).contains(&self.focus) {
+                    let row = (self.focus - focus::studio::CELL_BASE) % studio::NOTES;
+                    self.reveal_studio(studio::FIRST_NOTE + row as u8)
+                } else { Task::none() },
                 iced::widget::operation::focus(match self.focus {
                     focus::rvc::NAME => "rvc-name",
                     focus::soundpad::FILTER => "sound-filter",
@@ -3816,7 +4072,7 @@ impl App {
             return self.update(Msg::Page(2));
         }
         if key == Key::Named(Named::Escape)
-            && (self.details || self.rvc_page || self.soundpad_page || self.effects_page)
+            && (self.details || self.rvc_page || self.soundpad_page || self.effects_page || self.studio_page)
         {
             return self.update(Msg::Page(0));
         }
@@ -3837,18 +4093,63 @@ impl App {
             if self.focus == focus::TAB_EFFECTS {
                 return self.update(Msg::Page(6));
             }
+            if self.focus == focus::TAB_STUDIO {
+                return self.update(Msg::Page(7));
+            }
         }
         let delta = match key {
             Key::Named(Named::ArrowLeft | Named::ArrowDown) => -1,
             Key::Named(Named::ArrowRight | Named::ArrowUp) => 1,
             _ => 0,
         };
+        if self.studio_page && self.focus == focus::studio::CURSOR && delta != 0 {
+            let step = (self.studio_cursor.floor() as i32 + delta).clamp(0, studio::STEPS as i32 - 1);
+            self.seek_studio(step as usize);
+            return Task::none();
+        }
+        if self.studio_page && (focus::studio::CELL_BASE..focus::studio::CELL_BASE + 16 * studio::NOTES).contains(&self.focus) {
+            let i = self.focus - focus::studio::CELL_BASE;
+            let (mut step, mut note) = (i / studio::NOTES, i % studio::NOTES);
+            match key {
+                Key::Named(Named::ArrowLeft) => step = step.saturating_sub(1),
+                Key::Named(Named::ArrowRight) => step = (step + 1).min(15),
+                Key::Named(Named::ArrowDown) => note = note.saturating_sub(1),
+                Key::Named(Named::ArrowUp) => note = (note + 1).min(studio::NOTES - 1),
+                _ => {},
+            }
+            let next = focus::studio::CELL_BASE + step * studio::NOTES + note;
+            if next != self.focus {
+                self.focus = next;
+                return self.reveal_studio(studio::FIRST_NOTE + note as u8);
+            }
+        }
         let message = if self.logs_page {
             match self.focus {
                 focus::logs::COPY if activate => Msg::LogsCopy,
                 focus::logs::FOLDER if activate => Msg::LogsFolder,
                 focus::logs::SEND if activate => Msg::SendReport,
                 focus::logs::BACK if activate => Msg::Page(2),
+                _ => Msg::Noop,
+            }
+        } else if self.studio_page {
+            use focus::studio::*;
+            match self.focus {
+                RECORD if activate => Msg::StudioRecord,
+                IMPORT if activate => Msg::StudioImport,
+                BPM if delta != 0 => Msg::StudioBpm((self.studio_bpm as i32 + delta).clamp(60, 200) as u32),
+                BPM if activate => Msg::StudioBpm((self.studio_bpm + 1).min(200)),
+                HEAR if activate => Msg::SoundpadHear(!self.sound_monitor),
+                STOP if activate => Msg::SoundpadStop,
+                PLAY if activate => Msg::StudioRender(false),
+                EXPORT if activate => Msg::StudioRender(true),
+                CLEAR if activate => Msg::StudioClear,
+                f if activate && (BAR_BASE..BAR_BASE + studio::BARS).contains(&f) => Msg::StudioBar(f - BAR_BASE),
+                f if activate && (SAMPLE_BASE..SAMPLE_BASE + self.studio_samples.len()).contains(&f) =>
+                    Msg::StudioSelect(self.studio_samples[f - SAMPLE_BASE].clone()),
+                f if activate && (CELL_BASE..CELL_BASE + 16 * studio::NOTES).contains(&f) => {
+                    let i = f - CELL_BASE;
+                    Msg::StudioCell(self.studio_bar * 16 + i / studio::NOTES, studio::FIRST_NOTE + (i % studio::NOTES) as u8)
+                }
                 _ => Msg::Noop,
             }
         } else if self.soundpad_page {
@@ -4324,6 +4625,59 @@ mod controller_tests {
         let _ = app.update(Msg::MorphStep(MorphStep::ShowRoot));
         let _ = app.update(Msg::MorphStep(MorphStep::Done));
         assert!(app.morph.is_none() && app.intro.is_none());
+    }
+    #[test]
+    fn studio_page_edits_and_keyboard() {
+        use keyboard::{Key, Modifiers, key::Named};
+        let saved = "[studio]\nbpm=137\nevents=[{\"step\":0,\"note\":60,\"sample\":\"kick.wav\"}]";
+        let (mut app, _) = App::from_settings(Settings::for_test(saved)).unwrap().unwrap();
+        assert_eq!(app.studio_bpm, 137);
+        assert_eq!(app.studio_events.len(), 1);
+        app.studio_samples.push("kick.wav".into());
+        app.window = Some(App::open(1.0, None).0);
+        let _ = app.update(Msg::Page(7));
+        assert!(app.studio_page && !app.soundpad_page);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::studio::RECORD);
+        app.focus = focus::studio::BPM;
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::studio::HEAR);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.sound_monitor && app.monitor_mode() == 5);
+        assert_eq!(app.focus, focus::studio::HEAR);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(!app.sound_monitor);
+        let _ = app.update(Msg::StudioGrab(17));
+        assert_eq!((app.studio_cursor, app.studio_bar, app.focus), (17.0, 1, focus::studio::CURSOR));
+        assert!(app.studio_follow);
+        let _ = app.update(Msg::StudioDrag(18));
+        assert_eq!(app.studio_cursor, 18.0);
+        let _ = app.update(Msg::DragEnd);
+        let _ = app.update(Msg::StudioDrag(19));
+        assert_eq!(app.studio_cursor, 18.0, "releasing the ruler ends the drag");
+        let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
+        assert_eq!(app.studio_cursor, 17.0);
+        let _ = app.update(Msg::StudioSelect("kick.wav".into()));
+        let _ = app.update(Msg::StudioCell(1, 60));
+        assert_eq!(app.studio_events.len(), 2);
+        let _ = app.update(Msg::StudioBpm(145));
+        assert_eq!(app.studio_bpm, 145);
+        let _ = app.update(Msg::StudioBar(1));
+        assert!(!app.studio_follow, "a chosen bar must stay visible while another bar plays");
+        let _ = app.update(Msg::StudioCell(16, 61));
+        let _ = app.update(Msg::StudioCell(17, 36));
+        let _ = app.update(Msg::StudioCell(18, 83));
+        app.focus = focus::studio::CELL_BASE + (studio::ROOT_NOTE - studio::FIRST_NOTE) as usize;
+        let _ = app.key(Key::Named(Named::ArrowUp), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::studio::CELL_BASE + 25);
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::studio::CELL_BASE + studio::NOTES + 25);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.studio_events.iter().any(|e| e.step == 17 && e.note == 61));
+        let _ = app.update(Msg::StudioClear);
+        assert_eq!(app.studio_events.len(), 2);
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert!(!app.studio_page);
     }
     #[test]
     fn repair_requires_confirmation_and_exit_prevents_resume() {

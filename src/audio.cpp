@@ -890,10 +890,11 @@ void Engine::stop() {
     const bool hadSession=io_.joinable() || dsp_.joinable();
     if(hadSession) state=4;
     releaseEffects();
+    studioRecording=false;
     SetEvent(stop_);
     if(io_.joinable()) io_.join(); if(dsp_.joinable()) dsp_.join();if(desktopThread_.joinable())desktopThread_.join();if(tagLevelThread_.joinable())tagLevelThread_.join();
     if(tagOwner_) {CloseHandle(tagOwner_);tagOwner_=nullptr;}
-    soundPlaying=0;soundPosition=0;soundLength=0;
+    soundSeekRequest=0;soundPlaying=0;soundPosition=0;soundLength=0;
     if(running_.exchange(false)) status(L"Stopped");
     if(hadSession) {
         // Write only after audio threads have joined: no file I/O in the audio path.
@@ -960,8 +961,10 @@ void Engine::dspLoop(Config c) {
         PitchEffect pitchEffect; PhraseEffect phraseEffect; auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
         std::array<float,block> in{},out{},microphone{};
         LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
-        bool clipPending=false;
+        bool clipPending=false,studioActive=false,studioPending=false;
         {std::lock_guard lock(clipMutex_);clip_.clear();clip_.reserve(48000*20);} // publishing never allocates
+        std::vector<float> studioBuffer;studioBuffer.reserve(rate*20);
+        {std::lock_guard lock(studioMutex_);studioClip_.reserve(rate*20);}
         std::array<float,block> sound{};
         std::array<RoutedSample,block> routed{};
         std::array<uint8_t,block> modified{},recording{};
@@ -974,7 +977,7 @@ void Engine::dspLoop(Config c) {
             for(unsigned i=0;i<20;++i) { if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) return; fx->process(in.data(),out.data()); }
             fx->reset();
         }
-        soundRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
+        soundRequest=0;soundSeekRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
         SetEvent(ready_);
         HANDLE events[]={stop_,data_};
         while(WaitForMultipleObjects(2,events,FALSE,INFINITE)==WAIT_OBJECT_0+1) {
@@ -1010,6 +1013,24 @@ void Engine::dspLoop(Config c) {
                 // the converted voice also feeds the background mix while a Discord effect is held.
                 modified.fill(0);
                 rvc->process(out.data(),block,rvcEnabled.load() && !muted,modified.data());
+                // Capture processed microphone before Discord source selection. Publication is a
+                // try-lock swap of buffers reserved before this real-time loop.
+                if(studioRecording && !studioActive && !studioPending && !muted) studioActive=true;
+                if(studioActive) {
+                    if(!studioRecording || muted) {
+                        studioRecording=false;studioActive=false;studioPending=!studioBuffer.empty();
+                    } else {
+                        studioBuffer.insert(studioBuffer.end(),out.begin(),out.end());
+                        if(studioBuffer.size()>=rate*20) {
+                            studioRecording=false;studioActive=false;studioPending=true;
+                        }
+                    }
+                }
+                if(studioPending) {
+                    if(std::unique_lock lock(studioMutex_,std::try_to_lock);lock.owns_lock()) {
+                        studioClip_.swap(studioBuffer);studioBuffer.clear();++studioGeneration;studioPending=false;
+                    }
+                }
                 const auto hold=heldSample.load();const auto epoch=effectEpoch.load();
                 bool valid=heldFresh(hold,epoch,GetTickCount64()) && running_ && stats.outputActive && !muted;
                 const unsigned flags=valid?static_cast<unsigned>(hold&HoldAllMask):0;
@@ -1063,6 +1084,10 @@ void Engine::dspLoop(Config c) {
                         }
                     }
                 }
+                if(auto seek=soundSeekRequest.load();seek && sounds.playing()==unsigned(seek>>32)
+                    && sounds.seek(unsigned(seek>>32),unsigned(seek))){
+                    soundSeekRequest.compare_exchange_strong(seek,0);
+                }
                 sounds.render(sound.data(),block,soundVolume.load(),muted,recording.data());
                 soundPlaying=sounds.playing();soundPosition=sounds.position();soundLength=sounds.length();
                 for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,(fromDiscord || replay)?microphone[i]:0,sound[i],recording[i]};
@@ -1070,6 +1095,12 @@ void Engine::dspLoop(Config c) {
                 ++stats.processed;
                 stats.inputQueue=static_cast<unsigned>(captured_.size());
             }
+        }
+        // Preserve a recording when processing stops before the next audio block publishes it.
+        if(!studioBuffer.empty()) {
+            std::lock_guard lock(studioMutex_);
+            studioClip_.swap(studioBuffer);
+            ++studioGeneration;
         }
     } catch(const std::exception& e) { fail(e); }
 }
@@ -1108,13 +1139,24 @@ unsigned Engine::clipCopy(float* out,unsigned capacity,unsigned* generation) {
     if(out&&capacity)std::copy_n(clip_.begin(),std::min(count,capacity),out);
     return count;
 }
+unsigned Engine::studioCopy(float* out,unsigned capacity,unsigned* generation) {
+    std::lock_guard lock(studioMutex_);
+    if(generation)*generation=studioGeneration.load();
+    const auto count=static_cast<unsigned>(studioClip_.size());
+    if(out&&capacity)std::copy_n(studioClip_.begin(),std::min(count,capacity),out);
+    return count;
+}
 // Called from the hotkey thread and the UI; a quick second press of the same clip restarts it.
-void Engine::soundPlay(unsigned id) {
+void Engine::soundPlay(unsigned id,bool forceRestart) {
     std::lock_guard lock(soundRequestMutex_);
     const auto now=GetTickCount64();
-    const bool restart=id && id==soundPressId_ && now-soundPressTick_<soundDoublePressMs;
+    const bool restart=forceRestart || (id && id==soundPressId_ && now-soundPressTick_<soundDoublePressMs);
     soundPressId_=id;soundPressTick_=now;
+    soundSeekRequest=0;
     soundRequest=SoundPlayer::pack(id,++soundSerial_,restart);
+}
+void Engine::soundSeek(unsigned id,unsigned frame) {
+    soundSeekRequest=(uint64_t(id)<<32)|frame;
 }
 void Engine::tagLoop(Config c) {
     Event captureEvent;

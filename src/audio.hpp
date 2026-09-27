@@ -145,6 +145,7 @@ class SoundPlayer {
     unsigned id_=0;
     uint64_t serial_=0;
     float fade_=1,fadeStep_=0;
+    size_t seekFrame_=0;bool seeking_=false;
     std::shared_ptr<const SoundClip> next_;unsigned nextId_=0;
 public:
     static uint64_t pack(unsigned id,uint64_t serial,bool restart){return (serial<<33)|(restart?1ull<<32:0)|id;}
@@ -160,22 +161,41 @@ public:
         return id;
     }
     void commit(uint64_t packed){serial_=packed>>33;}
-    void stop(){if(clip_&&fade_>0){fadeStep_=-1.0f/240;}}
+    void stop(){seeking_=false;next_.reset();if(clip_&&fade_>0){fadeStep_=-1.0f/240;}}
     void start(unsigned id,std::shared_ptr<const SoundClip> clip){
         if(!clip||clip->samples.empty()){stop();return;}
+        seeking_=false;
         if(clip_&&fade_>0){next_=std::move(clip);nextId_=id;fadeStep_=-1.0f/240;return;}
         clip_=std::move(clip);id_=id;position_=0;fade_=1;fadeStep_=0;
+    }
+    bool seek(unsigned id,size_t frame){
+        if(!clip_||id_!=id||next_)return false;
+        seekFrame_=std::min(frame,clip_->samples.size()-1);
+        if(position_==0){position_=seekFrame_;return true;} // nothing has been sent yet
+        seeking_=true;fadeStep_=-1.0f/240;
+        return true;
     }
     void render(float* out,unsigned count,float volume,bool muted=false,uint8_t* recording=nullptr) {
         for(unsigned i=0;i<count;++i){
             out[i]=0;
             if(recording)recording[i]=0;
             if(!clip_)continue;
-            if(position_>=clip_->samples.size()){clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}continue;}
+            if(position_>=clip_->samples.size()){
+                if(seeking_){position_=seekFrame_;seeking_=false;fade_=0;fadeStep_=1.0f/240;}
+                else {clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}}
+                continue;
+            }
             if(recording)recording[i]=id_>=recordingClipIdBase;
             const float playbackVolume=muted?0.0f:(id_>=recordingClipIdBase?1.0f:volume);
             out[i]=std::clamp(clip_->samples[position_++]*clip_->gain.load(std::memory_order_relaxed)*playbackVolume*fade_,-1.0f,1.0f);
-            if(fadeStep_){fade_+=fadeStep_;if(fade_<=0){fade_=0;fadeStep_=0;clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}}}
+            if(fadeStep_){
+                fade_+=fadeStep_;
+                if(fade_<=0){
+                    fade_=0;
+                    if(seeking_){position_=seekFrame_;seeking_=false;fadeStep_=1.0f/240;}
+                    else {fadeStep_=0;clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}}
+                } else if(fade_>=1.0f-1e-5f){fade_=1;fadeStep_=0;}
+            }
         }
     }
 };
@@ -242,6 +262,8 @@ class Engine {
     // only try-locks this slot: a contended block publishes on the next one.
     std::mutex clipMutex_;
     std::vector<float> clip_;
+    std::mutex studioMutex_;
+    std::vector<float> studioClip_;
     uint64_t soundSerial_=0,soundPressTick_=0;unsigned soundPressId_=0;
     std::atomic<bool> resetEffect_{false}, running_{false};
     mutable std::mutex statusMutex_;
@@ -274,18 +296,23 @@ public:
     std::atomic<int> pitch{-5};
     // Soundpad: library writes happen off the DSP thread; the DSP thread only try-locks.
     std::atomic<uint64_t> soundRequest{0};
+    std::atomic<uint64_t> soundSeekRequest{0};
     std::atomic<float> soundVolume{1};
     std::atomic<unsigned> soundPlaying{0};
     std::atomic<float> soundPosition{0},soundLength{0};
     void soundLoad(unsigned id,std::vector<float> samples,float gain);
     bool soundGain(unsigned id,float gain);
     void soundClear();
-    void soundPlay(unsigned id);
+    void soundPlay(unsigned id,bool forceRestart=false);
+    void soundSeek(unsigned id,unsigned frame);
     std::shared_ptr<const SoundClip> soundClip(unsigned id);
     // Bumped once per published recording; 0 means nothing was recorded yet.
     std::atomic<unsigned> clipGeneration{0};
     // Samples of the published recording, copying at most `capacity` of them into `out`.
     unsigned clipCopy(float* out,unsigned capacity,unsigned* generation);
+    std::atomic<bool> studioRecording{false};
+    std::atomic<unsigned> studioGeneration{0};
+    unsigned studioCopy(float* out,unsigned capacity,unsigned* generation);
     unsigned held() const {
         const auto sample=heldSample.load();
         return heldFlags(sample,effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);

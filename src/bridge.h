@@ -66,6 +66,9 @@ int32_t mnr_sound_load(Mnr*,uint32_t id,const float* samples,uint32_t count,floa
 int32_t mnr_sound_gain(Mnr*,uint32_t id,float gain);
 void mnr_sound_clear(Mnr*);
 void mnr_sound_play(Mnr*,uint32_t id);
+void mnr_sound_restart(Mnr*,uint32_t id);
+// Seek the matching playing clip; a request sent immediately after play waits for its start.
+int32_t mnr_sound_seek(Mnr*,uint32_t id,float seconds);
 void mnr_sound_volume(Mnr*,float volume);
 // Hotkeys for clips: keys use the effect binding encoding; an entry with id 0 is the stop key.
 int32_t mnr_sound_bindings(Mnr*,const uint32_t* ids,const uint32_t* keys,uint32_t count);
@@ -74,6 +77,9 @@ uint32_t mnr_sound_state(Mnr*,float* position,float* length);
 // Newest finished hold-effect recording (48 kHz mono float). Returns how many samples it has
 // and reports its generation; `out` may be null to ask for the size only.
 uint32_t mnr_last_clip(Mnr*,float* out,uint32_t capacity,uint32_t* generation);
+int32_t mnr_studio_record(Mnr*,int32_t enabled);
+int32_t mnr_studio_recording(Mnr*);
+uint32_t mnr_studio_clip(Mnr*,float* out,uint32_t capacity,uint32_t* generation);
 // Modal picker on the calling thread: mode 0 folder, 1 audio files (multi-select).
 // Writes newline-separated UTF-8 paths; returns 1, 0 when cancelled, -1 on error.
 int32_t mnr_pick_paths(int32_t mode,char* result,uint32_t capacity);

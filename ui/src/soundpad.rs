@@ -250,6 +250,11 @@ pub fn serialize(sounds: &[Sound]) -> String {
 
 /// Decode a clip to 48 kHz mono, clamped to [-1, 1] and at most [`MAX_SECONDS`].
 pub fn decode(path: &Path) -> Result<Vec<f32>, String> {
+    decode_limited(path, MAX_SECONDS)
+}
+
+/// Same decoder with a smaller bound for sequencer samples.
+pub fn decode_limited(path: &Path, seconds: usize) -> Result<Vec<f32>, String> {
     use symphonia::core::{
         codecs::audio::AudioDecoderOptions, errors::Error, formats::TrackType,
         formats::probe::Hint, io::MediaSourceStream,
@@ -278,7 +283,7 @@ pub fn decode(path: &Path) -> Result<Vec<f32>, String> {
     let mut interleaved = Vec::new();
     let mut mono = Vec::new();
     let mut rate = 0;
-    let limit = MAX_SECONDS * RATE as usize;
+    let limit = seconds.clamp(1, MAX_SECONDS) * RATE as usize;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
