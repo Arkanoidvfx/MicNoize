@@ -40,6 +40,15 @@ int main(){try{
     const auto noiseEpoch=s.epoch;extended[12]=119;
     mnr_bindings(p,extended,13);mnr_snapshot(p,&s,error,sizeof(error),1);
     require(s.epoch==noiseEpoch,"Duplicate noise binding accepted");
+    MnrEffectOptions options{220,3,55,100,120,80,30,0,0,0,80,100,0};
+    mnr_effect_options(p,&options);options.echo_delay_ms=601;mnr_effect_options(p,&options);
+    uint32_t allKeys[21]{};for(unsigned i=0;i<21;++i)allKeys[i]=119+i;
+    mnr_bindings(p,allKeys,21);mnr_snapshot(p,&s,error,sizeof(error),1);
+    require(s.epoch!=noiseEpoch,"New effect bindings rejected");
+    const auto expandedEpoch=s.epoch;allKeys[20]=allKeys[13];mnr_bindings(p,allKeys,21);
+    mnr_snapshot(p,&s,error,sizeof(error),1);require(s.epoch==expandedEpoch,"Duplicate new binding accepted");
+    uint32_t clipId=42,clipKey=132;
+    require(!mnr_sound_bindings(p,&clipId,&clipKey,1),"New effect key duplicated by soundpad");
     mnr_alternate_intensity(p,0.15f);
     {
         std::vector<float> tone(48000),shifted(tone.size());

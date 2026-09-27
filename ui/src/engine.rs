@@ -77,6 +77,8 @@ unsafe extern "C" {
         discord_volume: f32,
         rvc_enabled: i32,
     );
+    fn mnr_effect_options(p: usize, options: *const EffectOptions);
+    fn mnr_effect_activity(p: usize) -> u32;
     fn mnr_phrase_state(p: usize, seconds: *mut f32) -> i32;
     fn mnr_discord_state(p: usize, text: *mut c_char, capacity: u32, active: *mut i32) -> i32;
     fn mnr_denoiser_state(p: usize, text: *mut c_char, capacity: u32) -> i32;
@@ -228,6 +230,7 @@ pub struct Controls {
     pub overload: bool,
     pub discord_volume: f32,
     pub pitch: i32,
+    pub effects: EffectOptions,
     pub intensity: f32,
     pub alternate_intensity: f32,
     pub muted: bool,
@@ -242,6 +245,49 @@ impl DeviceState {
         Self::Starting=>"Запуск",Self::WaitingDriver=>"Ожидание драйвера",Self::WaitingEndpoint=>"Ожидание устройства в Windows",
         Self::Ready=>"Готово",Self::Recovering=>"Восстановление соединения",Self::UserAction=>"Требуется действие",
     }}
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct EffectOptions {
+    pub echo_delay_ms: i32,
+    pub echo_repeats: i32,
+    pub echo_decay: i32,
+    pub echo_level: i32,
+    pub stutter_ms: i32,
+    pub grain_ms: i32,
+    pub grain_scatter_ms: i32,
+    pub grain_pitch: i32,
+    pub tune_root: i32,
+    pub tune_scale: i32,
+    pub tune_speed_ms: i32,
+    pub tune_strength: i32,
+    pub formant: i32,
+}
+impl Default for EffectOptions {
+    fn default() -> Self { Self { echo_delay_ms: 220, echo_repeats: 3, echo_decay: 55, echo_level: 100,
+        stutter_ms: 120, grain_ms: 80, grain_scatter_ms: 30, grain_pitch: 0,
+        tune_root: 0, tune_scale: 0, tune_speed_ms: 80, tune_strength: 100, formant: 0 } }
+}
+impl EffectOptions {
+    pub const RANGES: [(i32, i32); 13] = [(60,600),(1,8),(0,90),(0,100),(50,300),
+        (30,150),(0,100),(-12,12),(0,11),(0,2),(5,150),(0,100),(-12,12)];
+    pub fn value(&self, i: usize) -> i32 { match i {
+        0=>self.echo_delay_ms,1=>self.echo_repeats,2=>self.echo_decay,3=>self.echo_level,
+        4=>self.stutter_ms,5=>self.grain_ms,6=>self.grain_scatter_ms,7=>self.grain_pitch,
+        8=>self.tune_root,9=>self.tune_scale,10=>self.tune_speed_ms,11=>self.tune_strength,
+        12=>self.formant,_=>0,
+    }}
+    pub fn set(&mut self, i: usize, value: i32) {
+        let Some(&(min,max))=Self::RANGES.get(i) else {return};
+        let value=value.clamp(min,max);
+        match i {
+            0=>self.echo_delay_ms=value,1=>self.echo_repeats=value,2=>self.echo_decay=value,
+            3=>self.echo_level=value,4=>self.stutter_ms=value,5=>self.grain_ms=value,
+            6=>self.grain_scatter_ms=value,7=>self.grain_pitch=value,8=>self.tune_root=value,
+            9=>self.tune_scale=value,10=>self.tune_speed_ms=value,11=>self.tune_strength=value,
+            12=>self.formant=value,_=>{},
+        }
+    }
 }
 #[derive(Clone,Debug)]
 pub enum Reply {
@@ -415,7 +461,8 @@ impl Engine {
                 controls.overload as i32,
                 controls.discord_volume,
                 controls.rvc as i32,
-            )
+            );
+            mnr_effect_options(p, &controls.effects);
         };
         let initial_rvc = controls.rvc;
         let operation = Arc::new(AtomicU64::new(0));
@@ -645,10 +692,12 @@ impl Engine {
                 c.overload as i32,
                 c.discord_volume,
                 c.rvc as i32,
-            )
+            );
+            mnr_effect_options(self.p, &c.effects);
         }
     }
-    pub fn bindings(&self, keys: [u32; 13]) {
+    pub fn effect_activity(&self) -> u32 { unsafe { mnr_effect_activity(self.p) } }
+    pub fn bindings(&self, keys: [u32; 21]) {
         unsafe { mnr_bindings(self.p, keys.as_ptr(), keys.len() as u32) }
     }
     pub fn sound_loader(&self) -> SoundLoader {

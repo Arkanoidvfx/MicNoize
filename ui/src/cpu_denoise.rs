@@ -196,7 +196,7 @@ mod tests {
         let settings = crate::settings::Settings::for_test("");
         let controls = Controls {
             slow: 0.7, fast: 1.5, volume: 1.0, boost: 3.0, overload: false, discord_volume: 1.0,
-            pitch: 0, intensity: 1.0, alternate_intensity: 0.15, muted: true, rvc: false,
+            pitch: 0, effects: engine::EffectOptions::default(), intensity: 1.0, alternate_intensity: 0.15, muted: true, rvc: false,
             rvc_options: crate::rvc::Options::load(&settings),
         };
         let engine = Engine::new(controls).unwrap().unwrap();

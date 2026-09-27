@@ -23,7 +23,7 @@ struct Ramp {
 };
 struct OutputEffects {
     Ramp gain{1},boost{3},wet{0},drive{0},discordGain{0.08f};
-    void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.08f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr,const float* sound=nullptr) {
+    void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.08f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr,const float* sound=nullptr,const float* echoMic=nullptr,const float* echoDiscord=nullptr,float* echoOnly=nullptr) {
         const bool enabled=held && multiplier>1;
         for(size_t i=0;i<n;++i) {
             const float x=(std::isfinite(data[i])?data[i]:0)*gain.next(volume);
@@ -39,6 +39,9 @@ struct OutputEffects {
             }
             data[i]=std::clamp(effect,-1.0f,1.0f)*(discord && discord[i]?sourceGain:1.0f);
             if(effectOnly)effectOnly[i]=data[i];
+            const float echo=((echoMic?echoMic[i]:0)+(echoDiscord?echoDiscord[i]*sourceGain:0))*gain.value;
+            if(echoOnly)echoOnly[i]=echo;
+            data[i]=std::clamp(data[i]+echo,-1.0f,1.0f);
             // Soundpad and the background microphone bypass effects and Discord gain.
             if(sound)data[i]=std::clamp(data[i]+sound[i],-1.0f,1.0f);
             if(microphone)data[i]=std::clamp(data[i]+microphone[i]*gain.value,-1.0f,1.0f);
@@ -56,7 +59,7 @@ struct SourceRouting {
         if(!phrases && !phraseActive)phraseDiscord=false;
         previous=phrases;
         phraseFlags=conflict?HoldPhrases:((held|(held>>DiscordShift))&HoldPhrases);
-        return (phrases||phraseActive)?phraseDiscord:(held&(HoldLive<<DiscordShift))!=0;
+        return (phrases||phraseActive)?phraseDiscord:(held&(((HoldBoost|HoldPitch)<<DiscordShift)|(HoldNew<<4)))!=0;
     }
 };
 // One bounded, in-memory slot shared by all hold effects (20 s covers 10 s at x0.5).
@@ -73,24 +76,27 @@ public:
     bool finished() {const bool was=finished_;finished_=false;return was;}
     size_t count() const {return count_;}
     bool capturing() const {return capturing_;}
+    bool recordingDiscord() const{return discord_;}
     void copyRecording(std::vector<float>& out,float discordVolume) const {
         out.assign(audio_.begin(),audio_.begin()+count_);
         if(discord_)for(auto& sample:out)sample*=discordVolume;
     }
     bool process(float* data,size_t n,uint8_t* modified,bool& discord,
-                 unsigned allHeld,bool phraseActive,bool valid,unsigned epoch,unsigned cancel,unsigned request) {
+                 unsigned allHeld,bool phraseActive,bool valid,unsigned epoch,unsigned cancel,unsigned request,
+                 const float* capture=nullptr,const uint8_t* captureFlags=nullptr,bool tailActive=false) {
         const unsigned held=allHeld&recordable;
         if(epoch!=epoch_ || cancel!=cancel_ || !valid){
             if(capturing_)count_=0;
             capturing_=playing_=false;previous_=0;epoch_=epoch;cancel_=cancel;request_=request;
             return false;
         }
-        const bool active=held || phraseActive;
+        const bool active=held || phraseActive || tailActive;
         if(held && held!=previous_){count_=0;capturing_=true;playing_=false;discord_=discord;}
         previous_=held;
         if(capturing_){
-            for(size_t i=0;i<n;++i)if((modified[i]&~ModifiedBoost) && count_<audio_.size()){
-                modified_[count_]=static_cast<uint8_t>(modified[i]&~ModifiedBoost);audio_[count_++]=data[i];
+            for(size_t i=0;i<n;++i)if(((captureFlags?captureFlags[i]:modified[i])&~ModifiedBoost) && count_<audio_.size()){
+                modified_[count_]=static_cast<uint8_t>((captureFlags?captureFlags[i]:modified[i])&~ModifiedBoost);
+                audio_[count_++]=capture?capture[i]:data[i];
             }
             if(!active){capturing_=false;finished_=count_>0;}
         }
@@ -257,28 +263,205 @@ private:
     std::vector<float> history_,output_,window_;
     unsigned write_=0,read_=0,count_=0;
 };
+// Capture the completed history preceding a press. History is fed separately for each source.
+class StutterEffect {
+    std::array<float,14400> history_{},loop_{};
+    size_t write_=0,filled_=0,length_=0,position_=0;
+    bool wasHeld_=false;
+    Ramp wet_;
+public:
+    void reset(){write_=filled_=length_=position_=0;wasHeld_=false;wet_=Ramp{};}
+    void feed(const float* data,size_t n){
+        for(size_t i=0;i<n;++i){history_[write_]=std::isfinite(data[i])?data[i]:0;write_=(write_+1)%history_.size();filled_=std::min(filled_+1,history_.size());}
+    }
+    void process(float* data,size_t n,bool held,unsigned milliseconds,uint8_t* modified=nullptr){
+        if(held&&!wasHeld_){
+            length_=std::min(filled_,static_cast<size_t>(std::clamp(milliseconds,50u,300u))*48);
+            for(size_t i=0;i<length_;++i)loop_[i]=history_[(write_+history_.size()-length_+i)%history_.size()];
+            position_=0;
+        }
+        wasHeld_=held;
+        for(size_t i=0;i<n;++i){
+            const float mix=wet_.next(held&&length_?1.0f:0.0f);
+            if(mix>0 && length_){
+                const float edge=std::min({1.0f,position_/240.0f,(length_-position_-1)/240.0f});
+                data[i]=std::clamp(std::lerp(data[i],loop_[position_]*edge,mix),-1.0f,1.0f);
+                if(modified)modified[i]|=ModifiedEffects;
+                position_=(position_+1)%length_;
+            }
+        }
+        if(!held&&wet_.value==0)length_=0;
+    }
+};
+// Finite taps from the captured input only. The output is never written back into the delay.
+class EchoEffect {
+    static constexpr size_t capacity=48000*5;
+    std::vector<float> history_=std::vector<float>(capacity);
+    std::array<float,8> gains_{};
+    size_t write_=0,age_=0,remaining_=0,delay_=10560;
+    unsigned repeats_=3;
+    bool wasHeld_=false;
+public:
+    void reset(){write_=age_=remaining_=0;wasHeld_=false;}
+    bool active() const{return wasHeld_||remaining_>0;}
+    void process(const float* dry,size_t n,bool held,unsigned delayMs,unsigned repeats,unsigned decay,unsigned level,float* wet){
+        if(held&&!wasHeld_){
+            reset();delay_=static_cast<size_t>(std::clamp(delayMs,60u,600u))*48;
+            repeats_=std::clamp(repeats,1u,8u);
+            const float fall=std::clamp(decay,0u,90u)/100.0f;
+            float gain=std::clamp(level,0u,100u)/100.0f;
+            for(unsigned k=0;k<repeats_;++k){gains_[k]=gain;gain*=fall;}
+        }
+        if(!held&&wasHeld_)remaining_=delay_*repeats_;
+        wasHeld_=held;
+        for(size_t i=0;i<n;++i){
+            wet[i]=0;
+            if(!active())continue;
+            history_[write_]=held&&dry?std::clamp(std::isfinite(dry[i])?dry[i]:0.0f,-1.0f,1.0f):0.0f;
+            for(unsigned k=1;k<=repeats_;++k){
+                const size_t lag=delay_*k;
+                if(age_>=lag)wet[i]+=history_[(write_+capacity-lag)%capacity]*gains_[k-1];
+            }
+            if(!held){
+                if(remaining_<480)wet[i]*=remaining_/480.0f;
+                --remaining_;
+            }
+            wet[i]=std::clamp(wet[i],-1.0f,1.0f);
+            write_=(write_+1)%capacity;age_=std::min(age_+1,capacity);
+        }
+    }
+};
+class GranularEffect {
+    static constexpr size_t capacity=24000;
+    struct Voice {size_t start=0,phase=0;bool active=false;};
+    std::array<float,capacity> history_{};
+    std::array<float,7200> window_{};
+    Voice voices_[2]{};
+    size_t write_=0,filled_=0,tick_=0,grain_=0,scatter_=0;
+    unsigned random_=0x6d2b79f5;
+    Ramp wet_;
+public:
+    void reset(){write_=filled_=tick_=grain_=scatter_=0;voices_[0]=voices_[1]={};wet_=Ramp{};}
+    void process(float* data,size_t n,bool held,unsigned grainMs,unsigned scatterMs,int semitones,uint8_t* modified=nullptr){
+        const size_t grain=static_cast<size_t>(std::clamp(grainMs,30u,150u))*48;
+        const size_t scatter=static_cast<size_t>(std::clamp(scatterMs,0u,100u))*48;
+        if(grain!=grain_ || scatter!=scatter_){
+            grain_=grain;scatter_=scatter;tick_=0;voices_[0]=voices_[1]={};
+            for(size_t i=0;i<grain_;++i)window_[i]=0.5f-0.5f*std::cos(6.28318530718f*i/grain_);
+        }
+        const float ratio=std::exp2(std::clamp(semitones,-12,12)/12.0f);
+        for(size_t i=0;i<n;++i){
+            const float dry=std::isfinite(data[i])?data[i]:0;
+            history_[write_]=dry;write_=(write_+1)%capacity;filled_=std::min(filled_+1,capacity);
+            const bool ready=held && filled_>=grain_*2+scatter_;
+            if(ready && tick_==0){
+                random_^=random_<<13;random_^=random_>>17;random_^=random_<<5;
+                const size_t jitter=scatter_?random_%(scatter_+1):0;
+                for(auto& voice:voices_)if(!voice.active){voice={(write_+capacity-grain_*2-jitter)%capacity,0,true};break;}
+            }
+            float sum=0,weight=0;
+            for(auto& voice:voices_)if(voice.active){
+                const float w=window_[voice.phase];
+                const float at=voice.phase*ratio;
+                const size_t base=static_cast<size_t>(at);
+                const float fraction=at-base;
+                const float sample=std::lerp(history_[(voice.start+base)%capacity],history_[(voice.start+base+1)%capacity],fraction);
+                sum+=sample*w;weight+=w;
+                if(++voice.phase==grain_)voice.active=false;
+            }
+            const float mix=wet_.next(ready?1.0f:0.0f);
+            if(mix>0 && weight>0.0001f){data[i]=std::clamp(std::lerp(dry,sum/weight,mix),-1.0f,1.0f);if(modified)modified[i]|=ModifiedEffects;}
+            else data[i]=dry;
+            tick_=(tick_+1)%(grain_/2);
+        }
+    }
+};
+// 40 ms of 12 kHz samples, updated every 10 ms. A voiced YIN minimum controls one live shifter.
+class AutoTunePitch {
+    std::array<float,480> history_{};
+    size_t write_=0,filled_=0;
+    float correction_=0;
+    bool voiced_=false;
+public:
+    void reset(){write_=filled_=0;correction_=0;voiced_=false;}
+    bool voiced() const{return voiced_;}
+    float process(const float* data,size_t n,bool held,int manual,int root,int scale,unsigned speed,unsigned strength){
+        for(size_t i=0;i<n;i+=4){
+            float sample=0;for(size_t j=i;j<std::min(i+4,n);++j)sample+=std::isfinite(data[j])?data[j]:0;
+            history_[write_]=sample/4;write_=(write_+1)%history_.size();filled_=std::min(filled_+1,history_.size());
+        }
+        voiced_=false;
+        if(!held){correction_=0;return 0;}
+        float desired=0;
+        if(filled_==history_.size()){
+            std::array<float,151> difference{},normalized{};
+            double energy=0;
+            for(size_t i=0;i<history_.size();++i){const float v=history_[(write_+i)%history_.size()];energy+=v*v;}
+            if(energy/history_.size()>0.000016){
+                double running=0;int chosen=0;float best=1;
+                for(int lag=15;lag<=150;++lag){
+                    double d=0;
+                    for(int i=0;i<480-lag;++i){const float a=history_[(write_+i)%480]-history_[(write_+i+lag)%480];d+=a*a;}
+                    difference[lag]=static_cast<float>(d);running+=d;
+                    normalized[lag]=static_cast<float>(d*lag/std::max(running,1e-12));
+                    if(normalized[lag]<best){best=normalized[lag];chosen=lag;}
+                }
+                if(best<0.2f && chosen>0){
+                    for(int lag=16;lag<150;++lag)if(normalized[lag]<0.15f && normalized[lag]<=normalized[lag-1] && normalized[lag]<normalized[lag+1]){chosen=lag;break;}
+                    chosen=std::clamp(chosen,16,149);
+                    const float left=difference[chosen-1],middle=difference[chosen],right=difference[chosen+1];
+                    const float curve=left-2*middle+right;
+                    const float offset=std::abs(curve)>1e-9f?std::clamp(0.5f*(left-right)/curve,-0.5f,0.5f):0;
+                    const float midi=69+12*std::log2((12000.0f/(chosen+offset))/440.0f)+manual;
+                    const int center=static_cast<int>(std::round(midi));
+                    int target=center;float distance=100;
+                    constexpr unsigned major=0xAB5,minor=0x5AD;
+                    for(int note=center-12;note<=center+12;++note){
+                        const unsigned degree=static_cast<unsigned>((note-root%12+1200)%12);
+                        if(scale==0 || ((scale==1?major:minor)>>degree&1)){
+                            const float delta=std::abs(note-midi);
+                            if(delta<distance){distance=delta;target=note;}
+                        }
+                    }
+                    desired=std::clamp(target-midi,-2.0f,2.0f)*std::clamp(strength,0u,100u)/100.0f;
+                    voiced_=true;
+                }
+            }
+        }
+        if(!voiced_){correction_=0;return 0;}
+        const float alpha=1-std::exp(-10.0f/std::clamp(speed,5u,150u));
+        correction_+=alpha*(desired-correction_);
+        return correction_;
+    }
+};
 class PitchEffect {
     RubberBand::RubberBandLiveShifter shifter_{48000,1,0};
     const size_t size_=shifter_.getBlockSize();
     std::vector<float> input_=std::vector<float>(size_),output_=std::vector<float>(size_);
     size_t in_=0,out_=0,total_=0,delay_=0;
     bool hasOutput_=false,started_=false;
-    int semitones_=0;
     Ramp wet_;
-    void begin(int semitones) {
-        shifter_.reset(); shifter_.setPitchScale(std::exp2(semitones/12.0));
+    void begin(float semitones,float formants) {
+        shifter_.reset(); shifter_.setPitchScale(std::exp2(semitones/12.0f));
+        shifter_.setFormantScale(std::exp2(formants/12.0f));
         delay_=shifter_.getStartDelay();
-        in_=out_=total_=0; hasOutput_=false; started_=true; semitones_=semitones;
+        in_=out_=total_=0; hasOutput_=false; started_=true;
     }
 public:
     void reset() { shifter_.reset();in_=out_=total_=delay_=0;hasOutput_=started_=false;wet_=Ramp{}; }
     bool active() const {return wet_.value>0;}
     float delayMs() const {return static_cast<float>(delay_+size_)*1000/48000;}
     void process(float* data,size_t n,int semitones,bool held,uint8_t* modified=nullptr) {
-        const bool wanted=held && semitones!=0;
+        processAdvanced(data,n,static_cast<float>(semitones),static_cast<float>(semitones),held&&semitones!=0,modified);
+    }
+    void processAdvanced(float* data,size_t n,float semitones,float formants,bool wanted,uint8_t* modified=nullptr) {
+        if(wanted){
+            if(!started_)begin(semitones,formants);
+            shifter_.setPitchScale(std::exp2(semitones/12.0f));
+            shifter_.setFormantScale(std::exp2(formants/12.0f));
+        }
         for(size_t i=0;i<n;++i) {
-            if(started_ && wet_.value==0 && (!wanted || semitones!=semitones_)) started_=false;
-            if(!started_ && wanted) begin(semitones);
+            if(started_ && wet_.value==0 && !wanted) started_=false;
             if(!started_) continue; // Exact dry bypass, no pitch work or buffering.
             const float dry=data[i];
             const bool valid=hasOutput_ && total_>=delay_+size_;
@@ -290,7 +473,7 @@ public:
                 shifter_.shift(&source,&destination);
                 in_=out_=0; hasOutput_=true;
             }
-            const float mix=wet_.next(wanted && semitones==semitones_ && valid?1.0f:0.0f);
+            const float mix=wet_.next(wanted && valid?1.0f:0.0f);
             if(modified && mix>0)modified[i]=ModifiedEffects;
             data[i]=mix==0?dry:dry+mix*(shifted-dry);
             if(!std::isfinite(data[i])) throw std::runtime_error("Pitch returned non-finite audio");

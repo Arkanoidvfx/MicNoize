@@ -18,7 +18,7 @@ struct Mnr {
     std::jthread shell;
     HANDLE instance=nullptr;
     std::atomic<HWND> window{nullptr};
-    std::atomic<unsigned> keys[13]{};
+    std::atomic<unsigned> keys[21]{};
     std::mutex soundKeysMutex;
     std::vector<std::pair<unsigned,unsigned>> soundKeys; // id, key
     std::atomic<unsigned> soundKeysGeneration{0};
@@ -164,6 +164,20 @@ extern "C" int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity) {
         copy(all,result,capacity); return 1;
     } catch(const std::exception& e) {copy(e.what(),result,capacity);return 0;} catch(...) {return 0;}
 }
+extern "C" void mnr_effect_options(Mnr* p,const MnrEffectOptions* o) {
+    if(!p||!o||o->echo_delay_ms<60||o->echo_delay_ms>600||o->echo_repeats<1||o->echo_repeats>8||
+       o->echo_decay<0||o->echo_decay>90||o->echo_level<0||o->echo_level>100||
+       o->stutter_ms<50||o->stutter_ms>300||o->grain_ms<30||o->grain_ms>150||
+       o->grain_scatter_ms<0||o->grain_scatter_ms>100||o->grain_pitch< -12||o->grain_pitch>12||
+       o->tune_root<0||o->tune_root>11||o->tune_scale<0||o->tune_scale>2||
+       o->tune_speed_ms<5||o->tune_speed_ms>150||o->tune_strength<0||o->tune_strength>100||
+       o->formant< -12||o->formant>12)return;
+    auto& e=p->engine;
+    e.echoDelayMs=o->echo_delay_ms;e.echoRepeats=o->echo_repeats;e.echoDecay=o->echo_decay;e.echoLevel=o->echo_level;
+    e.stutterMs=o->stutter_ms;e.grainMs=o->grain_ms;e.grainScatterMs=o->grain_scatter_ms;e.grainPitch=o->grain_pitch;
+    e.tuneRoot=o->tune_root;e.tuneScale=o->tune_scale;e.tuneSpeedMs=o->tune_speed_ms;e.tuneStrength=o->tune_strength;e.formant=o->formant;
+}
+extern "C" uint32_t mnr_effect_activity(Mnr* p) {return p?p->engine.effectActivity.load():0;}
 extern "C" int32_t mnr_refresh_host(char* error,uint32_t capacity) {
     try {
         try{mic::configureTagTask();mic::runTagTask();mic::setTagTaskWarning({});}
@@ -190,10 +204,11 @@ extern "C" int32_t mnr_tag_task_enabled(int32_t mode,char* error,uint32_t capaci
     try {return mic::tagTaskEnabled(mode)?1:0;}catch(const std::exception& e){copy(e.what(),error,capacity);return -1;}catch(...){copy("Host task maintenance failed",error,capacity);return -1;}
 }
 extern "C" void mnr_bindings(Mnr* p,const uint32_t* keys,uint32_t count) {
-    if(!keys || (count!=12 && count!=13))return;
+    if(!keys || (count!=12 && count!=13 && count!=21))return;
     auto valid=[](unsigned k){return k==0 || ((k&255)>=3 && (k&255)<=254 && (k>>8)<=7);};
     for(unsigned i=0;i<count;++i){if(!valid(keys[i]))return;for(unsigned j=0;j<i;++j)if(keys[i]&&keys[i]==keys[j])return;}
-    bool discord=false;for(unsigned i=0;i<13;++i){p->keys[i]=i<count?keys[i]:0;if(i>=5&&i<10&&keys[i])discord=true;}
+    {std::lock_guard lock(p->soundKeysMutex);for(const auto& [id,key]:p->soundKeys)for(unsigned i=0;i<count;++i)if(keys[i]&&keys[i]==key)return;}
+    bool discord=false;for(unsigned i=0;i<21;++i){p->keys[i]=i<count?keys[i]:0;if(((i>=5&&i<10)||(i>=17&&i<21))&&i<count&&keys[i])discord=true;}
     p->engine.desktopEnabled=discord;p->engine.releaseEffects();
 }
 extern "C" void mnr_alternate_intensity(Mnr* p,float intensity) {
@@ -287,7 +302,7 @@ extern "C" int32_t mnr_sound_bindings(Mnr* p,const uint32_t* ids,const uint32_t*
     for(unsigned i=0;i<count;++i) {
         const unsigned k=keys[i];
         if(!k || (k&255)<3 || (k&255)>254 || (k>>8)>7) return 0;
-        for(unsigned j=0;j<13;++j) if(p->keys[j]==k) return 0;
+        for(unsigned j=0;j<21;++j) if(p->keys[j]==k) return 0;
         for(const auto& [id,key]:bindings) if(key==k || id==ids[i]) return 0;
         bindings.emplace_back(ids[i],k);
     }
@@ -443,8 +458,8 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
                     else if(captureArmed) {p->captured=key==VK_ESCAPE?0xffffffffu:(key|(modifiers()<<8));capturedThisSession=true;}
                 }
                 const bool eligible=p->engine.running()&&p->engine.stats.outputActive&&!p->engine.muted&&!capture&&desktop&&!p->locked&&!p->suspended;
-                unsigned keys[10]{};bool pressed[10]{};
-                for(unsigned i=0;i<10;++i){keys[i]=p->keys[i];pressed[i]=keys[i]&&down(keys[i]&255);}
+                unsigned keys[18]{};bool pressed[18]{};
+                for(unsigned i=0;i<18;++i){const unsigned slot=i<10?i:i+3;keys[i]=p->keys[slot];pressed[i]=keys[i]&&down(keys[i]&255);}
                 const unsigned flags=latch.update(epoch,eligible,keys,pressed,modifiers(),down(VK_LWIN)||down(VK_RWIN),p->engine.stats.desktopState==2);
                 unsigned replayKeys[]={p->keys[11]};bool replayPressed[]={replayKeys[0] && down(replayKeys[0]&255)};
                 const auto replayFlags=replayLatch.update(epoch,eligible,replayKeys,replayPressed,modifiers(),down(VK_LWIN)||down(VK_RWIN));

@@ -132,7 +132,7 @@ struct Stats {
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};
     std::atomic<float> tagMaxWakeMs{0};
 };
-struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;float sound=0;uint8_t recording=0;};
+struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;float sound=0;uint8_t recording=0;float echoMic=0,echoDiscord=0;};
 // Soundpad clip: decoded by the UI to 48 kHz mono, owned here so playback never touches files.
 struct SoundClip {
     std::vector<float> samples;
@@ -275,7 +275,7 @@ class Engine {
     Ring<16384,RoutedSample> cleaned_;
     Ring<16384,RoutedSample> preview_;
     std::atomic<uint8_t> previewMask_{0};
-    void preview(const float* audio,const RoutedSample* routed,const uint8_t* modified,unsigned count);
+    void preview(const float* audio,const float* echo,const RoutedSample* routed,const uint8_t* modified,unsigned count);
     std::mutex soundMutex_,soundRequestMutex_;
     std::unordered_map<unsigned,std::shared_ptr<SoundClip>> sounds_;
     // Newest finished hold-effect recording, for the UI to save as a file. The DSP thread
@@ -299,7 +299,7 @@ public:
     Stats stats;
     std::atomic<uint64_t> operation{0};
     uint64_t beginOperation(){const auto value=++operation;SetEvent(stop_);releaseEffects();return value;}
-    // One atomic message: timestamp (37 bits), epoch (16), eligibility + ten holds (11).
+    // One atomic message: millisecond timestamp (29 bits), epoch (16), eligibility + 18 holds (19).
     std::atomic<uint64_t> heldSample{0};
     std::atomic<uint64_t> noiseHeldSample{0};
     std::atomic<unsigned> effectEpoch{0};
@@ -314,6 +314,10 @@ public:
     std::atomic<unsigned> phraseCancel{0};
     std::atomic<unsigned> replayRequest{0};
     std::atomic<int> pitch{-5};
+    std::atomic<int> formant{0},grainPitch{0},tuneRoot{0},tuneScale{0};
+    std::atomic<unsigned> echoDelayMs{220},echoRepeats{3},echoDecay{55},echoLevel{100};
+    std::atomic<unsigned> stutterMs{120},grainMs{80},grainScatterMs{30},tuneSpeedMs{80},tuneStrength{100};
+    std::atomic<unsigned> effectActivity{0};
     // Soundpad: library writes happen off the DSP thread; the DSP thread only try-locks.
     std::atomic<uint64_t> soundRequest{0};
     std::atomic<uint64_t> soundSeekRequest{0};
@@ -338,7 +342,7 @@ public:
         const auto sample=heldSample.load();
         return heldFlags(sample,effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
     }
-    void releaseEffects() { heldSample=0; noiseHeldSample=0; ++effectEpoch; }
+    void releaseEffects() { heldSample=0; noiseHeldSample=0; effectActivity=0; ++effectEpoch; }
     void reportError(const std::string& message);
     std::atomic<float> intensity{1};
     std::atomic<float> alternateIntensity{0.15f};

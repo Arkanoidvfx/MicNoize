@@ -24,9 +24,80 @@ int main() {try {
         reverse.reset();std::vector<float> quiet(960,0.f);reverse.process(quiet.data(),960);
         for(float v:quiet) require(v==0.f,"Grain reverse kept audio after reset");
     }
+    {
+        mic::EchoEffect echo;
+        std::array<float,480> input{},wet{};
+        std::vector<float> heard(480*20);
+        for(int frame=0;frame<20;++frame){
+            input.fill(0);if(frame==0)input[0]=0.5f;
+            echo.process(input.data(),480,frame==0,60,3,50,100,wet.data());
+            std::copy(wet.begin(),wet.end(),heard.begin()+frame*480);
+        }
+        for(size_t i=0;i<heard.size();++i){
+            const float expected=i==2880?0.5f:i==5760?0.25f:i==8640?0.125f:0;
+            require(std::abs(heard[i]-expected)<1e-6f,"Echo duplicated dry input, fed back, or cut its tail");
+        }
+        std::array<float,1> dry{0.25f},micTail{0},discordTail{0.5f},mainOnly{},tailOnly{};
+        std::array<uint8_t,1> source{0},category{0};
+        mic::OutputEffects mixer;
+        mixer.process(dry.data(),1,1,1,false,false,source.data(),0.08f,category.data(),nullptr,
+            mainOnly.data(),nullptr,micTail.data(),discordTail.data(),tailOnly.data());
+        require(std::abs(dry[0]-0.29f)<1e-6f && std::abs(tailOnly[0]-0.04f)<1e-6f &&
+            mic::previewQueued(mainOnly[0],category[0],1,0,false,1,1,true).value==0,
+            "Discord echo tail gain or dry monitor separation failed");
+        echo.reset();input.fill(0);echo.process(input.data(),480,true,60,3,50,100,wet.data());
+        require(std::all_of(wet.begin(),wet.end(),[](float v){return v==0;}),"Old echo survived reset");
+        std::cout<<"echo=passed taps=3 tail=180ms dry=excluded\n";
+    }
+    {
+        mic::StutterEffect stutter;
+        std::array<float,480> frame{};
+        for(int block=0;block<30;++block){for(int i=0;i<480;++i)frame[i]=(block*480+i)/14400.0f;stutter.feed(frame.data(),480);}
+        frame.fill(0);stutter.process(frame.data(),480,true,50);
+        frame.fill(0);stutter.process(frame.data(),480,true,50);
+        require(std::abs(frame[300]-12780/14400.0f)<1e-5f,"Stutter did not capture the last 50 ms");
+        for(int i=0;i<4;++i){frame.fill(0);stutter.process(frame.data(),480,true,50);}
+        frame.fill(0);stutter.process(frame.data(),480,true,50);
+        require(std::abs(frame[300]-12780/14400.0f)<1e-5f,"Stutter loop changed its captured phrase");
+        frame.fill(0.2f);stutter.process(frame.data(),480,false,50);
+        frame.fill(0.2f);stutter.process(frame.data(),480,false,50);
+        require(frame[479]==0.2f,"Stutter did not release to live voice");
+        mic::GranularEffect granular;
+        bool changed=false;
+        for(int block=0;block<120;++block){
+            for(int i=0;i<480;++i)frame[i]=0.2f*std::sin((block*480+i)*0.17f);
+            const auto originalFrame=frame;
+            granular.process(frame.data(),480,true,30,20,7);
+            for(float v:frame)require(std::isfinite(v)&&std::abs(v)<=1,"Granular output escaped bounds");
+            if(block>50&&frame!=originalFrame)changed=true;
+        }
+        require(changed,"Granular never processed live speech");
+        std::cout<<"stutter=passed granular=passed\n";
+    }
+    {
+        mic::AutoTunePitch tune;
+        std::array<float,480> voice{};float correction=0;
+        for(int block=0;block<100;++block){
+            for(int i=0;i<480;++i)voice[i]=0.3f*std::sin(6.28318530718f*452*(block*480+i)/48000);
+            correction=tune.process(voice.data(),480,true,0,0,1,80,100);
+        }
+        require(correction< -0.25f&&correction> -0.8f,"AutoTune missed A in C major");
+        voice.fill(0);for(int i=0;i<5;++i)correction=tune.process(voice.data(),480,true,0,0,1,80,100);
+        require(correction==0&&!tune.voiced(),"AutoTune corrected an unvoiced passage");
+        mic::PitchEffect formant;unsigned crossings=0;float previous=0;
+        for(int block=0;block<180;++block){
+            for(int i=0;i<480;++i)voice[i]=0.2f*std::sin(6.28318530718f*440*(block*480+i)/48000);
+            formant.processAdvanced(voice.data(),480,0,6,true);
+            if(block>80)for(float sample:voice){if(previous<=0&&sample>0)++crossings;previous=sample;}
+        }
+        require(std::abs(crossings/0.99f-440)<20,"Formant shift changed fundamental pitch");
+        std::cout<<"autotune=passed formant=passed\n";
+    }
     std::array<float,480> original{},data{};
     {
         mic::LastEffect replay;std::array<uint8_t,480> modified{};bool discord=false;
+        require(mic::sourceRecordFlags(mic::HoldEcho|mic::HoldAutoTune,true)==
+            ((mic::HoldEcho|mic::HoldAutoTune)<<4),"Discord live activity bits lost their source");
         auto run=[&](float value,unsigned held,unsigned request,bool valid=true,unsigned epoch=1,unsigned cancel=0){
             data.fill(value);modified.fill(held?((held&33)?2:1):0);
             return replay.process(data.data(),480,modified.data(),discord,held,false,valid,epoch,cancel,request);
@@ -53,6 +124,11 @@ int main() {try {
         replayMix.process(&replayOutput,1,1,1,false,false,&replaySource,0.08f,&replayCategory,nullptr,&replayOnly);
         const auto replayPreview=mic::previewQueued(replayOnly,replayCategory,1,0,false,1,1,true);
         require(std::abs(mic::previewSample(replayPreview,1,1,true)-0.048f)<1e-6,"Discord hotkey replay missing from effects monitor");
+        discord=false;run(0.2f,mic::sourceRecordFlags(mic::HoldEcho,false),5);
+        discord=true;run(0.6f,mic::sourceRecordFlags(mic::HoldEcho,true),5);run(0,0,5);
+        replay.copyRecording(saved,0.08f);
+        require(saved.size()==480 && std::abs(saved[100]-0.048f)<1e-6,"Same live effect on another source did not replace recording");
+        discord=false;
         run(0.2f,2,5);run(0,0,5,false);
         require(!run(0,0,6),"Interrupted recording survived reset");
         run(0.2f,2,6);run(0.2f,2,6);run(0,0,6);
@@ -64,6 +140,20 @@ int main() {try {
         require(run(0,0,8,true,1,1),"Bounded replay failed to start");
         int blocks=1;while(run(0,0,8,true,1,1)){require(++blocks<=2000,"Unbounded replay");}
         require(blocks==2000,"Replay capacity changed");
+        mic::LastEffect echoReplay;std::array<float,480> echoCapture{};std::array<uint8_t,480> echoFlags{};
+        bool echoSource=false;data.fill(0);modified.fill(0);
+        echoReplay.process(data.data(),480,modified.data(),echoSource,0,false,true,1,0,0);
+        for(float level:{0.1f,0.2f}){
+            data.fill(level==0.1f?0.5f:0.7f);echoCapture.fill(level);echoFlags.fill(mic::ModifiedEffects);
+            echoReplay.process(data.data(),480,modified.data(),echoSource,level==0.1f?mic::HoldEcho:0,
+                false,true,1,0,0,echoCapture.data(),echoFlags.data(),true);
+        }
+        data.fill(0.7f);echoCapture.fill(0);echoFlags.fill(0);
+        echoReplay.process(data.data(),480,modified.data(),echoSource,0,false,true,1,0,0,
+            echoCapture.data(),echoFlags.data(),false);
+        echoReplay.copyRecording(saved,1);
+        require(echoReplay.finished()&&saved.size()==960&&saved[100]==0.1f&&saved[580]==0.2f,
+            "Echo replay captured returned dry voice or lost its tail");
         std::array<float,480> mic{},only{};std::array<uint8_t,480> sources{};sources.fill(1);mic.fill(0.25f);
         {
             mic::OutputEffects output;
@@ -243,6 +333,16 @@ int main() {try {
     require(mic::heldFlags(sample,7,1251,true)==0,"Stale heartbeat remained active");
     require(mic::heldFlags(sample,8,1100,true)==0,"Old session press remained active");
     require(mic::heldFlags(sample,7,1100,false)==0,"Ineligible press accepted");
+    {
+        mic::HoldLatch all;unsigned keys[18]{};bool pressed[18]{};
+        for(unsigned i=0;i<18;++i)keys[i]=80+i;
+        all.update(1,true,keys,pressed,0,false);
+        std::fill(std::begin(pressed),std::end(pressed),true);
+        const auto flags=all.update(1,true,keys,pressed,0,false);
+        require(flags==mic::HoldAllMask,"18 hotkeys did not fit the hold mask");
+        require(mic::heldFlags(mic::packHeld(1000,1,flags),1,1100,true)==flags,"New hold bits were lost in timestamp packing");
+        require(all.update(1,true,keys,pressed,0,false,false)==mic::HoldMicMask,"Unavailable Discord retained a new hold");
+    }
     {
         mic::HoldLatch noise;unsigned key[]={119|256};bool down[]={true};
         auto strength=[&](uint64_t now,unsigned epoch,bool eligible,unsigned mods){

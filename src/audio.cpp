@@ -652,9 +652,11 @@ void Engine::desktopLoop() {
                     check(capture->GetNextPacketSize(&n),"Discord next packet");
                 }
             }
+            if(stats.desktopState==2)releaseEffects();
             stats.desktopState=0;
         }catch(const std::exception& e){
             {std::lock_guard lock(statusMutex_);desktopMessage_=wide(e.what());}
+            if(stats.desktopState==2)releaseEffects();
             stats.desktopState=3;
             if(WaitForSingleObject(stop_,1000)==WAIT_OBJECT_0)break;
         }
@@ -958,8 +960,10 @@ void Engine::dspLoop(Config c) {
             if(cpuApi) {_mm_setcsr(_mm_getcsr()|0x8040);cpu.state=cpuApi->create();}
             stats.denoiser=cpu.state?3:2;
         }
-        PitchEffect pitchEffect; PhraseEffect phraseEffect; auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
-        std::array<float,block> in{},out{},microphone{};
+        PitchEffect pitchEffect; AutoTunePitch autoTune; StutterEffect stutterMic,stutterDiscord;
+        GranularEffect granular; EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect;
+        auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
+        std::array<float,block> in{},out{},microphone{},discordSource{},scratch{},echoMicOut{},echoDiscordOut{},captureData{};
         LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
         bool clipPending=false,studioActive=false,studioPending=false;
         {std::lock_guard lock(clipMutex_);clip_.clear();clip_.reserve(48000*20);} // publishing never allocates
@@ -967,7 +971,7 @@ void Engine::dspLoop(Config c) {
         {std::lock_guard lock(studioMutex_);studioClip_.reserve(rate*20);}
         std::array<float,block> sound{};
         std::array<RoutedSample,block> routed{};
-        std::array<uint8_t,block> modified{},recording{};
+        std::array<uint8_t,block> modified{},recording{},captureFlags{};
         std::array<float,block+1> discord{};SourceRouting routing;Drift discordDrift;
         bool discordPrimed=false,wasDiscord=false;Ramp sourceFade{1};
         float applied=c.intensity;
@@ -1037,34 +1041,67 @@ void Engine::dspLoop(Config c) {
                 bool fromDiscord=routing.select(flags,phraseEffect.state()!=0);
                 microphone=out;
                 if(desktop_.size()>block*6){desktop_.trim(block*2);discordDrift={};}
-                if(stats.desktopState!=2){desktop_.trim(0);discordPrimed=false;}
+                if(stats.desktopState!=2){desktop_.trim(0);discordPrimed=false;echoDiscord.reset();}
                 if(!discordPrimed && desktop_.size()>=block*2)discordPrimed=true;
                 const auto take=static_cast<unsigned>(std::clamp(std::lround(block*(1+discordDrift.update(static_cast<double>(desktop_.size())-block*2))),static_cast<long>(block-1),static_cast<long>(block+1)));
                 const bool haveDiscord=discordPrimed && desktop_.pop(discord.data(),take);
                 if(!haveDiscord)discordPrimed=false;
+                for(unsigned i=0;i<block;++i){
+                    const double at=i*static_cast<double>(take-1)/(block-1);const auto j=static_cast<unsigned>(at);
+                    discordSource[i]=haveDiscord?std::lerp(discord[j],discord[std::min(j+1,take-1)],static_cast<float>(at-j)):0;
+                }
                 if(fromDiscord){
-                    for(unsigned i=0;i<block;++i){
-                        const double at=i*static_cast<double>(take-1)/(block-1);const auto j=static_cast<unsigned>(at);
-                        out[i]=haveDiscord?std::lerp(discord[j],discord[std::min(j+1,take-1)],static_cast<float>(at-j)):0;
-                    }
+                    out=discordSource;
                     valid=valid && stats.desktopState==2;
                     modified.fill(0); // RVC flags described the microphone, which now travels separately.
                 }
-                if(fromDiscord!=wasDiscord){pitchEffect.reset();boostEffect=OutputEffects{};sourceFade=Ramp{0};wasDiscord=fromDiscord;}
+                const unsigned selected=sourceHeld(flags,fromDiscord);
+                if(fromDiscord!=wasDiscord){pitchEffect.reset();autoTune.reset();granular.reset();boostEffect=OutputEffects{};sourceFade=Ramp{0};wasDiscord=fromDiscord;}
                 stats.desktopSource=fromDiscord;
+                if(valid){
+                    (fromDiscord?stutterDiscord:stutterMic).process(out.data(),block,(selected&HoldStutter)!=0,stutterMs.load(),modified.data());
+                    scratch.fill(0);
+                    (fromDiscord?stutterMic:stutterDiscord).process(scratch.data(),block,false,stutterMs.load());
+                }else{scratch.fill(0);stutterMic.process(scratch.data(),block,false,stutterMs.load());stutterDiscord.process(scratch.data(),block,false,stutterMs.load());}
+                stutterMic.feed(microphone.data(),block);
+                if(haveDiscord)stutterDiscord.feed(discordSource.data(),block);else stutterDiscord.reset();
                 const auto pitchBegin=std::chrono::steady_clock::now();
-                pitchEffect.process(out.data(),block,pitch.load(),valid && ((flags|(flags>>DiscordShift))&HoldPitch)!=0,modified.data());
+                const bool pitchHeld=valid && (selected&HoldPitch)!=0;
+                const bool tuneHeld=valid && (selected&HoldAutoTune)!=0;
+                const int manual=pitchHeld?pitch.load():0;
+                const float correction=autoTune.process(out.data(),block,tuneHeld,manual,tuneRoot.load(),tuneScale.load(),tuneSpeedMs.load(),tuneStrength.load());
+                const int formants=pitchHeld?formant.load():0;
+                pitchEffect.processAdvanced(out.data(),block,static_cast<float>(manual)+correction,formants,pitchHeld&&(manual||formants)||(tuneHeld&&autoTune.voiced()),modified.data());
+                granular.process(out.data(),block,valid&&(selected&HoldGranular),grainMs.load(),grainScatterMs.load(),grainPitch.load(),modified.data());
                 for(auto& v:out)v*=sourceFade.next(1);
                 stats.pitchActive=pitchEffect.active(); stats.pitchDelayMs=pitchEffect.delayMs();
                 stats.pitchMaxMs=std::max(stats.pitchMaxMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-pitchBegin).count());
                 const bool phraseWasActive=phraseEffect.state()!=0;
                 phraseEffect.process(out.data(),block,routing.phraseFlags,slowSpeed.load(),fastSpeed.load(),valid,epoch,phraseCancel.load(),!fromDiscord,modified.data());
                 stats.phraseState=phraseEffect.state();stats.phraseSeconds=phraseEffect.seconds();
-                const bool boosted=valid && (flags&(HoldBoost|(HoldBoost<<DiscordShift)))!=0;
+                const bool boosted=valid && (selected&HoldBoost)!=0;
                 boostEffect.process(out.data(),block,1,boost.load(),boosted,overload.load(),nullptr,1,modified.data());
                 stats.boostActive=boosted && boost>1;
-                const bool replay=lastEffect.process(out.data(),block,modified.data(),fromDiscord,flags,
-                    phraseWasActive || phraseEffect.state()!=0 || pitchEffect.active(),valid,epoch,phraseCancel.load(),replayRequest.load());
+                const bool micEchoBefore=echoMic.active(),discordEchoBefore=echoDiscord.active();
+                const bool echoHeld=valid && (selected&HoldEcho)!=0;
+                if(!valid){echoMic.reset();echoDiscord.reset();}
+                echoMic.process(fromDiscord?nullptr:out.data(),block,echoHeld&&!fromDiscord,echoDelayMs.load(),echoRepeats.load(),echoDecay.load(),echoLevel.load(),echoMicOut.data());
+                echoDiscord.process(fromDiscord?out.data():nullptr,block,echoHeld&&fromDiscord,echoDelayMs.load(),echoRepeats.load(),echoDecay.load(),echoLevel.load(),echoDiscordOut.data());
+                const bool micEcho=micEchoBefore||echoMic.active(),discordEcho=discordEchoBefore||echoDiscord.active();
+                if(echoHeld){out.fill(0);modified.fill(0);}
+                const bool recordDiscord=(selected&LastEffect::recordable)?fromDiscord:lastEffect.recordingDiscord();
+                const bool chosenEcho=recordDiscord?discordEcho:micEcho;
+                const bool captureMain=(selected&LastEffect::recordable)!=0 || phraseWasActive || phraseEffect.state()!=0;
+                for(unsigned i=0;i<block;++i){
+                    captureFlags[i]=static_cast<uint8_t>((captureMain?(modified[i]&~ModifiedBoost):0)|(chosenEcho?ModifiedEffects:0));
+                    captureData[i]=((captureMain&&(modified[i]&~ModifiedBoost))?out[i]:0)+(recordDiscord?echoDiscordOut[i]:echoMicOut[i]);
+                }
+                effectActivity=sourceRecordFlags((pitchHeld?HoldPitch:0)|
+                    (valid?selected&(HoldStutter|HoldGranular|HoldAutoTune):0),fromDiscord)|
+                    (micEcho?HoldEcho:0)|(discordEcho?HoldEcho<<4:0);
+                const bool replay=lastEffect.process(out.data(),block,modified.data(),fromDiscord,sourceRecordFlags(selected,fromDiscord),
+                    phraseWasActive || phraseEffect.state()!=0 || pitchEffect.active(),valid,epoch,phraseCancel.load(),replayRequest.load(),
+                    captureData.data(),captureFlags.data(),chosenEcho);
                 // Hand a finished recording to the UI without allocating or waiting here.
                 if(lastEffect.finished())clipPending=true;
                 // A new hold already replaced the slot: that recording is gone, never publish half of it.
@@ -1090,7 +1127,7 @@ void Engine::dspLoop(Config c) {
                 }
                 sounds.render(sound.data(),block,soundVolume.load(),muted,recording.data());
                 soundPlaying=sounds.playing();soundPosition=sounds.position();soundLength=sounds.length();
-                for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,(fromDiscord || replay)?microphone[i]:0,sound[i],recording[i]};
+                for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,((fromDiscord&&!echoHeld)||replay)?microphone[i]:0,sound[i],recording[i],echoMicOut[i],echoDiscordOut[i]};
                 if(!cleaned_.push(routed.data(),block)) ++stats.drops;
                 ++stats.processed;
                 stats.inputQueue=static_cast<unsigned>(captured_.size());
@@ -1104,7 +1141,7 @@ void Engine::dspLoop(Config c) {
         }
     } catch(const std::exception& e) { fail(e); }
 }
-void Engine::preview(const float* audio,const RoutedSample* routed,const uint8_t* modified,unsigned count) {
+void Engine::preview(const float* audio,const float* echo,const RoutedSample* routed,const uint8_t* modified,unsigned count) {
     const auto mask=previewMask_.load();
     if(!mask)return;
     const auto epoch=effectEpoch.load();
@@ -1115,6 +1152,9 @@ void Engine::preview(const float* audio,const RoutedSample* routed,const uint8_t
         for(unsigned i=0;i<n;++i){
             const auto at=offset+i;
             samples[i]=previewQueued(audio[at],modified[at],routed[at].epoch,routed[at].sound,routed[at].recording,mask,epoch,audible);
+            if((mask&ModifiedEffects) && audible && routed[at].epoch==epoch && echo[at]!=0){
+                samples[i].value+=echo[at];samples[i].modified|=ModifiedEffects;
+            }
         }
         // Preview must never block or trim from the producer side.
         if(!preview_.push(samples.data(),n))break;
@@ -1175,7 +1215,7 @@ void Engine::tagLoop(Config c) {
     std::array<RoutedSample,16384> routed{};
     std::array<uint8_t,16384> sources{};
     std::array<uint8_t,16384> modified{};
-    std::array<float,16384> microphone{},effectOnly{},sound{};
+    std::array<float,16384> microphone{},effectOnly{},sound{},echoMic{},echoDiscord{},echoOnly{};
     HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     if(!timer) throw std::runtime_error("TAG high-resolution timer creation failed");
     struct Timer {HANDLE h; ~Timer(){CancelWaitableTimer(h);CloseHandle(h);}} closeTimer{timer};
@@ -1239,12 +1279,15 @@ void Engine::tagLoop(Config c) {
                 if(!primed && cleaned_.size()>=target+frames) primed=true;
                 const bool have=primed && cleaned_.pop(routed.data(),frames);
                 if(primed && !have){++stats.underruns;primed=false;fade=0;drift={};correction=0;}
-                for(unsigned i=0;i<frames;++i){output[i]=have?routed[i].value:0;sources[i]=have?routed[i].discord:0;modified[i]=have?routed[i].modified:0;microphone[i]=have?routed[i].microphone:0;sound[i]=have?routed[i].sound:0;}
-                effects.process(output.data(),frames,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data(),sound.data());
+                if(!have)std::fill_n(routed.data(),frames,RoutedSample{});
+                const auto currentEpoch=effectEpoch.load();
+                for(unsigned i=0;i<frames;++i){output[i]=have?routed[i].value:0;sources[i]=have?routed[i].discord:0;modified[i]=have?routed[i].modified:0;microphone[i]=have?routed[i].microphone:0;sound[i]=have?routed[i].sound:0;echoMic[i]=have&&routed[i].epoch==currentEpoch?routed[i].echoMic:0;echoDiscord[i]=have&&routed[i].epoch==currentEpoch?routed[i].echoDiscord:0;}
+                effects.process(output.data(),frames,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data(),sound.data(),echoMic.data(),echoDiscord.data(),echoOnly.data());
                 for(unsigned i=0;i<frames;++i) {
                     fade+=std::clamp((muted?0.0f:1.0f)-fade,-1.0f/240,1.0f/240);
                     output[i]*=fade;
                     effectOnly[i]*=fade;
+                    echoOnly[i]*=fade;
                 }
                 const float outputPeak=peak(output.data(),frames);
                 // Windows software endpoint gain applies to shared-mode capture only.
@@ -1252,7 +1295,7 @@ void Engine::tagLoop(Config c) {
                 for(unsigned i=0;i<frames;++i) output[i]*=compensation;
                 if(tag.write(output.data(),frames)) {
                     stats.tagFrames+=frames;
-                    preview(effectOnly.data(),routed.data(),modified.data(),frames);
+                    preview(effectOnly.data(),echoOnly.data(),routed.data(),modified.data(),frames);
                     if(muted && fade==0) stats.outputPeak=0;
                     else peakHold(stats.outputPeak,outputPeak);
                 } else {
@@ -1293,7 +1336,7 @@ void Engine::ioLoop(Config c) {
         std::vector<RoutedSample> routed(output.capacity);
         std::vector<uint8_t> sources(output.capacity);
         std::vector<uint8_t> modified(output.capacity);
-        std::vector<float> microphone(output.capacity),effectOnly(output.capacity),sound(output.capacity);
+        std::vector<float> microphone(output.capacity),effectOnly(output.capacity),sound(output.capacity),echoMic(output.capacity),echoDiscord(output.capacity),echoOnly(output.capacity);
         BYTE* initial=nullptr; check(render->GetBuffer(output.capacity,&initial),"Prime render buffer");
         check(render->ReleaseBuffer(output.capacity,AUDCLNT_BUFFERFLAGS_SILENT),"Prime render buffer release");
         Mmcss priority;
@@ -1347,8 +1390,9 @@ void Engine::ioLoop(Config c) {
                 BYTE* dest=nullptr; check(render->GetBuffer(n,&dest),"Render buffer");
                 float outputPeak=0;
                 if(have) {
-                    for(unsigned i=0;i<n;++i){mono[i]=routed[i].value;sources[i]=routed[i].discord;modified[i]=routed[i].modified;microphone[i]=routed[i].microphone;sound[i]=routed[i].sound;}
-                    effects.process(mono.data(),n,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data(),sound.data());
+                    const auto currentEpoch=effectEpoch.load();
+                    for(unsigned i=0;i<n;++i){mono[i]=routed[i].value;sources[i]=routed[i].discord;modified[i]=routed[i].modified;microphone[i]=routed[i].microphone;sound[i]=routed[i].sound;echoMic[i]=routed[i].epoch==currentEpoch?routed[i].echoMic:0;echoDiscord[i]=routed[i].epoch==currentEpoch?routed[i].echoDiscord:0;}
+                    effects.process(mono.data(),n,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data(),sound.data(),echoMic.data(),echoDiscord.data(),echoOnly.data());
                     auto out=reinterpret_cast<float*>(dest);
                     for(unsigned i=0;i<n;++i) {
                         float goal=muted?0.0f:1.0f;
@@ -1356,13 +1400,14 @@ void Engine::ioLoop(Config c) {
                         const float value=mono[i]*fade;
                         mono[i]=value;
                         effectOnly[i]*=fade;
+                        echoOnly[i]*=fade;
                         outputPeak=std::max(outputPeak,std::abs(value));
                         for(unsigned ch=0;ch<output.channels;++ch) out[i*output.channels+ch]=value;
                     }
                 }
                 check(render->ReleaseBuffer(n,have?0:AUDCLNT_BUFFERFLAGS_SILENT),"Release render buffer");
-                if(!have){std::fill_n(mono.data(),n,0);std::fill_n(modified.data(),n,0);}
-                preview(effectOnly.data(),routed.data(),modified.data(),n);
+                if(!have){std::fill_n(mono.data(),n,0);std::fill_n(modified.data(),n,0);std::fill_n(effectOnly.data(),n,0);std::fill_n(echoOnly.data(),n,0);std::fill_n(routed.data(),n,RoutedSample{});}
+                preview(effectOnly.data(),echoOnly.data(),routed.data(),modified.data(),n);
                 if(muted && fade==0) stats.outputPeak=0;
                 else peakHold(stats.outputPeak,outputPeak);
             }

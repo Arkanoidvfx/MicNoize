@@ -27,6 +27,14 @@ int32_t mnr_monitor_state(Mnr*,char* text,uint32_t capacity);
 // Peak of what the monitor actually rendered since the previous call (0 when idle).
 float mnr_monitor_peak(Mnr*);
 void mnr_controls(Mnr*,float volume,float boost,int32_t pitch,float intensity,int32_t muted,float slow,float fast,int32_t overload,float discordVolume,int32_t rvcEnabled);
+typedef struct {
+    int32_t echo_delay_ms,echo_repeats,echo_decay,echo_level;
+    int32_t stutter_ms,grain_ms,grain_scatter_ms,grain_pitch;
+    int32_t tune_root,tune_scale,tune_speed_ms,tune_strength,formant;
+} MnrEffectOptions;
+// Additive ABI: existing controls and snapshot layouts stay unchanged.
+void mnr_effect_options(Mnr*,const MnrEffectOptions*);
+uint32_t mnr_effect_activity(Mnr*);
 void mnr_rvc_settings(Mnr*,uint32_t slot,int32_t pitch,uint32_t index,uint32_t chunk_ms,uint32_t gain);
 int32_t mnr_phrase_state(Mnr*,float* seconds);
 int32_t mnr_discord_state(Mnr*,char* text,uint32_t capacity,int32_t* active);

@@ -16,7 +16,7 @@ mod updater;
 mod maintenance;
 mod update_window;
 mod view;
-use engine::{Config, Controls, Device, Engine, Reply, Snapshot};
+use engine::{Config, Controls, Device, EffectOptions, Engine, Reply, Snapshot};
 use iced::{Element, Font, Size, Subscription, Task, Theme, keyboard, window};
 use settings::{Settings, key_name};
 use soundpad::{Section, Sound, Sort as SoundSort, State as SoundState};
@@ -31,6 +31,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The effect defaults of 0.3.16 (boost 167 %, ×0.67, ×1.67, pitch −6) reach existing installs
+/// once: settings without this `[effects] defaults_version` get them, and every save writes it.
+const EFFECT_DEFAULTS_VERSION: i32 = 2;
+fn apply_effect_defaults(settings: &mut Settings) {
+    if settings.number("effects", "defaults_version", 1, 1, 99) >= EFFECT_DEFAULTS_VERSION {
+        return;
+    }
+    for (key, value) in [("boost", 167), ("slow_speed", 67), ("fast_speed", 167), ("pitch", -6)] {
+        settings.set("effects", key, value);
+    }
+    settings.set("effects", "defaults_version", EFFECT_DEFAULTS_VERSION);
+}
 /// settings.ini section of tuned strengths: microphone id = percent.
 const PROFILES: &str = "noise_profiles";
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -42,7 +54,7 @@ const RESTART_EVENT: u32 = 4;
 const RVC_SLACK_MS: u32 = 200;
 const DISCORD_VOLUME_AT_100: f32 = 0.08;
 const DISCORD_VOLUME_MAX_PERCENT: f32 = 200.0;
-/// `Msg::Bind` targets above the 13 effect keys: the soundpad stop key and one per clip.
+/// `Msg::Bind` targets above the 21 effect and service keys: soundpad stop and clips.
 const SOUND_STOP_BIND: usize = 99;
 /// The old 20 % soundpad setting is the new 100 %: physical gain 0.04 (-28 dB).
 const SOUND_VOLUME_AT_100: f32 = 0.04;
@@ -52,6 +64,24 @@ const CLIP_ID_BASE: u32 = 900_000;
 /// How many recordings the microphone page keeps on disk.
 const CLIPS_KEPT: usize = 6;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+fn load_effect_options(settings: &Settings) -> EffectOptions {
+    EffectOptions {
+        echo_delay_ms: settings.number("effects", "echo_delay_ms", 220, 60, 600),
+        echo_repeats: settings.number("effects", "echo_repeats", 3, 1, 8),
+        echo_decay: settings.number("effects", "echo_decay", 55, 0, 90),
+        echo_level: settings.number("effects", "echo_level", 100, 0, 100),
+        stutter_ms: settings.number("effects", "stutter_ms", 120, 50, 300),
+        grain_ms: settings.number("effects", "grain_ms", 80, 30, 150),
+        grain_scatter_ms: settings.number("effects", "grain_scatter_ms", 30, 0, 100),
+        grain_pitch: settings.number("effects", "grain_pitch", 0, -12, 12),
+        tune_root: settings.number("effects", "tune_root", 0, 0, 11),
+        tune_scale: settings.number("effects", "tune_scale", 0, 0, 2),
+        tune_speed_ms: settings.number("effects", "tune_speed_ms", 80, 5, 150),
+        tune_strength: settings.number("effects", "tune_strength", 100, 0, 100),
+        formant: settings.number("effects", "formant", 0, -12, 12),
+    }
+}
 
 /// Local wall clock for recording names: std has no local time, `GetLocalTime` does.
 #[repr(C)]
@@ -308,6 +338,10 @@ mod focus {
         pub const REVERSE_BIND: usize = 15;
         /// Discord bindings of the five effects: `DISCORD_BIND_BASE + effect`.
         pub const DISCORD_BIND_BASE: usize = 16;
+        pub const NEW_MIC_BIND_BASE: usize = 60;
+        pub const NEW_DISCORD_BIND_BASE: usize = 64;
+        pub const DETAIL_BASE: usize = 120;
+        pub const OPTION_BASE: usize = 130;
         pub const MONITOR: usize = 9;
         pub const MONITOR_BIND: usize = 23;
         pub const REPLAY_BIND: usize = 32;
@@ -514,6 +548,8 @@ enum Msg {
     Overload(bool),
     DiscordVolume(f32),
     Pitch(f32),
+    EffectOption(usize, f32),
+    EffectDetails(usize),
     Slow(f32),
     Fast(f32),
     Rvc(bool),
@@ -648,6 +684,8 @@ enum Msg {
     ReadyPreviewEnd,
     /// Шумодав's «Подбор под микрофон»: start or stop the tune, undo its result, listen to
     /// yourself (the full-voice monitor).
+    /// The pointer came onto (true) or left «by ARKANOID»: the window glitches meanwhile.
+    SignatureHover(bool),
     TuneStart,
     TuneStop,
     TuneUndo,
@@ -808,6 +846,9 @@ struct App {
     ready_preview: Option<Instant>,
     /// The running or last finished strength tune, and the microphone's saved strength before it.
     tune: Option<tune::Tune>,
+    /// «by ARKANOID» hovered since, and the window's picture its glitch slices.
+    glitch: Option<Instant>,
+    glitch_mosaic: Option<Arc<tacho::Mosaic>>,
     tune_profile_before: Option<String>,
     core_present: bool,
     /// This GPU's denoiser models are on disk, or it has none to download.
@@ -841,7 +882,9 @@ struct App {
     gpu: Result<(String, String), String>,
     rvc_runtime_installed: bool,
     rvc_runtime_installing: bool,
-    keys: [u32; 13],
+    keys: [u32; 21],
+    effect_activity: u32,
+    effect_details: Option<usize>,
     discord_state: i32,
     discord_source: bool,
     discord_message: String,
@@ -1005,10 +1048,11 @@ impl App {
         Self::from_settings_and_runtime(settings, runtime_root.clone(), runtime_root)
     }
     fn from_settings_and_runtime(
-        settings: Settings,
+        mut settings: Settings,
         runtime_root: PathBuf,
         component_root: PathBuf,
     ) -> Result<Option<(Self, Task<Msg>)>, String> {
+        apply_effect_defaults(&mut settings);
         let headphone_denoise = settings.number("headphones", "denoise", 1, 0, 1) != 0;
         let headphone_intensity =
             settings.number("headphones", "intensity", 80, 0, 200) as f32 / 100.0;
@@ -1018,13 +1062,14 @@ impl App {
         let effects_monitor = settings.number("effects", "monitor_effects", 0, 0, 1) != 0;
         let boost_monitor = settings.number("effects", "monitor_boost", 0, 0, 1) != 0;
         let controls = Controls {
-            slow: settings.number("effects", "slow_speed", 70, 50, 95) as f32 / 100.0,
-            fast: settings.number("effects", "fast_speed", 150, 105, 200) as f32 / 100.0,
+            slow: settings.number("effects", "slow_speed", 67, 50, 95) as f32 / 100.0,
+            fast: settings.number("effects", "fast_speed", 167, 105, 200) as f32 / 100.0,
             volume: 1.0,
-            boost: settings.number("effects", "boost", 300, 100, 2000) as f32 / 100.0,
+            boost: settings.number("effects", "boost", 167, 100, 2000) as f32 / 100.0,
             overload: settings.number("effects", "overload", 0, 0, 1) != 0,
             discord_volume: load_discord_volume(&settings),
-            pitch: settings.number("effects", "pitch", -5, -12, 12),
+            pitch: settings.number("effects", "pitch", -6, -12, 12),
+            effects: load_effect_options(&settings),
             intensity: settings.number("audio", "intensity", 40, 0, 200) as f32 / 100.0,
             alternate_intensity: settings.number("audio", "alternate_intensity", 10, 0, 200) as f32
                 / 100.0,
@@ -1050,6 +1095,14 @@ impl App {
             settings.number("effects", "monitor_key", 0, 0, 2046) as u32,
             settings.number("effects", "replay_key", 119 | 256, 0, 2046) as u32,
             settings.number("effects", "noise_key", 0, 0, 2046) as u32,
+            settings.number("effects", "echo_key", 0, 0, 2046) as u32,
+            settings.number("effects", "stutter_key", 0, 0, 2046) as u32,
+            settings.number("effects", "granular_key", 0, 0, 2046) as u32,
+            settings.number("effects", "autotune_key", 0, 0, 2046) as u32,
+            settings.number("effects", "discord_echo_key", 0, 0, 2046) as u32,
+            settings.number("effects", "discord_stutter_key", 0, 0, 2046) as u32,
+            settings.number("effects", "discord_granular_key", 0, 0, 2046) as u32,
+            settings.number("effects", "discord_autotune_key", 0, 0, 2046) as u32,
         ];
         for i in 0..keys.len() {
             if keys[i] != 0
@@ -1282,6 +1335,8 @@ impl App {
                 ready_fx_due: false,
                 ready_preview: None,
                 tune: None,
+                glitch: None,
+                glitch_mosaic: None,
                 tune_profile_before: None,
                 core_present,
                 models_present,
@@ -1309,6 +1364,8 @@ impl App {
                 rvc_runtime_installed,
                 rvc_runtime_installing: false,
                 keys,
+                effect_activity: 0,
+                effect_details: None,
                 phrase_state: 0,
                 discord_state: 0,
                 discord_source: false,
@@ -1465,6 +1522,7 @@ impl App {
                 discord_volume_percent(self.controls.discord_volume).round() as i32,
             ),
             ("discord_volume_scale", 2),
+            ("defaults_version", EFFECT_DEFAULTS_VERSION),
             ("pitch", self.controls.pitch),
             ("boost_key", self.keys[0] as i32),
             ("pitch_key", self.keys[1] as i32),
@@ -1479,6 +1537,27 @@ impl App {
             ("monitor_key", self.keys[10] as i32),
             ("replay_key", self.keys[11] as i32),
             ("noise_key", self.keys[12] as i32),
+            ("echo_key", self.keys[13] as i32),
+            ("stutter_key", self.keys[14] as i32),
+            ("granular_key", self.keys[15] as i32),
+            ("autotune_key", self.keys[16] as i32),
+            ("discord_echo_key", self.keys[17] as i32),
+            ("discord_stutter_key", self.keys[18] as i32),
+            ("discord_granular_key", self.keys[19] as i32),
+            ("discord_autotune_key", self.keys[20] as i32),
+            ("echo_delay_ms", self.controls.effects.echo_delay_ms),
+            ("echo_repeats", self.controls.effects.echo_repeats),
+            ("echo_decay", self.controls.effects.echo_decay),
+            ("echo_level", self.controls.effects.echo_level),
+            ("stutter_ms", self.controls.effects.stutter_ms),
+            ("grain_ms", self.controls.effects.grain_ms),
+            ("grain_scatter_ms", self.controls.effects.grain_scatter_ms),
+            ("grain_pitch", self.controls.effects.grain_pitch),
+            ("tune_root", self.controls.effects.tune_root),
+            ("tune_scale", self.controls.effects.tune_scale),
+            ("tune_speed_ms", self.controls.effects.tune_speed_ms),
+            ("tune_strength", self.controls.effects.tune_strength),
+            ("formant", self.controls.effects.formant),
             ("monitor_effects", self.effects_monitor as i32),
             ("monitor_boost", self.boost_monitor as i32),
             ("slow_speed", (self.controls.slow * 100.0).round() as i32),
@@ -2112,6 +2191,10 @@ impl App {
                     self.ready_fx_due = false;
                     self.start_ready_fx();
                 }
+                // A window left in the background gets no «pointer left» from the signature.
+                if self.glitch.is_some() && !self.ui_active() {
+                    (self.glitch, self.glitch_mosaic) = (None, None);
+                }
                 if self.ready_preview.is_some_and(|since| since.elapsed() > Duration::from_secs(8)) {
                     self.ready_preview = None;
                 }
@@ -2319,6 +2402,7 @@ impl App {
                 self.feed_tune(snapshot.input_peak, snapshot.output_peak, snapshot.state);
                 let studio_just_started = self.snapshot.state != 3 && snapshot.state == 3;
                 self.snapshot = snapshot;
+                self.effect_activity = self.engine.effect_activity();
                 (self.phrase_state, self.phrase_seconds) = self.engine.phrase();
                 (
                     self.discord_state,
@@ -2999,6 +3083,15 @@ impl App {
                 self.controls.pitch = v as i32;
                 self.focus = focus::effects::PITCH;
                 self.changed();
+            }
+            Msg::EffectOption(i, v) => {
+                self.controls.effects.set(i, v.round() as i32);
+                self.focus = focus::effects::OPTION_BASE + i;
+                self.changed();
+            }
+            Msg::EffectDetails(i) => {
+                self.effect_details = if self.effect_details == Some(i) { None } else { Some(i) };
+                self.focus = focus::effects::DETAIL_BASE + i;
             }
             Msg::Slow(v) => {
                 self.controls.slow = v / 100.0;
@@ -4220,6 +4313,14 @@ impl App {
                 self.start_ready_fx();
             }
             Msg::ReadyPreviewEnd => self.ready_preview = None,
+            Msg::SignatureHover(on) => {
+                if on && self.morph.is_none() {
+                    self.glitch_mosaic = self.window_mosaic(Self::window_size());
+                    self.glitch = Some(Instant::now());
+                } else {
+                    (self.glitch, self.glitch_mosaic) = (None, None);
+                }
+            }
             Msg::TuneStart => {
                 self.focus = focus::effects::TUNE;
                 if self.tune_ready().is_ok() {
@@ -4303,6 +4404,8 @@ impl App {
             10 => MONITOR_BIND,
             11 => REPLAY_BIND,
             12 => NOISE_BIND,
+            13..=16 => NEW_MIC_BIND_BASE + target - 13,
+            17..=20 => NEW_DISCORD_BIND_BASE + target - 17,
             SOUND_STOP_BIND => focus::soundpad::STOP_BIND,
             t => focus::soundpad::ROW_BASE + 3 * (t - SOUND_BIND_BASE) + 2,
         }
@@ -4457,9 +4560,13 @@ impl App {
                     BOOST,
                     BOOST_BIND,
                     discord(0),
+                    DETAIL_BASE + 1,
                     PITCH,
                     PITCH_BIND,
                     discord(1),
+                ];
+                if self.effect_details == Some(1) { items.push(OPTION_BASE + 12); }
+                items.extend([
                     SLOW,
                     SLOW_BIND,
                     discord(2),
@@ -4469,7 +4576,15 @@ impl App {
                     REVERSE_WORD,
                     REVERSE_BIND,
                     discord(4),
-                ];
+                ]);
+                for (row, primary) in [(5, 0), (6, 4), (7, 5), (8, 10)] {
+                    items.extend([DETAIL_BASE + row, OPTION_BASE + primary,
+                        NEW_MIC_BIND_BASE + row - 5, NEW_DISCORD_BIND_BASE + row - 5]);
+                    if self.effect_details == Some(row) {
+                        let options: &[usize] = match row { 5=>&[1,2,3],7=>&[6,7],8=>&[8,9,11],_=>&[] };
+                        items.extend(options.iter().map(|&i| OPTION_BASE + i));
+                    }
+                }
                 if self.phrase_state != 0 {
                     items.push(CANCEL_PHRASE);
                 }
@@ -4888,6 +5003,11 @@ impl App {
                     Msg::Pitch((self.controls.pitch + delta).clamp(-12, 12) as f32)
                 }
                 PITCH_BIND if activate => Msg::Bind(1),
+                f if activate && (DETAIL_BASE..DETAIL_BASE+9).contains(&f) => Msg::EffectDetails(f-DETAIL_BASE),
+                f if delta != 0 && (OPTION_BASE..OPTION_BASE+13).contains(&f) =>
+                    Msg::EffectOption(f-OPTION_BASE,(self.controls.effects.value(f-OPTION_BASE)+delta) as f32),
+                f if activate && (NEW_MIC_BIND_BASE..NEW_MIC_BIND_BASE+4).contains(&f) => Msg::Bind(13+f-NEW_MIC_BIND_BASE),
+                f if activate && (NEW_DISCORD_BIND_BASE..NEW_DISCORD_BIND_BASE+4).contains(&f) => Msg::Bind(17+f-NEW_DISCORD_BIND_BASE),
                 CLIP_TO_SOUNDPAD if activate => match self.clip_menu {
                     Some(i) => Msg::ClipSave(i, true),
                     None => Msg::Noop,
@@ -5086,6 +5206,24 @@ fn main() {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn extended_effect_settings_and_bindings() {
+        let ini="[effects]\npitch=3\ndefaults_version=2\necho_delay_ms=600\ngrain_pitch=-7\ntune_scale=2\nformant=5\necho_key=130\ndiscord_autotune_key=131";
+        let (mut app, _) = App::from_settings(Settings::for_test(ini)).unwrap().unwrap();
+        assert_eq!(app.controls.pitch,3);
+        assert_eq!((app.controls.effects.echo_delay_ms,app.controls.effects.grain_pitch,
+            app.controls.effects.tune_scale,app.controls.effects.formant),(600,-7,2,5));
+        assert_eq!((app.keys[13],app.keys[20]),(130,131));
+        let _=app.update(Msg::EffectOption(0,999.0));
+        assert_eq!(app.controls.effects.echo_delay_ms,600);
+        let _=app.update(Msg::EffectDetails(5));
+        assert_eq!(app.effect_details,Some(5));
+        app.effects_page=true;
+        app.window=Some(App::open(1.0,None).0);
+        app.focus=focus::effects::DETAIL_BASE+5;
+        let _=app.key(keyboard::Key::Named(keyboard::key::Named::Tab),keyboard::Modifiers::empty(),false);
+        assert_eq!(app.focus,focus::effects::OPTION_BASE);
+    }
     #[test]
     fn tag_autostart_defaults_on_only_for_new_installs() {
         let mut settings = Settings::for_test("");
@@ -5321,7 +5459,8 @@ mod controller_tests {
     #[test]
     fn discord_volume_uses_the_new_scale_and_migrates_legacy_eight_percent() {
         let (defaults, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
-        assert_eq!(defaults.controls.boost, 3.0);
+        assert_eq!(defaults.controls.boost, 1.67);
+        assert_eq!((defaults.controls.slow, defaults.controls.fast, defaults.controls.pitch), (0.67, 1.67, -6), "first-install effect defaults");
         assert!(!defaults.controls.overload);
         assert!((defaults.controls.discord_volume - 0.08).abs() < 0.0001);
         assert!((defaults.studio_gain() - 0.08).abs() < 0.0001);
@@ -5358,6 +5497,27 @@ mod controller_tests {
         assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=20\nvolume_display=100")), 1.0);
         assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=30\nvolume_display=100")), 1.5);
         assert!((SOUND_VOLUME_AT_100 - 0.2 * 0.2).abs() < 0.0001);
+    }
+    #[test]
+    fn new_effect_defaults_reach_old_settings_once() {
+        let old = "[effects]
+boost=300
+slow_speed=70
+fast_speed=150
+pitch=-5
+overload=1";
+        let (app, _) = App::from_settings(Settings::for_test(old)).unwrap().unwrap();
+        let c = app.controls;
+        assert_eq!((c.boost, c.slow, c.fast, c.pitch, c.overload), (1.67, 0.67, 1.67, -6, true), "once, other settings kept");
+        let chosen = "[effects]
+boost=500
+slow_speed=80
+fast_speed=120
+pitch=3
+defaults_version=2";
+        let (app, _) = App::from_settings(Settings::for_test(chosen)).unwrap().unwrap();
+        let c = app.controls;
+        assert_eq!((c.boost, c.slow, c.fast, c.pitch), (5.0, 0.8, 1.2, 3), "never again after that");
     }
     #[test]
     fn tuned_strength_follows_the_microphone() {
@@ -6097,7 +6257,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         drop(other);
         // Keyboard handlers require a window ID; do not execute the window-open task.
         app.window = Some(App::open(1.0, None).0);
-        app.keys = [0; 13];
+        app.keys = [0; 21];
         use keyboard::{Key, Modifiers, key::Named};
         // Шумодав: devices, the headphone gear, the folded route, the two strengths, then the
         // tune panel's «Послушать себя» and «Подобрать».
@@ -6121,6 +6281,9 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
             assert_eq!(app.focus, expected);
         }
         app.focus = 20;
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::effects::DETAIL_BASE + 5);
+        app.focus = focus::effects::NEW_DISCORD_BIND_BASE + 3;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 9);
         let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
@@ -6230,10 +6393,10 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.keys[1], 0);
         app.candidate = 120;
         let _ = app.update(Msg::AcceptBind);
-        assert_eq!(app.keys, [119, 120, 0, 0, 0, 0, 0, 0, 0, 0, 200, 375, 0]);
+        assert_eq!(&app.keys[..13], &[119, 120, 0, 0, 0, 0, 0, 0, 0, 0, 200, 375, 0]);
         let _ = app.update(Msg::Bind(0));
         let _ = app.update(Msg::ClearBind);
-        assert_eq!(app.keys, [0, 120, 0, 0, 0, 0, 0, 0, 0, 0, 200, 375, 0]);
+        assert_eq!(&app.keys[..13], &[0, 120, 0, 0, 0, 0, 0, 0, 0, 0, 200, 375, 0]);
         let _ = app.update(Msg::Bind(2));
         app.candidate = 120;
         let _ = app.update(Msg::AcceptBind);

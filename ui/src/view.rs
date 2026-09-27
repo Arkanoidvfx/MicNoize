@@ -527,7 +527,8 @@ impl App {
         };
         // The ready card's tag and confetti fly over the whole window, under a running morph.
         let celebrate = tacho::celebrate(self.ready_fx.filter(|_| self.morph.is_none()));
-        widget::stack![base, celebrate, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
+        let glitch = tacho::glitch(self.glitch.filter(|_| self.morph.is_none()), self.glitch_mosaic.clone());
+        widget::stack![base, glitch, celebrate, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
     }
 
     /// The whole app window without any morph.
@@ -539,10 +540,11 @@ impl App {
                 container(
                     row![
                         logo,
-                        bold("Mic Noize", 15, INK),
-                        numbers(env!("CARGO_PKG_VERSION"), 13, Color { a: 0.75, ..INK }),
+                        bold("MicNoize", 15, INK),
+                        // 40 % smaller than before and 75 % transparent: there, not loud.
+                        numbers(env!("CARGO_PKG_VERSION"), 8, Color { a: 0.25, ..INK }),
                         Space::new().width(Length::Fill),
-                        tacho::signature(),
+                        tacho::signature(Msg::SignatureHover),
                     ]
                     .spacing(10)
                     .align_y(iced::Center),
@@ -1537,7 +1539,8 @@ impl App {
         )
         .padding([0, 13]);
         let mut rows = column![head].spacing(6);
-        for i in 0..5 {
+        for i in 0..9 {
+            let activity = match i { 1 => Some((1u32 << 1, 1u32 << 6)), 5..=8 => Some((1u32 << (i + 5), 1u32 << (i + 9))), _ => None };
             let (name, glyph, sub, control, bind_focus, active): (&str, &str, Element<'_, Msg>, Element<'_, Msg>, usize, bool) = match i {
                 0 => (
                     "Усиление",
@@ -1548,7 +1551,7 @@ impl App {
                         .into(),
                     frame(
                         tacho(100.0..=2000.0, self.controls.boost * 100.0, Msg::Boost, clock)
-                            .default(300.0)
+                            .default(167.0)
                             .red_above(1600.0)
                             .segments(16)
                             .compact()
@@ -1560,12 +1563,12 @@ impl App {
                     self.snapshot.boost_active != 0,
                 ),
                 1 => (
-                    "Высота",
+                    "Formant Shift",
                     glyph::NOTE,
-                    label("полутоны", 11, FAINT).into(),
+                    action(label("тон · форманты", 11, DIM), Msg::EffectDetails(1), self.focus == DETAIL_BASE + 1, false).into(),
                     frame(
                         tacho(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch, clock)
-                            .default(-5.0)
+                            .default(-6.0)
                             .origin(0.0)
                             .segments(16)
                             .compact()
@@ -1574,7 +1577,7 @@ impl App {
                         self.ring(self.focus == PITCH),
                     ),
                     PITCH_BIND,
-                    self.snapshot.pitch_active != 0,
+                    self.effect_activity & ((1 << 1) | (1 << 6)) != 0,
                 ),
                 // Mirrored so that, as on every other slider, more orange means a stronger
                 // effect: ×0.50 (slowest) sits on the right.
@@ -1584,7 +1587,7 @@ impl App {
                     label("запись, пока держите", 11, FAINT).into(),
                     frame(
                         tacho(-95.0..=-50.0, -self.controls.slow * 100.0, |v| Msg::Slow(-v), clock)
-                            .default(-70.0)
+                            .default(-67.0)
                             .segments(16)
                             .compact()
                             .phase(300.0)
@@ -1600,7 +1603,7 @@ impl App {
                     label("запись, пока держите", 11, FAINT).into(),
                     frame(
                         tacho(105.0..=200.0, self.controls.fast * 100.0, Msg::Fast, clock)
-                            .default(150.0)
+                            .default(167.0)
                             .segments(16)
                             .compact()
                             .phase(450.0)
@@ -1610,7 +1613,7 @@ impl App {
                     FAST_BIND,
                     (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 0,
                 ),
-                _ => (
+                4 => (
                     "Реверс",
                     glyph::REVERSE,
                     label("после отпускания", 11, FAINT).into(),
@@ -1618,14 +1621,48 @@ impl App {
                     REVERSE_BIND,
                     self.phrase_state >= 9,
                 ),
+                5 => (
+                    "Эхо", glyph::REPEAT,
+                    action(label("настроить", 11, DIM), Msg::EffectDetails(5), self.focus == DETAIL_BASE + 5, false).into(),
+                    frame(tacho(60.0..=600.0, self.controls.effects.echo_delay_ms as f32,
+                        |v| Msg::EffectOption(0, v), clock).default(220.0).compact()
+                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE)),
+                    NEW_MIC_BIND_BASE, self.effect_activity & ((1 << 10) | (1 << 14)) != 0,
+                ),
+                6 => (
+                    "Застревание", glyph::REPEAT,
+                    action(label("как работает", 11, DIM), Msg::EffectDetails(6), self.focus == DETAIL_BASE + 6, false).into(),
+                    frame(tacho(50.0..=300.0, self.controls.effects.stutter_ms as f32,
+                        |v| Msg::EffectOption(4, v), clock).default(120.0).compact()
+                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE + 4)),
+                    NEW_MIC_BIND_BASE + 1, self.effect_activity & ((1 << 11) | (1 << 15)) != 0,
+                ),
+                7 => (
+                    "Granular", glyph::NOTE,
+                    action(label("настроить", 11, DIM), Msg::EffectDetails(7), self.focus == DETAIL_BASE + 7, false).into(),
+                    frame(tacho(30.0..=150.0, self.controls.effects.grain_ms as f32,
+                        |v| Msg::EffectOption(5, v), clock).default(80.0).compact()
+                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE + 5)),
+                    NEW_MIC_BIND_BASE + 2, self.effect_activity & ((1 << 12) | (1 << 16)) != 0,
+                ),
+                _ => (
+                    "AutoTune", glyph::NOTE,
+                    action(label("тональность · гамма", 11, DIM), Msg::EffectDetails(8), self.focus == DETAIL_BASE + 8, false).into(),
+                    frame(tacho(5.0..=150.0, self.controls.effects.tune_speed_ms as f32,
+                        |v| Msg::EffectOption(10, v), clock).default(80.0).compact()
+                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE + 10)),
+                    NEW_MIC_BIND_BASE + 3, self.effect_activity & ((1 << 13) | (1 << 17)) != 0,
+                ),
             };
             let binding = |discord: bool| {
-                let lit = active && self.discord_source == discord;
-                let target = i + if discord { 5 } else { 0 };
+                let lit = activity.map_or(active && self.discord_source == discord,
+                    |(mic, disc)| self.effect_activity & (if discord { disc } else { mic }) != 0);
+                let target = if i<5 { i + if discord { 5 } else { 0 } }
+                    else { i + if discord { 12 } else { 8 } };
                 self.bind_button(
                     target,
                     self.keys[target],
-                    self.focus == if discord { DISCORD_BIND_BASE + i } else { bind_focus },
+                    self.focus == if discord { if i<5 { DISCORD_BIND_BASE + i } else { NEW_DISCORD_BIND_BASE + i - 5 } } else { bind_focus },
                     lit,
                     150.0,
                 )
@@ -1656,6 +1693,9 @@ impl App {
                         ..Default::default()
                     }),
             );
+            if self.effect_details == Some(i) {
+                rows = rows.push(self.effect_detail(i));
+            }
         }
         // Values mirror mic::PhraseEffect::State in src/effects.hpp: 1/2 record slow/fast,
         // 3/4 play slow/fast, 5/6 tail capture, 7/8 limit reached, 9 record reverse,
@@ -1755,6 +1795,40 @@ impl App {
         column![title("Эффекты"), rows, bottom].spacing(14).into()
     }
 
+    fn effect_detail(&self, row: usize) -> Element<'_, Msg> {
+        use focus::effects::OPTION_BASE;
+        let options: &[(usize, &str)] = match row {
+            1 => &[(12, "Форманты")],
+            5 => &[(1, "Повторы"), (2, "Затухание"), (3, "Уровень")],
+            7 => &[(6, "Разброс"), (7, "Тон зерна")],
+            8 => &[(8, "Тоника"), (9, "Гамма"), (11, "Сила")],
+            _ => &[],
+        };
+        if options.is_empty() {
+            return card(label("При нажатии берутся последние 50–300 мс; фрагмент повторяется до отпускания.", 12, DIM))
+                .padding([12, 16]).into();
+        }
+        let mut controls = row![].spacing(12);
+        for &(index, name) in options {
+            let (min, max) = super::engine::EffectOptions::RANGES[index];
+            let knob = tacho(min as f32..=max as f32, self.controls.effects.value(index) as f32,
+                move |v| Msg::EffectOption(index, v), self.clock())
+                .default(super::engine::EffectOptions::default().value(index) as f32)
+                .compact()
+                .format(move |v| match index {
+                    8 => ["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B"][(v.round() as usize).min(11)].into(),
+                    9 => ["Хроматика","Мажор","Минор"][(v.round() as usize).min(2)].into(),
+                    7 | 12 => format!("{v:+.0}"),
+                    1 => format!("{v:.0}"),
+                    6 => format!("{v:.0} мс"),
+                    _ => format!("{v:.0} %"),
+                });
+            controls = controls.push(column![label(name, 11, DIM), frame(knob, self.ring(self.focus == OPTION_BASE + index))]
+                .spacing(4).width(Length::Fill));
+        }
+        card(controls).padding([12, 16]).into()
+    }
+
     /// Reverse row: a practice word that turns around; click it to type your own.
     fn reverse_demo(&self) -> Element<'_, Msg> {
         if self.reverse_edit {
@@ -1789,7 +1863,7 @@ impl App {
     fn clips_view(&self) -> Element<'_, Msg> {
         use focus::effects::*;
         if self.clips.is_empty() {
-            return label("Появятся после эффектов удержания: высоты, замедления, ускорения или реверса.", 12, FAINT).into();
+            return label("Появятся после удержания голосового эффекта.", 12, FAINT).into();
         }
         let (playing, position, length) = self.sound_playing;
         let progress = |i: usize| -> Option<f32> {
@@ -3350,9 +3424,10 @@ mod tests {
         use iced::advanced::{Renderer as _, Layout, graphics::{damage, Viewport}};
         let dir = PathBuf::from(std::env::var("MNR_DESIGN_DIR").expect("MNR_DESIGN_DIR"));
         let window = std::cell::Cell::new((1040.0_f32, 740.0_f32));
+        let scale = std::cell::Cell::new(1.0_f32);
         let render = |app: &App, name: &str| {
             let (w, h) = window.get();
-            let size = Size::new(w as u32, h as u32);
+            let size = Size::new((w * scale.get()) as u32, (h * scale.get()) as u32);
             let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
             let mut tree = iced::advanced::widget::Tree::empty();
             let limits = iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h));
@@ -3368,7 +3443,7 @@ mod tests {
                 iced::Rectangle::with_size(Size::new(w, h)));
             let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
             let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
-            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, BG);
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, scale.get()), &changes, BG);
             // The renderer writes BGRA into the pixmap; PNG wants RGBA.
             let mut data = pixels.data().to_vec();
             for px in data.as_chunks_mut::<4>().0 {
@@ -3390,7 +3465,7 @@ mod tests {
         app.output = app.outputs.first().cloned();
         app.headphone_output = app.outputs.get(1).cloned();
         // (modifiers << 8) | virtual key: 1 Ctrl, 2 Alt; 36 Home, 4/6 mouse 3/5, 0x54 T.
-        app.keys = [3 << 8 | 0x54, 3 << 8 | 36, 1 << 8 | 36, 2 << 8 | 36, 36, 0, 3 << 8 | 6, 1 << 8 | 6, 2 << 8 | 6, 6, 1 << 8 | 4, 2 << 8 | 4, 4];
+        app.keys[..13].copy_from_slice(&[3 << 8 | 0x54, 3 << 8 | 36, 1 << 8 | 36, 2 << 8 | 36, 36, 0, 3 << 8 | 6, 1 << 8 | 6, 2 << 8 | 6, 6, 1 << 8 | 4, 2 << 8 | 4, 4]);
         app.in_peak = 0.2;
         app.peak = 0.08;
         app.controls.intensity = 0.99;
@@ -3404,6 +3479,15 @@ mod tests {
         render(&app, "headphones");
         app.headphone_message = "Headphone host rejected request; see results/tag-headphones.log".into();
         render(&app, "headphones-no-line");
+        {
+            // «by ARKANOID» hovered: the window glitches.
+            let page = app.headphone_page;
+            app.headphone_page = false;
+            app.glitch_mosaic = app.window_mosaic(App::window_size());
+            app.glitch = Some(Instant::now() - Duration::from_millis(420));
+            render(&app, "glitch");
+            (app.glitch, app.glitch_mosaic, app.headphone_page) = (None, None, page);
+        }
         {
             app.headphone_page = false;
             app.ready_preview = Some(Instant::now());
@@ -3515,6 +3599,14 @@ mod tests {
             key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
         }).collect();
         render(&app, "effects");
+        app.effect_details = Some(5);
+        window.set((960.0, 680.0));
+        render(&app, "effects-min-echo-details");
+        scale.set(2.0);
+        render(&app, "effects-min-echo-details-200pct");
+        scale.set(1.0);
+        window.set((1040.0, 740.0));
+        app.effect_details = None;
         app.controls.overload = true;
         let boost = app.controls.boost;
         app.controls.boost = 15.0;

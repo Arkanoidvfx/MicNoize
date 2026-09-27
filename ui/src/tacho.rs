@@ -873,6 +873,9 @@ struct Reverse {
 struct Hover(bool);
 const LETTER_GAP: f32 = 1.5;
 const REV_CYCLE: f32 = 4000.0;
+/// Frames while the letters fly: a 144 Hz pace for the short flights (600 ms each); only the
+/// word's own bounds repaint.
+const REV_FRAME: Duration = Duration::from_millis(7);
 impl Reverse {
     fn cycle(&self, now: Instant) -> f32 {
         (now.saturating_duration_since(self.clock.epoch).as_secs_f32() * 1000.0).rem_euclid(REV_CYCLE) / REV_CYCLE
@@ -923,7 +926,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
                 let t = self.cycle(*now);
                 let moving = (0.25..0.40).contains(&t) || (0.75..0.90).contains(&t);
                 if moving {
-                    shell.request_redraw_at(frame_after(*now));
+                    shell.request_redraw_at(RedrawRequest::At(*now + REV_FRAME));
                 } else {
                     let edge = [0.25, 0.75, 1.25].into_iter().find(|e| *e > t).unwrap_or(1.25);
                     let wait = ((edge - t) * REV_CYCLE).max(16.0);
@@ -964,6 +967,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
         );
         let arc = (p * std::f32::consts::PI).sin();
         let advance = |w: &f32| w + LETTER_GAP;
+        // In flight the letters are glyph outlines: those sit at fractional positions, where text
+        // snaps to whole pixels and the flight looked short of frames.
+        let flying = p > 0.0 && p < 1.0;
+        let mut frame = flying.then(|| Frame::new(clip));
         for (i, ch) in self.word.iter().enumerate() {
             // Letter i starts after the letters before it, and ends up after those behind it.
             let from = self.widths[..i].iter().map(advance).sum::<f32>();
@@ -971,7 +978,25 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
             let d = to - from;
             let lift = if d.abs() < 0.5 { -4.0 } else { -d.signum() * (3.0 + d.abs() / 10.0) };
             let x = b.x + 24.0 + from + self.widths[i] / 2.0 + d * p;
-            put(renderer, glyph(ch.to_string(), 15.0, numbers()), Point::new(x, b.center_y() + lift * arc), tint, clip);
+            let y = b.center_y() + lift * arc;
+            match frame.as_mut() {
+                Some(frame) => frame.fill_text(iced_tiny_skia::graphics::geometry::Text {
+                    content: ch.to_string(),
+                    position: Point::new(x, y),
+                    max_width: f32::INFINITY,
+                    color: tint,
+                    size: Pixels(15.0),
+                    line_height: text::LineHeight::default(),
+                    font: numbers(),
+                    align_x: text::Alignment::Center,
+                    align_y: iced::alignment::Vertical::Center,
+                    shaping: text::Shaping::Basic,
+                }),
+                None => put(renderer, glyph(ch.to_string(), 15.0, numbers()), Point::new(x, y), tint, clip),
+            }
+        }
+        if let Some(frame) = frame {
+            renderer.with_layer(clip, |renderer| renderer.draw_geometry(frame.into_geometry()));
         }
     }
     fn mouse_interaction(&self, _: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, _: &Rectangle, _: &Renderer) -> mouse::Interaction {
@@ -1379,8 +1404,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
 }
 
 /// The colour Windows keys out of a colour-keyed (layered) window: pixels of exactly this colour
-/// are transparent and let clicks through. Nothing in the palette is this dark purple-black.
-pub const KEY: Color = Color::from_rgb8(1, 0, 1);
+/// are transparent and let clicks through. Pure black, because that is also what a window shows
+/// where it has not painted yet: the new version's window, shown before its first frame (or with
+/// a frame Windows dropped while it was fully transparent), stays see-through instead of flashing
+/// a black rectangle. Nothing in the palette is pure black.
+pub const KEY: Color = Color::from_rgb8(0, 0, 0);
 
 /// What the update window's bar shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -1909,6 +1937,94 @@ impl<Message> Widget<Message, Theme, Renderer> for TuneCurve {
     }
 }
 
+/// While the pointer rests on «by ARKANOID» the whole window glitches: bands of its own picture
+/// (a mosaic painted when the hover began) slip sideways with colour fringes, and stray blocks
+/// and scanlines flicker. A new pattern every 70 ms; nothing is drawn otherwise.
+pub fn glitch<'a, Message: 'a>(start: Option<Instant>, mosaic: Option<std::sync::Arc<Mosaic>>) -> Element<'a, Message> {
+    Element::new(Glitch { start, mosaic })
+}
+struct Glitch {
+    start: Option<Instant>,
+    mosaic: Option<std::sync::Arc<Mosaic>>,
+}
+const GLITCH_TICK: Duration = Duration::from_millis(70);
+const GLITCH_CYAN: Color = Color::from_rgb8(0x56, 0xE0, 0xFF);
+impl<Message> Widget<Message, Theme, Renderer> for Glitch {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fill }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(_)) = (event, self.start) {
+            shell.request_redraw_at(RedrawRequest::At(*now + GLITCH_TICK));
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let (Some(start), Some(m)) = (self.start, &self.mosaic) else { return };
+        let b = layout.bounds();
+        let ms = Instant::now().saturating_duration_since(start).as_millis();
+        let tick = (ms / GLITCH_TICK.as_millis()) as u32 + 1;
+        let ramp = (ms as f32 / 200.0).min(1.0);
+        let rnd = |k: u32| grain(k, tick);
+        let (cell, row_h) = (b.width / m.width as f32, b.height / m.height as f32);
+        let rgb = |c: [u8; 3]| Color::from_rgb8(c[0], c[1], c[2]);
+        let close = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 6);
+        let mut shapes = Vec::new();
+        // Bands of the window slipping sideways, some with red/cyan fringes.
+        for k in 0..(6 + (rnd(1) * 6.0) as u32) {
+            let y0 = b.y + rnd(10 + k * 7) * b.height;
+            let h = 3.0 + rnd(11 + k * 7) * 26.0 * (0.4 + 0.6 * ramp);
+            let dx = (rnd(12 + k * 7) - 0.5) * 140.0 * ramp;
+            let r0 = (((y0 - b.y) / row_h) as usize).min(m.height);
+            let r1 = (((y0 + h - b.y) / row_h).ceil() as usize).min(m.height);
+            for r in r0..r1 {
+                let y = b.y + r as f32 * row_h;
+                let mut run: Option<(usize, [u8; 3])> = None;
+                for c in 0..=m.width {
+                    let color = (c < m.width).then(|| m.cells[r * m.width + c]);
+                    match (run, color) {
+                        (Some((_, current)), Some(next)) if close(current, next) => {}
+                        (current, next) => {
+                            if let Some((first, color)) = current {
+                                slant(&mut shapes, b.x + first as f32 * cell + dx, y, (c - first) as f32 * cell + 0.5, row_h + 0.5, 0.0, rgb(color));
+                            }
+                            run = next.map(|n| (c, n));
+                        }
+                    }
+                }
+            }
+            if rnd(13 + k * 7) > 0.45 {
+                slant(&mut shapes, b.x + dx - 6.0, y0, b.width, h, 0.0, Color { a: 0.28 * ramp, ..GLITCH_CYAN });
+                slant(&mut shapes, b.x + dx + 6.0, y0, b.width, h, 0.0, Color { a: 0.22 * ramp, ..HOT });
+            }
+        }
+        // Stray pixel blocks: accents, or a piece of the picture from elsewhere.
+        for k in 0..18 {
+            let side = 5.0 + rnd(200 + k * 5) * 18.0;
+            let (x, y) = (b.x + rnd(201 + k * 5) * b.width, b.y + rnd(202 + k * 5) * b.height);
+            let pick = rnd(203 + k * 5);
+            let color = if pick < 0.3 {
+                TAG
+            } else if pick < 0.5 {
+                GLITCH_CYAN
+            } else if pick < 0.6 {
+                INK
+            } else {
+                let (u, v) = (rnd(205 + k * 5), rnd(206 + k * 5));
+                rgb(m.cells[((v * m.height as f32) as usize).min(m.height - 1) * m.width + ((u * m.width as f32) as usize).min(m.width - 1)])
+            };
+            let alpha = (0.55 + 0.4 * rnd(204 + k * 5)) * ramp;
+            slant(&mut shapes, x, y, side, side * (0.4 + rnd(207 + k * 5)), 0.0, Color { a: alpha, ..color });
+        }
+        for k in 0..2 {
+            slant(&mut shapes, b.x, b.y + rnd(300 + k) * b.height, b.width, 1.0, 0.0, Color { a: 0.14 * ramp, ..INK });
+        }
+        renderer.with_layer(b, |renderer| renderer.draw_geometry(geometry(b, &shapes)));
+    }
+}
+
 /// Frames drawn by the window (the morph layer is always in it): the update intro waits for
 /// the card to be drawn before its window becomes visible.
 static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2029,26 +2145,48 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
     }
 }
 
-/// "by ARKANOID" in the sliders' tag style: a quiet slanted chip for the title bar.
-pub fn signature<'a, Message: 'a>() -> Element<'a, Message> {
+/// "by ARKANOID" in the sliders' tag style: a quiet slanted chip for the title bar. Hovered, it
+/// glows (a pulsing orange aura, brighter letters) and tells the app, which glitches the window.
+pub fn signature<'a, Message: 'a>(on_hover: impl Fn(bool) -> Message + 'a) -> Element<'a, Message> {
     let by = text_width("by", 11.0, Font::with_name("Segoe UI"));
     let name = text_width("ARKANOID", 11.0, numbers());
-    Element::new(Signature { by, name })
+    Element::new(Signature { by, name, on_hover: Box::new(on_hover) })
 }
-struct Signature {
+struct Signature<'a, Message> {
     by: f32,
     name: f32,
+    on_hover: Box<dyn Fn(bool) -> Message + 'a>,
+}
+#[derive(Default)]
+struct SignatureState {
+    painted: Painted,
+    hover: Option<Instant>,
 }
 const SIGNATURE_H: f32 = 20.0;
 const SIGNATURE_LEAN: f32 = 6.0;
-impl Signature {
+impl<Message> Signature<'_, Message> {
     fn width(&self) -> f32 {
         SIGNATURE_LEAN + 9.0 + self.by + 5.0 + self.name + 9.0
     }
 }
-impl<Message> Widget<Message, Theme, Renderer> for Signature {
-    fn tag(&self) -> tree::Tag { tree::Tag::of::<Painted>() }
-    fn state(&self) -> tree::State { tree::State::new(Painted::default()) }
+impl<Message> Widget<Message, Theme, Renderer> for Signature<'_, Message> {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<SignatureState>() }
+    fn state(&self) -> tree::State { tree::State::new(SignatureState::default()) }
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        let state = tree.state.downcast_mut::<SignatureState>();
+        match event {
+            Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) => {
+                let over = cursor.is_over(layout.bounds());
+                if over != state.hover.is_some() {
+                    state.hover = over.then(Instant::now);
+                    shell.publish((self.on_hover)(over));
+                    shell.request_redraw();
+                }
+            }
+            Event::Window(window::Event::RedrawRequested(now)) if state.hover.is_some() => shell.request_redraw_at(frame_after(*now)),
+            _ => {}
+        }
+    }
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fixed(self.width()), height: Length::Fixed(SIGNATURE_H) }
     }
@@ -2057,11 +2195,23 @@ impl<Message> Widget<Message, Theme, Renderer> for Signature {
     }
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
-        let mut shapes = Vec::with_capacity(2);
+        let state = tree.state.downcast_ref::<SignatureState>();
+        // 0 idle, up to 1 hovered: ramps in over 200 ms, then breathes.
+        let glow = state.hover.map_or(0.0, |since| {
+            let ms = Instant::now().saturating_duration_since(since).as_secs_f32() * 1000.0;
+            (ms / 200.0).min(1.0) * (0.78 + 0.22 * (ms / 140.0).sin())
+        });
+        let mut shapes = Vec::with_capacity(10);
         let w = b.width - SIGNATURE_LEAN;
-        slant(&mut shapes, b.x, b.y, w, SIGNATURE_H, SIGNATURE_LEAN, OFF_EDGE);
+        for k in (1..=7).rev() {
+            let e = k as f32 * 1.4;
+            let h = SIGNATURE_H + 2.0 * e;
+            slant(&mut shapes, b.x - e - e * SIGNATURE_LEAN / SIGNATURE_H, b.y - e, w + 2.0 * e, h, SIGNATURE_LEAN * h / SIGNATURE_H, Color { a: 0.09 * glow, ..TAG });
+        }
+        let edge = Color { r: OFF_EDGE.r + (TAG.r - OFF_EDGE.r) * glow, g: OFF_EDGE.g + (TAG.g - OFF_EDGE.g) * glow, b: OFF_EDGE.b + (TAG.b - OFF_EDGE.b) * glow, a: 1.0 };
+        slant(&mut shapes, b.x, b.y, w, SIGNATURE_H, SIGNATURE_LEAN, edge);
         slant(&mut shapes, b.x + 1.2, b.y + 1.0, w - 2.4, SIGNATURE_H - 2.0, SIGNATURE_LEAN * (SIGNATURE_H - 2.0) / SIGNATURE_H, Color::from_rgb8(0x1B, 0x1C, 0x1F));
-        tree.state.downcast_ref::<Painted>().draw(renderer, b.expand(2.0), shapes);
+        state.painted.draw(renderer, b.expand(14.0), shapes);
         let text = |content: &str, font: Font| Text {
             content: content.to_owned(),
             bounds: Size::new(80.0, SIGNATURE_H),
@@ -2074,8 +2224,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Signature {
             wrapping: text::Wrapping::None,
         };
         let x = b.x + SIGNATURE_LEAN / 2.0 + 9.0;
-        put(renderer, text("by", Font::with_name("Segoe UI")), Point::new(x, b.center_y()), Color::from_rgb8(0x85, 0x86, 0x8D), b.expand(4.0));
-        put(renderer, text("ARKANOID", numbers()), Point::new(x + self.by + 5.0, b.center_y()), INK, b.expand(4.0));
+        let by = Color::from_rgb8(0x85, 0x86, 0x8D);
+        put(renderer, text("by", Font::with_name("Segoe UI")), Point::new(x, b.center_y()), brighten(by, glow), b.expand(4.0));
+        let name = Color { r: INK.r + (HEAD.r - INK.r) * glow, g: INK.g + (TAG.g - INK.g) * glow * 0.5, b: INK.b + (TAG.b - INK.b) * glow * 0.6, a: 1.0 };
+        put(renderer, text("ARKANOID", numbers()), Point::new(x + self.by + 5.0, b.center_y()), name, b.expand(4.0));
     }
 }
 
