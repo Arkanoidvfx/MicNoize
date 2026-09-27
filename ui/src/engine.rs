@@ -98,6 +98,7 @@ unsafe extern "C" {
     fn mnr_sound_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32) -> i32;
     fn mnr_studio_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32, start: u32, end: u32) -> i32;
     fn mnr_sound_loop(p: usize, id: u32, start: u32, end: u32) -> i32;
+    fn mnr_studio_pitch(input: *const f32, count: u32, scale: f32, output: *mut f32) -> i32;
     fn mnr_sound_gain(p: usize, id: u32, gain: f32) -> i32;
     fn mnr_sound_clear(p: usize);
     fn mnr_sound_play(p: usize, id: u32);
@@ -128,6 +129,14 @@ pub fn pick_paths(folder: bool) -> Result<Vec<std::path::PathBuf>, String> {
 /// Send-able handle for loading clips from a decode task without holding the controller.
 #[derive(Clone, Copy)]
 pub struct SoundLoader(usize);
+pub fn studio_pitch(input: &[f32], scale: f32) -> Result<Vec<f32>, String> {
+    if input.is_empty() || input.len() > 20 * 48_000 { return Err("Неверная длина звука".into()); }
+    let mut output = vec![0.0; input.len()];
+    if unsafe { mnr_studio_pitch(input.as_ptr(), input.len() as u32, scale, output.as_mut_ptr()) } == 0 {
+        return Err("Не удалось изменить высоту звука".into());
+    }
+    Ok(output)
+}
 impl SoundLoader {
     pub fn load(&self, id: u32, samples: &[f32], gain: f32) -> Result<(), String> {
         if unsafe { mnr_sound_load(self.0, id, samples.as_ptr(), samples.len() as u32, gain) } == 0 {

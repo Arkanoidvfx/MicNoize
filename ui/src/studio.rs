@@ -1,5 +1,5 @@
 //! Four-bar sample piano roll. Rendering and file work run outside the audio thread.
-use crate::{settings::Settings, soundpad};
+use crate::{engine, settings::Settings, soundpad};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
 
@@ -105,6 +105,8 @@ pub fn render(folder: &Path, bpm: u32, events: &[Event]) -> Result<Vec<f32>, Str
     let length = frame_at(STEPS, bpm);
     let mut mix = vec![0.0f32; length];
     let mut decoded: HashMap<&str, Vec<f32>> = HashMap::new();
+    let mut pitched: HashMap<(&str, u8), Vec<f32>> = HashMap::new();
+    let mut pitched_frames = 0;
     for event in events {
         if (event.step as usize) >= STEPS || event.length == 0 || event.step as usize + event.length as usize > STEPS
             || !(FIRST_NOTE..FIRST_NOTE + NOTES as u8).contains(&event.note)
@@ -113,24 +115,31 @@ pub fn render(folder: &Path, bpm: u32, events: &[Event]) -> Result<Vec<f32>, Str
             if decoded.len() >= MAX_SOURCES { return Err("В треке может быть не больше 32 разных звуков".into()); }
             decoded.insert(&event.sample, soundpad::decode_limited(&folder.join(&event.sample), 20)?);
         }
-        let pcm = &decoded[event.sample.as_str()];
-        if pcm.is_empty() { return Err(format!("Пустой звук: {}", event.sample)); }
+        let source = &decoded[event.sample.as_str()];
+        if source.is_empty() { return Err(format!("Пустой звук: {}", event.sample)); }
         let start = frame_at(event.step as usize, bpm);
-        let speed = 2f64.powf((event.note as f64 - ROOT_NOTE as f64) / 12.0);
+        if event.note != ROOT_NOTE && !pitched.contains_key(&(event.sample.as_str(), event.note)) {
+            let scale = 2f32.powf((event.note as f32 - ROOT_NOTE as f32) / 12.0);
+            let variant = engine::studio_pitch(source, scale)?;
+            // ponytail: keep at most about 64 MiB of variants; recompute uncommon notes if exceeded.
+            if pitched_frames + variant.len() > 16_000_000 { pitched.clear(); pitched_frames = 0; }
+            pitched_frames += variant.len();
+            pitched.insert((event.sample.as_str(), event.note), variant);
+        }
+        let pcm = if event.note == ROOT_NOTE { source } else { &pitched[&(event.sample.as_str(), event.note)] };
         let sustain = event.length > 1;
         let note_frames = frame_at(event.step as usize + event.length as usize, bpm) - start;
+        let period = pcm.len().max(frame_at(1, bpm));
         for (i, out) in mix[start..].iter_mut().take(if sustain { note_frames } else { length - start }).enumerate() {
-            let at = i as f64 * speed;
-            if !sustain && at >= pcm.len() as f64 { break; }
-            let at = if sustain { at % pcm.len() as f64 } else { at };
-            let n = at as usize;
-            let next = pcm.get(n + 1).copied().unwrap_or(pcm[n]);
+            if !sustain && i >= pcm.len() { break; }
+            let n = if sustain { i % period } else { i };
+            if n >= pcm.len() { continue; }
             let envelope = if sustain { ((note_frames - i).min(240) as f32 / 240.0).min(1.0) } else { 1.0 };
             let seam = if sustain {
                 let fade = pcm.len().min(480) / 2;
-                if fade == 0 { 1.0 } else { ((at.min(pcm.len() as f64 - at) / fade as f64) as f32).min(1.0) }
+                if fade == 0 { 1.0 } else { ((n.min(pcm.len() - n) as f32) / fade as f32).min(1.0) }
             } else { 1.0 };
-            *out += (pcm[n] + (next - pcm[n]) * (at - n as f64) as f32) * envelope * seam;
+            *out += pcm[n] * envelope * seam;
         }
     }
     let peak = mix.iter().fold(0.0f32, |peak, v| peak.max(v.abs()));
@@ -162,14 +171,13 @@ mod tests {
         soundpad::write_wav(&folder.join("tone.wav"), &[0.5; 480]).unwrap();
         let audio = render(&folder, 120, &events).unwrap();
         assert_eq!(audio.len(), 4 * 16 * 6000);
-        assert!((audio[0] - 0.85).abs() < 0.001);
+        assert!(audio[0] > 0.1);
         assert_eq!(audio[480], 0.0);
-        assert!(audio[24_000 + 300] > 0.49);
-        assert_eq!(audio[24_000 + 400], 0.0);
-        assert!(audio[48_000 + 900] > 0.49); // C3: twice the source duration
-        assert_eq!(audio[48_000 + 1000], 0.0);
-        assert!(audio[72_000 + 200] > 0.49); // C5: half the source duration
-        assert_eq!(audio[72_000 + 300], 0.0);
+        for step in [4, 8, 12] {
+            let start = frame_at(step, 120);
+            assert!(audio[start + 100..start + 400].iter().map(|v| v.abs()).sum::<f32>() > 5.0);
+            assert_eq!(audio[start + 480], 0.0, "pitch must preserve the one-shot duration");
+        }
         toggle(&mut events, 0, 60, "tone.wav");
         toggle(&mut events, 4, 67, "tone.wav");
         toggle(&mut events, 8, 48, "tone.wav");
@@ -197,7 +205,8 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         soundpad::write_wav(&folder.join("tone.wav"), &[0.25; 480]).unwrap();
         let audio = render(&folder, 120, &events).unwrap();
-        assert!(audio[frame_at(10, 120) + 240] > 0.8, "short sample must sustain through the dragged note");
+        assert!(audio[frame_at(10, 120) + 240] > 0.1, "short sample must retrigger on a later grid step");
+        assert_eq!(audio[frame_at(10, 120) + 480], 0.0, "short samples must not buzz between steps");
         assert_eq!(audio[frame_at(12, 120)], 0.0);
         std::fs::remove_file(folder.join("tone.wav")).unwrap();
         std::fs::remove_dir(folder).unwrap();

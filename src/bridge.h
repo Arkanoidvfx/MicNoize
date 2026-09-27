@@ -66,6 +66,8 @@ int32_t mnr_sound_load(Mnr*,uint32_t id,const float* samples,uint32_t count,floa
 // Studio clips bypass the soundpad volume and can loop between sample frames [start,end).
 int32_t mnr_studio_load(Mnr*,uint32_t id,const float* samples,uint32_t count,float gain,uint32_t start,uint32_t end);
 int32_t mnr_sound_loop(Mnr*,uint32_t id,uint32_t start,uint32_t end);
+// Offline pitch shift: output has exactly count frames, preserving sample duration.
+int32_t mnr_studio_pitch(const float* input,uint32_t count,float scale,float* output);
 int32_t mnr_sound_gain(Mnr*,uint32_t id,float gain);
 void mnr_sound_clear(Mnr*);
 void mnr_sound_play(Mnr*,uint32_t id);

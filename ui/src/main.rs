@@ -667,6 +667,8 @@ struct App {
     studio_volume: u32,
     studio_zoom: usize,
     studio_loop: bool,
+    studio_live: bool,
+    studio_rebuild: bool,
     studio_loop_start: usize,
     studio_loop_end: usize,
     studio_loop_drag: Option<bool>, // true adjusts the start; false adjusts the end
@@ -1150,6 +1152,8 @@ impl App {
                 studio_volume,
                 studio_zoom,
                 studio_loop,
+                studio_live: studio_loop,
+                studio_rebuild: false,
                 studio_loop_start,
                 studio_loop_end,
                 studio_loop_drag: None,
@@ -2191,6 +2195,7 @@ impl App {
                     }
                 }
                 let (snapshot, error) = self.engine.snapshot(self.ui_active());
+                let studio_just_started = self.snapshot.state != 3 && snapshot.state == 3;
                 self.snapshot = snapshot;
                 (self.phrase_state, self.phrase_seconds) = self.engine.phrase();
                 (
@@ -2220,6 +2225,7 @@ impl App {
                     && playing.0 != studio::TRACK_ID && !self.studio_loop;
                 self.sound_playing = playing;
                 if studio_finished {
+                    self.studio_live = false;
                     self.studio_cursor = 0.0;
                     if self.studio_follow { self.studio_bar = 0; }
                 }
@@ -2313,6 +2319,10 @@ impl App {
                     self.save();
                 }
                 let next = timer(self.ui_active() && self.running());
+                if studio_just_started && self.studio_page && self.ui_active() && self.studio_loop
+                    && self.studio_live && !self.studio_events.is_empty() {
+                    return Task::batch([next, self.update(Msg::StudioRender(false))]);
+                }
                 if events & 17 != 0 {
                     return Task::batch([next, self.update(Msg::Show)]);
                 }
@@ -2627,7 +2637,12 @@ impl App {
                     return Task::batch([snap, self.load_logs(false)]);
                 }
                 if self.studio_page {
-                    return Task::batch([snap, self.reveal_studio(studio::ROOT_NOTE)]);
+                    let reveal = self.reveal_studio(studio::ROOT_NOTE);
+                    if self.ui_active() && self.studio_live && self.studio_loop && self.snapshot.state == 3
+                        && self.sound_playing.0 != studio::TRACK_ID && !self.studio_events.is_empty() {
+                        return Task::batch([snap, reveal, self.update(Msg::StudioRender(false))]);
+                    }
+                    return Task::batch([snap, reveal]);
                 }
                 return snap;
             }
@@ -3446,7 +3461,7 @@ impl App {
             Msg::DragEnd => {
                 self.studio_scrubbing = false;
                 self.studio_loop_drag = None;
-                self.studio_stroke = None;
+                let studio_edited = self.studio_stroke.take().is_some();
                 if let (Some(i), Some(section)) = (self.dragging.take(), self.drag_over.take())
                     && let Some(sound) = self.sounds.get(i)
                     && let Some(target) = self.sections.get_mut(section)
@@ -3458,6 +3473,7 @@ impl App {
                 }
                 self.dragging = None;
                 self.drag_over = None;
+                if studio_edited && self.studio_live { return self.update(Msg::StudioRender(false)); }
             }
             Msg::SoundUnassign(i) => {
                 if let Some(section) = self.custom_section()
@@ -3470,11 +3486,18 @@ impl App {
             Msg::SoundpadStop => {
                 self.engine.sound_play(0);
                 self.sound_pending_play = None;
+                if self.studio_live && self.studio_loop {
+                    self.studio_loop = false;
+                    self.dirty = Some(Instant::now());
+                }
+                self.studio_live = false;
+                self.studio_rebuild = false;
             }
             Msg::StudioBpm(bpm) => {
                 self.studio_bpm = bpm.clamp(60, 200);
                 self.focus = focus::studio::BPM;
                 self.dirty = Some(Instant::now());
+                if self.studio_live { return self.update(Msg::StudioRender(false)); }
             }
             Msg::StudioVolume(value) => {
                 self.studio_volume = value.min(200);
@@ -3496,20 +3519,34 @@ impl App {
                 self.focus = focus::studio::LOOP;
                 self.sync_studio_loop();
                 self.dirty = Some(Instant::now());
+                if enabled {
+                    self.studio_live = true;
+                    if !self.studio_events.is_empty() { return self.update(Msg::StudioRender(false)); }
+                }
             }
             Msg::StudioLoopStart(step) => {
+                let activate = !self.studio_loop;
                 self.studio_loop_start = step.min(self.studio_loop_end - 1);
                 self.studio_loop = true;
                 self.focus = focus::studio::LOOP_START;
                 self.sync_studio_loop();
                 self.dirty = Some(Instant::now());
+                if activate && !self.studio_events.is_empty() {
+                    self.studio_live = true;
+                    return self.update(Msg::StudioRender(false));
+                }
             }
             Msg::StudioLoopEnd(step) => {
+                let activate = !self.studio_loop;
                 self.studio_loop_end = step.clamp(self.studio_loop_start + 1, studio::STEPS);
                 self.studio_loop = true;
                 self.focus = focus::studio::LOOP_END;
                 self.sync_studio_loop();
                 self.dirty = Some(Instant::now());
+                if activate && !self.studio_events.is_empty() {
+                    self.studio_live = true;
+                    return self.update(Msg::StudioRender(false));
+                }
             }
             Msg::StudioLoopGrab(step) => {
                 let start_distance = step.abs_diff(self.studio_loop_start);
@@ -3553,6 +3590,7 @@ impl App {
                     studio::toggle(&mut self.studio_events, step, note, sample);
                     self.focus = focus::studio::CELL_BASE + (step % 16) * studio::NOTES + (note - studio::FIRST_NOTE) as usize;
                     self.dirty = Some(Instant::now());
+                    if self.studio_live { return self.update(Msg::StudioRender(false)); }
                 }
             }
             Msg::StudioDrawStart(step, note) => {
@@ -3581,7 +3619,11 @@ impl App {
                 self.studio_erasing = true;
                 if studio::erase(&mut self.studio_events, step, note) { self.dirty = Some(Instant::now()); }
             }
-            Msg::StudioRightEnd => self.studio_erasing = false,
+            Msg::StudioRightEnd => {
+                let edited = self.studio_erasing;
+                self.studio_erasing = false;
+                if edited && self.studio_live { return self.update(Msg::StudioRender(false)); }
+            }
             Msg::StudioRecord => {
                 self.focus = focus::studio::RECORD;
                 let was_recording = self.engine.studio_recording();
@@ -3625,11 +3667,16 @@ impl App {
             }
             Msg::StudioRender(export) => {
                 self.focus = if export { focus::studio::EXPORT } else { focus::studio::PLAY };
-                if self.studio_busy || self.studio_events.is_empty() { return Task::none(); }
+                if self.studio_busy {
+                    if !export && self.studio_live { self.studio_rebuild = true; }
+                    return Task::none();
+                }
+                if self.studio_events.is_empty() { return Task::none(); }
                 if !export && self.snapshot.state != 3 {
                     self.studio_note = "Сначала запустите виртуальный микрофон".into();
                     return Task::none();
                 }
+                if !export { self.studio_live = true;self.studio_rebuild = false; }
                 self.studio_busy = true;
                 self.studio_note = "Собираем трек…".into();
                 let folder = self.studio_folder.clone();
@@ -3659,9 +3706,11 @@ impl App {
             }
             Msg::StudioRendered(export, result) => {
                 self.studio_busy = false;
+                let rebuild = self.studio_rebuild && self.studio_live && self.studio_loop && result.is_ok();
+                self.studio_rebuild = false;
                 match result {
                     Ok(Some(path)) => self.studio_note = format!("Сохранено: {}", path.display()),
-                    Ok(None) if !export && self.snapshot.state == 3 => {
+                    Ok(None) if !export && self.snapshot.state == 3 && self.studio_live => {
                         if self.studio_cursor >= studio::STEPS as f32 { self.studio_cursor = 0.0; }
                         if self.studio_loop && (self.studio_cursor < self.studio_loop_start as f32
                             || self.studio_cursor >= self.studio_loop_end as f32) {
@@ -3674,15 +3723,21 @@ impl App {
                         self.engine.sound_seek(studio::TRACK_ID, self.studio_cursor * 15.0 / self.studio_play_bpm as f32);
                         self.studio_note = "Трек отправлен в виртуальный микрофон".into();
                     }
+                    Ok(None) if !export && !self.studio_live => self.studio_note = "Остановлено".into(),
                     Ok(None) if !export => self.studio_note = "Микрофон остановлен — запустите его и повторите".into(),
                     Ok(None) => {},
                     Err(e) => self.studio_note = format!("Сборка трека: {e}"),
                 }
+                if rebuild { return self.update(Msg::StudioRender(false)); }
             }
             Msg::StudioClear => {
                 self.focus = focus::studio::CLEAR;
                 studio::clear_bar(&mut self.studio_events, self.studio_bar);
                 self.dirty = Some(Instant::now());
+                if self.studio_live {
+                    if self.studio_events.is_empty() { self.engine.sound_play(0); }
+                    else { return self.update(Msg::StudioRender(false)); }
+                }
             }
             Msg::StudioDeleteAsk(name) => {
                 if self.studio_samples.contains(&name) {
@@ -3719,6 +3774,9 @@ impl App {
                         if self.sound_playing.0 == studio::TRACK_ID { self.engine.sound_play(0); }
                         self.studio_note = format!("Звук перемещён в «Удалённые»: {name}");
                         self.dirty = Some(Instant::now());
+                        if self.studio_live && !self.studio_events.is_empty() {
+                            return self.update(Msg::StudioRender(false));
+                        }
                     }
                     Err(e) => self.studio_note = format!("Не удалось удалить звук: {e}"),
                 }
@@ -4938,9 +4996,20 @@ mod controller_tests {
         assert!(app.studio_events.is_empty());
         let _ = app.update(Msg::StudioRightEnd);
         assert!(!app.studio_erasing);
+        app.studio_events.push(studio::Event { step: 8, note: 60, sample: "tone.wav".into(), length: 1 });
+        app.snapshot.state = 3;
+        let _ = app.update(Msg::StudioLoopEnabled(true));
+        assert!(app.studio_live && app.studio_loop && app.studio_busy, "enabling a loop must schedule playback");
+        app.studio_busy = false;
+        let _ = app.update(Msg::SoundpadStop);
+        assert!(!app.studio_live && !app.studio_loop, "Stop must release loop playback");
         let _ = app.update(Msg::StudioLoopStart(16));
         let _ = app.update(Msg::StudioLoopEnd(32));
         assert!(app.studio_loop && (app.studio_loop_start, app.studio_loop_end) == (16, 32));
+        app.studio_busy = true;
+        let _ = app.update(Msg::StudioRender(false));
+        assert!(app.studio_rebuild, "edits during rendering must schedule a fresh loop");
+        app.studio_busy = false;
         let _ = app.update(Msg::StudioVolume(170));
         assert_eq!(app.studio_volume, 170);
         let _ = app.update(Msg::StudioZoom(0));
