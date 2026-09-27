@@ -525,7 +525,9 @@ impl App {
                 m.anim.as_ref(),
             ),
         };
-        widget::stack![base, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
+        // The ready card's tag and confetti fly over the whole window, under a running morph.
+        let celebrate = tacho::celebrate(self.ready_fx.filter(|_| self.morph.is_none()));
+        widget::stack![base, celebrate, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
     }
 
     /// The whole app window without any morph.
@@ -534,7 +536,17 @@ impl App {
         let logo = tacho::logo(26.0, voice);
         let titlebar = row![
             mouse_area(
-                container(row![logo, bold("Mic Noize", 15, INK), Space::new().width(Length::Fill), tacho::signature()].spacing(10).align_y(iced::Center))
+                container(
+                    row![
+                        logo,
+                        bold("Mic Noize", 15, INK),
+                        numbers(env!("CARGO_PKG_VERSION"), 13, Color { a: 0.75, ..INK }),
+                        Space::new().width(Length::Fill),
+                        tacho::signature(),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Center),
+                )
                     .padding([0, 16])
                     .width(Length::Fill)
                     .height(46)
@@ -691,29 +703,9 @@ impl App {
         .padding([14, 10])
         .width(196)
         .height(Length::Fill);
-        if self.update_ready {
-            rail = rail.push(
-                container(
-                    column![
-                        bold("Обновление готово", 13, INK),
-                        label(&self.update_status, 12, DIM),
-                        action(
-                            container(label("Перезапустить", 13, ORANGE_DARK)).center_x(Length::Fill),
-                            Msg::ApplyUpdate,
-                            self.focus == focus::UPDATE_BANNER,
-                            true,
-                        )
-                        .width(Length::Fill),
-                    ]
-                    .spacing(8),
-                )
-                .padding(12)
-                .style(|_| container::Style {
-                    background: Some(CARD.into()),
-                    border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 10.0.into() },
-                    ..Default::default()
-                }),
-            );
+        if self.update_ready || self.ready_preview.is_some() {
+            // The celebration layer stays in the tree: the card keeps its widget state.
+            rail = rail.push(widget::stack![self.ready_card()].push(tacho::ready_fx(self.ready_fx, self.ready_mosaic.clone(), RAIL)));
             rail = rail.push(Space::new().height(8));
         }
         rail = rail.push(item(glyph::SETTINGS, "Настройки", 2, self.details || self.logs_page));
@@ -725,6 +717,36 @@ impl App {
                 ..Default::default()
             })
             .into()
+    }
+
+    /// «Обновление готово» in the rail: the new version in large numbers (it rolls in from the
+    /// installed one when the card celebrates) and the restart. Fixed size: its mosaic maps on it.
+    pub fn ready_card(&self) -> Element<'_, Msg> {
+        let message = if self.ready_preview.is_some() { Msg::ReadyPreviewEnd } else { Msg::ApplyUpdate };
+        container(
+            column![
+                bold("Обновление готово", 13, INK),
+                row![label("Версия", 12, DIM), tacho::roll(env!("CARGO_PKG_VERSION"), &self.ready_version(), self.ready_fx, 14.0, INK)]
+                    .spacing(6)
+                    .align_y(iced::Center),
+                label("скачана и готова", 12, DIM),
+                Space::new().height(Length::Fill),
+                action(container(label("Перезапустить", 13, ORANGE_DARK)).center(Length::Fill), message, self.focus == focus::UPDATE_BANNER, true)
+                    .padding([0, 12])
+                    .width(Length::Fill)
+                    .height(tacho::ready::BUTTON_H),
+            ]
+            .spacing(4),
+        )
+        .padding(12)
+        .width(tacho::ready::CARD.width)
+        .height(tacho::ready::CARD.height)
+        .style(|_| container::Style {
+            background: Some(CARD.into()),
+            border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 10.0.into() },
+            ..Default::default()
+        })
+        .into()
     }
 
     /// Шумодав: the devices you can change on top, the fixed route folded away, then strength.
@@ -909,9 +931,9 @@ impl App {
         let risky = strength > 100.0;
         let noise_card = container(
             column![
-                row![label("Сила", 13, DIM), Space::new().width(Length::Fill)].height(26).align_y(iced::Center),
+                row![label("Шумоподавление", 13, DIM), Space::new().width(Length::Fill)].height(26).align_y(iced::Center),
                 frame(
-                    tacho(0.0..=200.0, strength, Msg::Intensity, clock).default(100.0).red_above(100.0).segments(20),
+                    tacho(0.0..=200.0, strength, Msg::Intensity, clock).default(40.0).red_above(100.0).segments(20),
                     self.ring(self.focus == INTENSITY),
                 ),
             ]
@@ -935,7 +957,7 @@ impl App {
         let hold_card = card(
             column![
                 row![
-                    label("Пока держу", 13, DIM),
+                    label("При удержании клавиши", 13, DIM),
                     Space::new().width(Length::Fill),
                     self.bind_button(12, self.keys[12], self.focus == NOISE_BIND, false, 140.0),
                 ]
@@ -943,13 +965,12 @@ impl App {
                 .align_y(iced::Center),
                 frame(
                     tacho(0.0..=200.0, self.controls.alternate_intensity * 100.0, Msg::AlternateIntensity, clock)
-                        .default(15.0)
+                        .default(10.0)
                         .red_above(100.0)
                         .segments(20)
                         .phase(20.0 * 64.0 + 128.0),
                     self.ring(self.focus == ALT_INTENSITY),
                 ),
-                label("Смена силы шумодава при удержании", 12, FAINT),
             ]
             .spacing(10),
         );
@@ -958,6 +979,7 @@ impl App {
             .push(devices)
             .push(meters)
             .push(row![noise_card, hold_card].spacing(14))
+            .push(self.tune_panel())
             .spacing(14);
         // Without NVIDIA the sliders do nothing; say so next to them, not in the error line.
         let note = if self.denoiser.0 == 2 && self.running() {
@@ -1269,6 +1291,147 @@ impl App {
         )
     }
 
+    /// «Подбор под микрофон» under the strength sliders: finds the weakest strength that silences
+    /// this microphone's room (a quiet sweep, then a spoken check), keeps it per microphone and
+    /// puts it back when the microphone changes; «Послушать себя» turns on the full-voice monitor.
+    fn tune_panel(&self) -> Element<'_, Msg> {
+        use focus::effects::{TUNE, TUNE_LISTEN, TUNE_UNDO};
+        use tune::Phase;
+        let now = Instant::now();
+        let listening = self.monitor_all && matches!(self.monitor, 1 | 2);
+        let ready = self.tune_ready();
+        let running = self.tune.as_ref().is_some_and(tune::Tune::running);
+        let mic = self.input.as_ref().map_or("микрофон не выбран".to_owned(), |d| d.name.clone());
+        let saved = self.input.as_ref().and_then(|d| self.profile(&d.id));
+
+        let listen = action(
+            row![icon(glyph::HEADPHONES, 12, if listening { ORANGE_DARK } else { INK }), label(if listening { "Слушаю себя" } else { "Послушать себя" }, 13, if listening { ORANGE_DARK } else { INK })]
+                .spacing(8)
+                .align_y(iced::Center),
+            Msg::TuneListen,
+            self.focus == TUNE_LISTEN,
+            listening,
+        )
+        .on_press_maybe(matches!(self.snapshot.state, 2 | 3).then_some(Msg::TuneListen));
+        let tune_label = match &self.tune {
+            Some(t) if t.running() => "Остановить",
+            Some(t) if t.phase == Phase::Done => "Ещё раз",
+            _ if saved.is_some() => "Подобрать заново",
+            _ => "Подобрать",
+        };
+        let tune_button = action(label(tune_label, 13, if running { INK } else { ORANGE_DARK }), if running { Msg::TuneStop } else { Msg::TuneStart }, self.focus == TUNE, !running)
+            .on_press_maybe((running || ready.is_ok()).then_some(if running { Msg::TuneStop } else { Msg::TuneStart }));
+        let header = row![
+            icon(glyph::MIC, 13, ORANGE),
+            bold("Подбор под микрофон", 13, INK),
+            label(mic, 12, FAINT).wrapping(iced::widget::text::Wrapping::None),
+            Space::new().width(Length::Fill),
+            listen,
+            tune_button,
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+
+        // The three steps, when a tune runs or has run.
+        let steps = |active: usize, failed: bool| -> Element<'static, Msg> {
+            let names = ["Тишина", "Голос", "Готово"];
+            let mut chips = row![].spacing(6).align_y(iced::Center);
+            for (i, name) in names.into_iter().enumerate() {
+                let (glyph_color, text_color) = if failed && i == active {
+                    (RED, RED)
+                } else if i < active || (i == 2 && active == 2) {
+                    (GREEN, DIM)
+                } else if i == active {
+                    (ORANGE, INK)
+                } else {
+                    (EDGE, FAINT)
+                };
+                if i > 0 {
+                    chips = chips.push(icon(glyph::RIGHT, 8, FAINT));
+                }
+                let mark: Element<'static, Msg> = if i < active || (i == 2 && active == 2 && !failed) {
+                    icon(glyph::CHECK, 10, glyph_color).into()
+                } else {
+                    container(Space::new().width(6).height(6)).style(move |_| container::Style { background: Some(glyph_color.into()), border: Border { radius: 3.0.into(), ..Border::default() }, ..Default::default() }).into()
+                };
+                chips = chips.push(row![mark, label(name, 12, text_color)].spacing(5).align_y(iced::Center));
+            }
+            chips.into()
+        };
+        let left: Element<'_, Msg> = match &self.tune {
+            Some(t) if t.phase == Phase::Quiet => column![
+                steps(0, false),
+                row![bold("Помолчите", 15, INK), numbers(format!("{} с", t.left(now)), 15, ORANGE)].spacing(8).align_y(iced::Center),
+                label("Фон как обычно: вентилятор, комната. Ползунок сам проходит силы.", 12, DIM),
+            ]
+            .spacing(6)
+            .into(),
+            Some(t) if t.phase == Phase::Voice => column![
+                steps(1, false),
+                row![bold("Скажите пару слов", 15, INK), numbers(format!("{} с", t.left(now)), 15, ORANGE)].spacing(8).align_y(iced::Center),
+                label("Обычным голосом, например: «раз, два, три, проверка».", 12, DIM),
+            ]
+            .spacing(6)
+            .into(),
+            Some(t) if t.phase == Phase::Done => {
+                let residual = t.chosen_residual().map_or(String::new(), |r| format!(", на {} % стал {:.0} dB", t.chosen, r));
+                let voice = match (t.voice_drop, t.backed_off) {
+                    (_, true) => "Голос подсаживался, поэтому на шаг мягче.",
+                    (Some(_), false) => "Голос проходит без потерь.",
+                    (None, _) => "Голоса не было слышно: подобрано по тишине.",
+                };
+                column![
+                    steps(2, false),
+                    row![
+                        numbers(format!("{} %", t.chosen), 18, GREEN),
+                        label(format!("фон {:.0} dB{residual}", t.noise_db), 12, DIM),
+                        Space::new().width(Length::Fill),
+                        action(label(format!("Вернуть {:.0} %", t.previous * 100.0), 12, INK), Msg::TuneUndo, self.focus == TUNE_UNDO, false).padding([3, 10]),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Center),
+                    label(format!("{voice} Сила сохранена для этого микрофона."), 12, DIM),
+                ]
+                .spacing(6)
+                .into()
+            }
+            Some(tune::Tune { phase: Phase::Failed(reason), .. }) => column![
+                steps(if reason.contains("тишины") { 0 } else { 1 }, true),
+                label(reason.clone(), 12, RED),
+            ]
+            .spacing(6)
+            .into(),
+            _ => match (ready, saved) {
+                (Err(why), _) => label(why, 12, FAINT).into(),
+                (Ok(()), Some(strength)) => column![
+                    row![numbers(format!("{:.0} %", strength * 100.0), 18, ORANGE), label("подобрано для этого микрофона", 12, DIM)].spacing(10).align_y(iced::Center),
+                    label("При смене микрофона сила ставится сама. Послушайте себя, чтобы проверить на слух.", 12, FAINT),
+                ]
+                .spacing(6)
+                .into(),
+                (Ok(()), None) => label("Помолчите 4 секунды, потом скажите пару слов: Mic Noize найдёт самую мягкую силу, при которой фон пропадает, и запомнит её для этого микрофона.", 12, DIM).into(),
+            },
+        };
+        let (curve, chosen, current) = match &self.tune {
+            Some(t) => (t.curve.clone(), (t.phase == Phase::Done).then_some(t.chosen), (t.phase == Phase::Quiet).then(|| t.strength())),
+            None => (Vec::new(), None, None),
+        };
+        card(
+            column![
+                header,
+                row![
+                    container(left).width(Length::Fill),
+                    container(tacho::tune_curve(curve, &tune::STEPS, chosen, current, tune::SILENT_DB)).width(300),
+                ]
+                .spacing(18)
+                .align_y(iced::Center),
+            ]
+            .spacing(10),
+        )
+        .padding([12, 16])
+        .into()
+    }
+
     /// Что слышите вы: processing of the sound you hear, opened from the gear.
     fn headphone_panel(&self) -> Element<'_, Msg> {
         use focus::headphones::*;
@@ -1515,7 +1678,9 @@ impl App {
                 .align_y(iced::Center),
             );
         }
-        if self.discord_state == 3 {
+        // A closed Discord is no fault: its hotkeys just have nothing to catch. The engine keeps
+        // looking for it, and the note came and went with every try.
+        if self.discord_state == 3 && !self.discord_message.contains("Откройте приложение Discord") {
             rows = rows.push(label(&self.discord_message, 12, RED));
         }
         let full_monitor = if self.monitor_all { self.monitor } else { 0 };
@@ -2698,16 +2863,12 @@ impl App {
                 .spacing(8),
             )
         };
+        // The version stands in the title bar; a ready update restarts from the rail's card, so
+        // this block only says where the check stands.
         let updates = column![
-            row![label(format!("Mic Noize {}", env!("CARGO_PKG_VERSION")), 13, INK), label(&self.update_status, 12, if self.update_ready { GREEN } else { FAINT })].spacing(12).align_y(iced::Center),
-            // "Обновить сейчас" exists only with an update to apply (the Tab order already
-            // skips it otherwise); a disabled orange button read as the page's main action.
-            row![
-                action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" }, 13, if self.update_checking { FAINT } else { INK }), Msg::UpdateCheck, self.focus == UPDATE, false)
-                    .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
-            ]
-            .push(self.update_ready.then(|| action(label("Обновить сейчас", 13, ORANGE_DARK), Msg::ApplyUpdate, self.focus == APPLY_UPDATE, true)))
-            .spacing(8),
+            label(&self.update_status, 12, if self.update_ready { GREEN } else { FAINT }),
+            action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" }, 13, if self.update_checking { FAINT } else { INK }), Msg::UpdateCheck, self.focus == UPDATE, false)
+                .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
         ]
         .spacing(8);
         let visuals = column![
@@ -2733,8 +2894,13 @@ impl App {
             ]
             .spacing(8)
             .align_y(iced::Center),
-            // Plays «Перезапустить» → update window → restart for real, without installing.
-            action(label("Проверить анимацию обновления", 13, INK), Msg::RehearseUpdate, self.focus == REHEARSE, false),
+            // «Анимация обновления» plays «Перезапустить» → update window → restart for real,
+            // without installing; «Карточка обновления» shows the ready card's celebration.
+            row![
+                action(label("Анимация обновления", 13, INK), Msg::RehearseUpdate, self.focus == REHEARSE, false),
+                action(label("Карточка обновления", 13, INK), Msg::ReadyPreview, self.focus == READY_PREVIEW, false),
+            ]
+            .spacing(8),
         ]
         .spacing(8);
         // Two columns under the device card, so the page fits the default window unscrolled.
@@ -3238,6 +3404,53 @@ mod tests {
         render(&app, "headphones");
         app.headphone_message = "Headphone host rejected request; see results/tag-headphones.log".into();
         render(&app, "headphones-no-line");
+        {
+            app.headphone_page = false;
+            app.ready_preview = Some(Instant::now());
+            app.ready_mosaic = mosaic_of(app.ready_card(), tacho::ready::CARD);
+            for ms in [250u64, 560, 950, 1350, 1750, 2150, 2600, 3000, 3400] {
+                app.ready_fx = Some(Instant::now() - Duration::from_millis(ms));
+                render(&app, &format!("ready-{ms:04}"));
+            }
+            (app.ready_fx, app.ready_preview, app.ready_mosaic) = (None, None, None);
+            // «Подбор под микрофон»: idle, the quiet sweep half way, the spoken check, the result.
+            app.snapshot.state = 2;
+            app.denoiser.0 = 1;
+            render(&app, "tune-idle");
+            let start = Instant::now() - Duration::from_millis(1600);
+            let mut sweep = tune::Tune::new(0.4, start);
+            let mut t = start;
+            let residual = |s: u8| [-52.0_f32, -58.0, -63.0, -67.0, -71.0, -74.0, -76.0, -78.0, -80.0, -82.0][tune::STEPS.iter().position(|&x| x == s).unwrap()];
+            let amp = |db: f32| 10f32.powf(db / 20.0);
+            while sweep.phase == tune::Phase::Quiet && t < Instant::now() {
+                t += Duration::from_millis(50);
+                let r = residual(sweep.strength());
+                sweep.feed(t, amp(-50.0), amp(r));
+            }
+            app.tune = Some(sweep);
+            render(&app, "tune-quiet");
+            let mut voice = tune::Tune::new(0.4, Instant::now() - Duration::from_secs(10));
+            let mut t = Instant::now() - Duration::from_secs(10);
+            while voice.phase == tune::Phase::Quiet {
+                t += Duration::from_millis(50);
+                let r = residual(voice.strength());
+                voice.feed(t, amp(-50.0), amp(r));
+            }
+            voice.phase_started = Instant::now() - Duration::from_millis(1200);
+            app.tune = Some(voice);
+            render(&app, "tune-voice");
+            let mut done = tune::Tune::new(0.4, Instant::now() - Duration::from_secs(10));
+            let mut t = Instant::now() - Duration::from_secs(10);
+            while done.running() {
+                t += Duration::from_millis(50);
+                let (i, o) = if done.phase == tune::Phase::Quiet { (amp(-50.0), amp(residual(done.strength()))) } else { (amp(-20.0), amp(-20.5)) };
+                done.feed(t, i, o);
+            }
+            app.tune = Some(done);
+            render(&app, "tune-done");
+            (app.tune, app.snapshot.state, app.denoiser.0) = (None, 0, 0);
+            app.headphone_page = true;
+        }
         app.headphone_message.clear();
         app.headphone_page = false;
         {

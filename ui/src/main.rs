@@ -8,6 +8,7 @@ mod rvc;
 mod settings;
 mod smooth;
 mod tacho;
+mod tune;
 mod soundpad;
 mod studio;
 mod telemetry;
@@ -30,6 +31,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// settings.ini section of tuned strengths: microphone id = percent.
+const PROFILES: &str = "noise_profiles";
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const DEVICE_REPAIRED: &str = "Устройство восстановлено";
 const DEVICE_REPAIRING: &str = "Проверяем и восстанавливаем виртуальное устройство…";
@@ -48,6 +51,7 @@ const SOUND_BIND_BASE: usize = 100;
 const CLIP_ID_BASE: u32 = 900_000;
 /// How many recordings the microphone page keeps on disk.
 const CLIPS_KEPT: usize = 6;
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Local wall clock for recording names: std has no local time, `GetLocalTime` does.
 #[repr(C)]
@@ -274,7 +278,6 @@ mod focus {
         pub const AUTOSTART: usize = 8;
         pub const APP_AUTOSTART: usize = 79;
         pub const UPDATE: usize = 57;
-        pub const APPLY_UPDATE: usize = 58;
         pub const DRIVER: usize = 72;
         pub const REPAIR: usize = 90;
         pub const REPAIR_REINSTALL: usize = 91;
@@ -285,6 +288,7 @@ mod focus {
         pub const REHEARSE: usize = 96;
         pub const PIXEL_SHIFT: usize = 97;
         pub const SLIDER_IDLE: usize = 98;
+        pub const READY_PREVIEW: usize = 88;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -319,6 +323,10 @@ mod focus {
         pub const HEADPHONE_GEAR: usize = 81;
         pub const ROUTE: usize = 82;
         pub const REVERSE_WORD: usize = 83;
+        /// «Подбор под микрофон»: tune, listen to yourself, undo.
+        pub const TUNE: usize = 110;
+        pub const TUNE_LISTEN: usize = 111;
+        pub const TUNE_UNDO: usize = 112;
         /// The first-run setup card: retry the download, install the virtual microphone.
         pub const SETUP_RETRY: usize = 84;
         pub const SETUP_DRIVER: usize = 85;
@@ -635,6 +643,15 @@ enum Msg {
     MorphStep(MorphStep),
     /// After an update: the hidden window is keyed and shown as the update window; then it grows.
     IntroStart,
+    /// Settings' «Карточка обновления»: shows the ready card and its celebration for 8 s.
+    ReadyPreview,
+    ReadyPreviewEnd,
+    /// Шумодав's «Подбор под микрофон»: start or stop the tune, undo its result, listen to
+    /// yourself (the full-voice monitor).
+    TuneStart,
+    TuneStop,
+    TuneUndo,
+    TuneListen,
     /// Plays the whole update hand-over for real, without installing anything.
     RehearseUpdate,
     /// The rehearsal's update window is on screen (or could not start).
@@ -783,6 +800,15 @@ struct App {
     driver_ready: bool,
     /// The device lists arrived once: before that a missing microphone is no problem yet.
     devices_known: bool,
+    /// The «Обновление готово» card's celebration: when it started, its mosaic, and whether a
+    /// newly downloaded update still waits to be celebrated where the user sees it.
+    ready_fx: Option<Instant>,
+    ready_mosaic: Option<Arc<tacho::Mosaic>>,
+    ready_fx_due: bool,
+    ready_preview: Option<Instant>,
+    /// The running or last finished strength tune, and the microphone's saved strength before it.
+    tune: Option<tune::Tune>,
+    tune_profile_before: Option<String>,
     core_present: bool,
     /// This GPU's denoiser models are on disk, or it has none to download.
     models_present: bool,
@@ -840,6 +866,7 @@ struct App {
     rvc_name: String,
     rvc_delete_confirm: bool,
     update_checking: bool,
+    last_update_check: Instant,
     update_ready: bool,
     update_status: String,
     apply_after_quit: bool,
@@ -998,8 +1025,8 @@ impl App {
             overload: settings.number("effects", "overload", 0, 0, 1) != 0,
             discord_volume: load_discord_volume(&settings),
             pitch: settings.number("effects", "pitch", -5, -12, 12),
-            intensity: settings.number("audio", "intensity", 100, 0, 200) as f32 / 100.0,
-            alternate_intensity: settings.number("audio", "alternate_intensity", 15, 0, 200) as f32
+            intensity: settings.number("audio", "intensity", 40, 0, 200) as f32 / 100.0,
+            alternate_intensity: settings.number("audio", "alternate_intensity", 10, 0, 200) as f32
                 / 100.0,
             muted: false,
             rvc: settings.number("effects", "rvc_enabled", 0, 0, 1) != 0,
@@ -1250,6 +1277,12 @@ impl App {
                 driver_installing,
                 driver_ready,
                 devices_known: false,
+                ready_fx: None,
+                ready_mosaic: None,
+                ready_fx_due: false,
+                ready_preview: None,
+                tune: None,
+                tune_profile_before: None,
                 core_present,
                 models_present,
                 setup_error: String::new(),
@@ -1300,6 +1333,7 @@ impl App {
                 rvc_name,
                 rvc_delete_confirm: false,
                 update_checking: !cfg!(test),
+                last_update_check: Instant::now(),
                 update_ready: false,
                 update_status: if cfg!(test) {
                     String::new()
@@ -1539,6 +1573,78 @@ impl App {
     /// own two defaults and the microphone, so there is no slot; the device repair frees one.
     fn headphone_needs_lines(&self) -> bool {
         self.headphone_message.contains("Headphone host rejected request")
+    }
+    /// The strength tuned for this microphone, if any.
+    fn profile(&self, id: &str) -> Option<f32> {
+        self.settings.get(PROFILES, id)?.parse::<u8>().ok().filter(|&v| v <= 200).map(|v| f32::from(v) / 100.0)
+    }
+    /// Whether the tune can run now; otherwise why not, for the panel.
+    fn tune_ready(&self) -> Result<(), &'static str> {
+        if self.input.is_none() {
+            Err("Выберите микрофон выше.")
+        } else if !matches!(self.snapshot.state, 2 | 3) || self.busy {
+            Err("Подбор работает, когда обработка голоса запущена.")
+        } else if self.denoiser.0 == 2 {
+            Err("Шумодав сейчас выключен: подбирать нечего.")
+        } else if self.denoiser.0 == 4 {
+            Err("Шум уже убирает сам вход: свой шумодав выключен.")
+        } else {
+            Ok(())
+        }
+    }
+    /// One meter reading for a running tune: it moves the strength along its sweep, and when it
+    /// finishes, the result is applied and kept for this microphone.
+    fn feed_tune(&mut self, input: f32, output: f32, state: i32) {
+        let active = self.ui_active();
+        let Some(tune) = self.tune.as_mut().filter(|t| t.running()) else { return };
+        let stop = if !matches!(state, 2 | 3) {
+            Some("Обработка остановилась, подбор прерван.")
+        } else if !active {
+            Some("Окно ушло на задний план, подбор прерван: вернитесь и начните снова.")
+        } else {
+            None
+        };
+        if let Some(reason) = stop {
+            self.controls.intensity = tune.previous;
+            tune.phase = tune::Phase::Failed(reason.into());
+            self.engine.controls(self.controls);
+            return;
+        }
+        tune.feed(Instant::now(), input, output);
+        let strength = f32::from(tune.strength()) / 100.0;
+        let done = tune.phase == tune::Phase::Done;
+        if matches!(tune.phase, tune::Phase::Failed(_)) {
+            self.controls.intensity = tune.previous;
+            self.engine.controls(self.controls);
+        } else if (self.controls.intensity - strength).abs() > 1e-4 || done {
+            self.controls.intensity = strength;
+            if done {
+                if let Some(id) = self.input.as_ref().map(|d| d.id.clone()) {
+                    self.settings.set(PROFILES, &id, (strength * 100.0).round() as u32);
+                }
+                self.changed();
+            } else {
+                self.engine.controls(self.controls);
+            }
+        }
+    }
+    /// Plays the ready card's celebration from now; its mosaic is the card painted offscreen.
+    fn start_ready_fx(&mut self) {
+        self.ready_fx = Some(Instant::now());
+        self.ready_mosaic = view::mosaic_of(self.ready_card(), tacho::ready::CARD);
+    }
+    /// The version the ready card shows: the download, or one patch up for the preview.
+    fn ready_version(&self) -> String {
+        match (&self.update_version, self.ready_preview) {
+            (Some(version), None) => version.clone(),
+            _ => {
+                let current = env!("CARGO_PKG_VERSION");
+                match current.rsplit_once('.').and_then(|(head, patch)| Some((head, patch.parse::<u32>().ok()?))) {
+                    Some((head, patch)) => format!("{head}.{}", patch + 1),
+                    None => current.to_owned(),
+                }
+            }
+        }
     }
     /// Something the voice needs is still missing or failed to install.
     fn setup_pending(&self) -> bool {
@@ -2000,6 +2106,15 @@ impl App {
                     }
                 }
                 self.log_message();
+                // A new download celebrates where the user sees it: now if the window is in
+                // front, else the next time it is.
+                if self.ready_fx_due && self.update_ready && self.ui_active() && self.morph.is_none() {
+                    self.ready_fx_due = false;
+                    self.start_ready_fx();
+                }
+                if self.ready_preview.is_some_and(|since| since.elapsed() > Duration::from_secs(8)) {
+                    self.ready_preview = None;
+                }
                 let status = components::status();
                 if self.rvc_runtime_installing
                     && let Some(share) = status.share()
@@ -2201,6 +2316,7 @@ impl App {
                     }
                 }
                 let (snapshot, error) = self.engine.snapshot(self.ui_active());
+                self.feed_tune(snapshot.input_peak, snapshot.output_peak, snapshot.state);
                 let studio_just_started = self.snapshot.state != 3 && snapshot.state == 3;
                 self.snapshot = snapshot;
                 (self.phrase_state, self.phrase_seconds) = self.engine.phrase();
@@ -2325,6 +2441,12 @@ impl App {
                     self.save();
                 }
                 let next = timer(self.ui_active() && self.running());
+                let next = if !self.update_ready && !self.update_checking && !self.quitting
+                    && self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+                    Task::batch([next, self.update(Msg::UpdateCheck)])
+                } else {
+                    next
+                };
                 if studio_just_started && self.studio_page && self.ui_active() && self.studio_loop
                     && self.studio_live && !self.studio_events.is_empty() {
                     return Task::batch([next, self.update(Msg::StudioRender(false))]);
@@ -2495,6 +2617,7 @@ impl App {
             }
             Msg::UpdateChecked(status) => {
                 self.update_checking = false;
+                self.last_update_check = Instant::now();
                 // Apply after the fresh check: the newest download (Ready), or the one already on
                 // disk when the check itself failed (offline). Current means the release is gone.
                 let apply = std::mem::take(&mut self.apply_pending)
@@ -2505,6 +2628,7 @@ impl App {
                         self.update_status = "Установлена актуальная версия".into();
                     }
                     updater::Status::Ready(version) => {
+                        self.ready_fx_due |= !self.update_ready;
                         self.update_ready = true;
                         self.update_version = Some(version.clone());
                         self.update_status = format!("Версия {version} скачана и готова");
@@ -2789,6 +2913,14 @@ impl App {
             Msg::Input(d) => {
                 if !self.busy && self.inputs.contains(&d) {
                     let restart = self.running();
+                    // Cancel a sweep before applying the new microphone's profile. An untuned
+                    // microphone must not inherit the sweep's temporary strength.
+                    if let Some(tune) = self.tune.take().filter(tune::Tune::running) {
+                        self.controls.intensity = tune.previous;
+                    }
+                    if let Some(strength) = self.profile(&d.id) {
+                        self.controls.intensity = strength;
+                    }
                     self.input = Some(d);
                     self.focus = if self.details {
                         focus::settings::INPUT
@@ -2834,6 +2966,10 @@ impl App {
                 }
             }
             Msg::Intensity(v) => {
+                // A hand on the slider takes over from a running tune.
+                if self.tune.as_ref().is_some_and(tune::Tune::running) {
+                    self.tune = None;
+                }
                 self.controls.intensity = (v / 100.0).clamp(0.0, 2.0);
                 self.focus = focus::effects::INTENSITY;
                 self.changed();
@@ -4078,6 +4214,45 @@ impl App {
                     _ => return self.update(Msg::MorphStep(MorphStep::Done)),
                 }
             }
+            Msg::ReadyPreview => {
+                self.focus = focus::settings::READY_PREVIEW;
+                self.ready_preview = Some(Instant::now());
+                self.start_ready_fx();
+            }
+            Msg::ReadyPreviewEnd => self.ready_preview = None,
+            Msg::TuneStart => {
+                self.focus = focus::effects::TUNE;
+                if self.tune_ready().is_ok() {
+                    let id = self.input.as_ref().map(|d| d.id.clone()).unwrap_or_default();
+                    self.tune_profile_before = self.settings.get(PROFILES, &id).map(str::to_owned);
+                    let tune = tune::Tune::new(self.controls.intensity, Instant::now());
+                    self.controls.intensity = f32::from(tune.strength()) / 100.0;
+                    self.engine.controls(self.controls);
+                    self.tune = Some(tune);
+                }
+            }
+            Msg::TuneStop => {
+                self.focus = focus::effects::TUNE;
+                if let Some(tune) = self.tune.take().filter(tune::Tune::running) {
+                    self.controls.intensity = tune.previous;
+                    self.engine.controls(self.controls);
+                }
+            }
+            Msg::TuneUndo => {
+                if let Some(tune) = self.tune.take().filter(|t| t.phase == tune::Phase::Done) {
+                    self.focus = focus::effects::TUNE;
+                    self.controls.intensity = tune.previous;
+                    if let Some(id) = self.input.as_ref().map(|d| d.id.clone()) {
+                        self.settings.set(PROFILES, &id, self.tune_profile_before.take().unwrap_or_default());
+                    }
+                    self.changed();
+                }
+            }
+            Msg::TuneListen => {
+                let task = self.update(Msg::Monitor);
+                self.focus = focus::effects::TUNE_LISTEN;
+                return task;
+            }
             Msg::RehearseUpdate => {
                 if !self.quitting && !self.busy && !self.driver_installing && !self.core_installing {
                     self.rehearse_after_quit = true;
@@ -4247,11 +4422,8 @@ impl App {
                     items.extend([REPAIR, REFRESH]);
                 }
                 items.push(UPDATE);
-                if self.update_ready {
-                    items.push(APPLY_UPDATE);
-                }
                 items.extend([PIXEL_SHIFT, SLIDER_IDLE]);
-                items.extend([LOGS, QUIT, REHEARSE]);
+                items.extend([LOGS, QUIT, REHEARSE, READY_PREVIEW]);
                 items.extend(tabs);
                 items
             } else if self.rvc_page {
@@ -4330,7 +4502,10 @@ impl App {
                         items.push(LINES);
                     }
                 }
-                items.extend([ROUTE, INTENSITY, NOISE_BIND, ALT_INTENSITY]);
+                items.extend([ROUTE, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE_LISTEN, TUNE]);
+                if self.tune.as_ref().is_some_and(|t| t.phase == tune::Phase::Done) {
+                    items.push(TUNE_UNDO);
+                }
                 items.extend(tabs);
                 items
             };
@@ -4594,7 +4769,6 @@ impl App {
                 }
                 REFRESH if activate => Msg::Refresh,
                 UPDATE if activate => Msg::UpdateCheck,
-                APPLY_UPDATE if activate => Msg::ApplyUpdate,
                 DRIVER if activate => Msg::InstallDriver,
                 REPAIR if activate => Msg::Repair,
                 REPAIR_REINSTALL if activate => Msg::RepairReinstall(!self.repair_reinstall),
@@ -4609,6 +4783,7 @@ impl App {
                 SLIDER_IDLE if activate => Msg::SliderIdle(!self.slider_idle),
                 LOGS if activate => Msg::Page(5),
                 REHEARSE if activate => Msg::RehearseUpdate,
+                READY_PREVIEW if activate => Msg::ReadyPreview,
                 _ => Msg::Noop,
             }
         } else {
@@ -4631,6 +4806,9 @@ impl App {
                 HEADPHONE_GEAR if activate => Msg::HeadphonePanel(!self.headphone_page),
                 ROUTE if activate => Msg::RouteToggle,
                 SETUP_RETRY if activate => Msg::RetryCore,
+                TUNE if activate => if self.tune.as_ref().is_some_and(tune::Tune::running) { Msg::TuneStop } else { Msg::TuneStart },
+                TUNE_LISTEN if activate => Msg::TuneListen,
+                TUNE_UNDO if activate => Msg::TuneUndo,
                 SETUP_DRIVER if activate => Msg::InstallDriver,
                 SETUP_SETTINGS if activate => Msg::Page(2),
                 REVERSE_WORD if activate && !self.reverse_edit => Msg::ReverseEdit(true),
@@ -5182,18 +5360,50 @@ mod controller_tests {
         assert!((SOUND_VOLUME_AT_100 - 0.2 * 0.2).abs() < 0.0001);
     }
     #[test]
+    fn tuned_strength_follows_the_microphone() {
+        let (mut app, _) = App::from_settings(Settings::for_test("[noise_profiles]
+mic-b=65")).unwrap().unwrap();
+        app.inputs = vec![Device { id: "mic-a".into(), name: "A".into() }, Device { id: "mic-b".into(), name: "B".into() }];
+        app.input = app.inputs.first().cloned();
+        let _ = app.update(Msg::Input(app.inputs[1].clone()));
+        assert!((app.controls.intensity - 0.65).abs() < 1e-6, "a tuned microphone brings its strength");
+        let _ = app.update(Msg::Input(app.inputs[0].clone()));
+        assert!((app.controls.intensity - 0.65).abs() < 1e-6, "an untuned one keeps the current strength");
+        // «Вернуть» puts back the strength and the profile from before the tune.
+        let mut done = tune::Tune::new(0.4, Instant::now());
+        (done.phase, done.chosen) = (tune::Phase::Done, 30);
+        app.tune = Some(done);
+        app.tune_profile_before = None;
+        app.settings.set(PROFILES, "mic-a", 30);
+        let _ = app.update(Msg::TuneUndo);
+        assert!((app.controls.intensity - 0.4).abs() < 1e-6 && app.profile("mic-a").is_none() && app.tune.is_none());
+        // Switching during a sweep restores the old strength when the new mic has no profile.
+        app.tune = Some(tune::Tune::new(0.4, Instant::now()));
+        app.controls.intensity = 0.85;
+        let _ = app.update(Msg::Input(app.inputs[0].clone()));
+        assert!(app.tune.is_none() && (app.controls.intensity - 0.4).abs() < 1e-6);
+        // A hand on the slider takes over from a running tune.
+        app.tune = Some(tune::Tune::new(0.4, Instant::now()));
+        let _ = app.update(Msg::Intensity(55.0));
+        assert!(app.tune.is_none());
+        assert_eq!(app.tune_ready(), Err("Подбор работает, когда обработка голоса запущена."));
+    }
+    #[test]
     fn noise_presets_and_hotkey_roundtrip() {
         use keyboard::{Key, Modifiers, key::Named};
         let (mut app, _) = App::from_settings(Settings::for_test("[audio]\nintensity=105"))
             .unwrap()
             .unwrap();
         assert_eq!(app.controls.intensity, 1.05);
-        assert_eq!(app.controls.alternate_intensity, 0.15);
+        assert_eq!(app.controls.alternate_intensity, 0.1, "first-install default while held");
+        let (fresh, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        assert_eq!((fresh.controls.intensity, fresh.controls.alternate_intensity), (0.4, 0.1), "first-install defaults");
+        drop(fresh);
         assert_eq!(app.keys[12], 0);
         app.window = Some(App::open(1.0, None).0);
         app.focus = 37;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
-        assert_eq!(app.controls.alternate_intensity, 0.16);
+        assert_eq!(app.controls.alternate_intensity, 0.11);
         assert_eq!(app.controls.intensity, 1.05);
         let _ = app.update(Msg::AlternateIntensity(250.0));
         assert_eq!(app.controls.alternate_intensity, 2.0);
@@ -5370,6 +5580,20 @@ page_pixelate=0")).unwrap().unwrap();
         assert!(!app.quitting && app.apply_pending,"preparation must finish before stopping audio");
         let _ = app.update(Msg::UpdatePrepared(Ok(())));
         assert!(app.apply_after_quit, "Enter on the banner must apply the newest update");
+    }
+    #[test]
+    fn update_check_repeats_in_tray_after_interval() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.last_update_check = Instant::now() - UPDATE_CHECK_INTERVAL;
+        let _ = app.update(Msg::Tick);
+        assert!(app.update_checking);
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Current));
+        let _ = app.update(Msg::Tick);
+        assert!(!app.update_checking, "a completed check resets the interval");
+        app.last_update_check = Instant::now() - UPDATE_CHECK_INTERVAL;
+        app.update_ready = true;
+        let _ = app.update(Msg::Tick);
+        assert!(!app.update_checking, "a downloaded update needs no repeat check");
     }
     #[test]
     fn offline_recheck_still_applies_the_downloaded_update() {
@@ -5875,8 +6099,9 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.window = Some(App::open(1.0, None).0);
         app.keys = [0; 13];
         use keyboard::{Key, Modifiers, key::Named};
-        // Шумодав: devices, the headphone gear, the folded route, then the two strengths.
-        for expected in [35, 50, 81, 82, 34, 38, 37, 40] {
+        // Шумодав: devices, the headphone gear, the folded route, the two strengths, then the
+        // tune panel's «Послушать себя» and «Подобрать».
+        for expected in [35, 50, 81, 82, 34, 38, 37, 111, 110, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }

@@ -1548,6 +1548,367 @@ impl MorphState {
         first
     }
 }
+/// «Обновление готово» celebrates once (canvas D + B + A): a slanted «НОВОЕ» tag drops into
+/// the rail, bounces, wiggles and opens into the card, which assembles from a pixel mosaic;
+/// the version rolls to the new one and flashes green, the button breathes with a ring, then
+/// confetti bursts from the button over the whole window and a gleam crosses the button.
+/// Milliseconds from the start.
+pub mod ready {
+    pub const DROP: (f32, f32) = (0.0, 420.0);
+    pub const WIGGLE: (f32, f32) = (420.0, 650.0);
+    pub const OPEN: (f32, f32) = (600.0, 760.0);
+    pub const MOSAIC: (f32, f32) = (700.0, 1200.0);
+    pub const ROLL: (f32, f32) = (1200.0, 1500.0);
+    pub const FLASH: (f32, f32) = (1500.0, 2100.0);
+    pub const RING: (f32, f32) = (1500.0, 1850.0);
+    pub const CONFETTI: (f32, f32) = (1650.0, 3250.0);
+    pub const GLEAM: (f32, f32) = (1850.0, 2350.0);
+    pub const END: f32 = 3300.0;
+    /// The card's fixed size (its mosaic maps onto it) and its button's height.
+    pub const CARD: iced::Size = iced::Size::new(176.0, 124.0);
+    pub const BUTTON_H: f32 = 30.0;
+}
+const FLASH_GREEN: Color = Color::from_rgb8(0x6F, 0xE1, 0x8B);
+/// Where the card stood in the last frame: the window layer draws the tag and the confetti
+/// around it, outside the card's own bounds (drawing there from the card would leave stale
+/// pixels behind, tiny-skia repaints only a widget's damaged bounds).
+static READY_CARD: std::sync::Mutex<Option<Rectangle>> = std::sync::Mutex::new(None);
+fn ready_ms(start: Instant, now: Instant) -> f32 {
+    now.saturating_duration_since(start).as_secs_f32() * 1000.0
+}
+fn ready_span(ms: f32, (a, b): (f32, f32)) -> f32 {
+    ((ms - a) / (b - a)).clamp(0.0, 1.0)
+}
+fn smooth(x: f32) -> f32 {
+    x * x * (3.0 - 2.0 * x)
+}
+fn bounce(mut x: f32) -> f32 {
+    let (n, d) = (7.5625, 2.75);
+    if x < 1.0 / d {
+        n * x * x
+    } else if x < 2.0 / d {
+        x -= 1.5 / d;
+        n * x * x + 0.75
+    } else if x < 2.5 / d {
+        x -= 2.25 / d;
+        n * x * x + 0.9375
+    } else {
+        x -= 2.625 / d;
+        n * x * x + 0.984375
+    }
+}
+fn ready_button(card: Rectangle) -> Rectangle {
+    Rectangle { x: card.x + 12.0, y: card.y + card.height - 12.0 - ready::BUTTON_H, width: card.width - 24.0, height: ready::BUTTON_H }
+}
+
+/// The card's own layer: hides it while the tag falls, then its mosaic dissolves in a wave
+/// from the bottom left; later a ring around the button and a gleam across it.
+pub fn ready_fx<'a, Message: 'a>(start: Option<Instant>, mosaic: Option<std::sync::Arc<Mosaic>>, cover: Color) -> Element<'a, Message> {
+    Element::new(ReadyFx { start, mosaic, cover })
+}
+struct ReadyFx {
+    start: Option<Instant>,
+    mosaic: Option<std::sync::Arc<Mosaic>>,
+    cover: Color,
+}
+impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fill }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start)
+            && ready_ms(start, *now) < ready::END
+        {
+            shell.request_redraw_at(frame_after(*now));
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        if let Ok(mut card) = READY_CARD.lock() {
+            *card = Some(b);
+        }
+        let Some(start) = self.start else { return };
+        let ms = ready_ms(start, Instant::now());
+        if ms >= ready::END {
+            return;
+        }
+        let mut shapes = Vec::new();
+        if ms < ready::MOSAIC.0 {
+            slant(&mut shapes, b.x - 1.0, b.y - 1.0, b.width + 2.0, b.height + 2.0, 0.0, self.cover);
+        } else if ms < ready::MOSAIC.1
+            && let Some(m) = &self.mosaic
+        {
+            let p = ready_span(ms, ready::MOSAIC);
+            let side = 11.0;
+            let (cols, rows) = ((b.width / side).ceil() as usize, (b.height / side).ceil() as usize);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let u = ((c as f32 + 0.5) / cols as f32 + (rows - 1 - r) as f32 / rows as f32) / 2.0;
+                    let local = (p * 1.6 - u * 0.6).clamp(0.0, 1.0);
+                    let alpha = ((1.0 - local) * 10.0).round() / 10.0;
+                    let (u0, v0) = (c as f32 / cols as f32, r as f32 / rows as f32);
+                    let (u1, v1) = ((c + 1) as f32 / cols as f32, (r + 1) as f32 / rows as f32);
+                    let [red, green, blue] = sample(m, u0, v0, u1, v1).map(|v| v.round() as u8);
+                    slant(&mut shapes, b.x + c as f32 * side, b.y + r as f32 * side, side + 0.6, side + 0.6, 0.0, Color { a: alpha, ..Color::from_rgb8(red, green, blue) });
+                }
+            }
+        }
+        let button = ready_button(b);
+        renderer.with_layer(b, |renderer| {
+            let mut frame = Frame::new(b);
+            fill_shapes(&mut frame, &shapes);
+            let ring = ready_span(ms, ready::RING);
+            if ring > 0.0 && ring < 1.0 {
+                let grow = 6.0 * (1.0 - (1.0 - ring).powi(3));
+                let path = Path::rounded_rectangle(
+                    Point::new(button.x - grow, button.y - grow),
+                    Size::new(button.width + 2.0 * grow, button.height + 2.0 * grow),
+                    (8.0 + grow).into(),
+                );
+                frame.stroke(&path, iced_tiny_skia::graphics::geometry::Stroke::default().with_width(2.0).with_color(Color { a: 0.9 * (1.0 - ring), ..TAG }));
+            }
+            renderer.draw_geometry(frame.into_geometry());
+            let gleam = ready_span(ms, ready::GLEAM);
+            if gleam > 0.0 && gleam < 1.0 {
+                renderer.with_layer(button, |renderer| {
+                    let x = button.x - 34.0 + (button.width + 48.0) * smooth(gleam);
+                    let band = [Shape { x, y: button.y, w: 20.0, h: button.height, lean: 12.0, round: 0.0, color: Color { a: 0.55, ..HEAD } }];
+                    renderer.draw_geometry(geometry(button, &band));
+                });
+            }
+        });
+    }
+}
+
+/// The window's layer over everything: the falling tag, then the confetti from the button,
+/// flying high over the whole app. Draws nothing outside the celebration.
+pub fn celebrate<'a, Message: 'a>(start: Option<Instant>) -> Element<'a, Message> {
+    Element::new(Celebrate { start })
+}
+struct Celebrate {
+    start: Option<Instant>,
+}
+impl<Message> Widget<Message, Theme, Renderer> for Celebrate {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fill }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start)
+            && ready_ms(start, *now) < ready::END
+        {
+            shell.request_redraw_at(frame_after(*now));
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let Some(start) = self.start else { return };
+        let Some(card) = READY_CARD.lock().ok().and_then(|c| *c) else { return };
+        let ms = ready_ms(start, Instant::now());
+        if ms >= ready::END {
+            return;
+        }
+        let window = layout.bounds();
+        let mut frame = Frame::new(window);
+        if ms < ready::OPEN.1 {
+            let wiggle = ready_span(ms, ready::WIGGLE);
+            let open = ready_span(ms, ready::OPEN);
+            let x = card.x + card.width / 2.0;
+            let y = card.y + 26.0 - 170.0 * (1.0 - bounce(ready_span(ms, ready::DROP)));
+            let degrees = 7.0 * (wiggle * 4.0 * std::f32::consts::PI).sin() * (1.0 - wiggle);
+            frame.push_transform();
+            frame.translate(iced::Vector::new(x, y));
+            frame.rotate(degrees.to_radians());
+            frame.scale(1.0 - 0.8 * open);
+            fill_shapes(&mut frame, &[Shape { x: -32.0, y: -11.0, w: 58.0, h: 22.0, lean: 6.0, round: 0.0, color: Color { a: 1.0 - open, ..TAG } }]);
+            frame.fill_text(iced_tiny_skia::graphics::geometry::Text {
+                content: "НОВОЕ".into(),
+                position: Point::ORIGIN,
+                max_width: f32::INFINITY,
+                color: Color { a: 1.0 - open, ..DARK },
+                size: Pixels(11.0),
+                line_height: text::LineHeight::default(),
+                font: numbers(),
+                align_x: text::Alignment::Center,
+                align_y: iced::alignment::Vertical::Center,
+                shaping: text::Shaping::Basic,
+            });
+            frame.pop_transform();
+        }
+        let age = ms - ready::CONFETTI.0;
+        let life = ready::CONFETTI.1 - ready::CONFETTI.0;
+        if age >= 0.0 && age < life {
+            let button = ready_button(card);
+            let (ox, oy) = (button.x + button.width / 2.0, button.y + button.height / 2.0);
+            let palette = [TAG, HEAD, FLASH_GREEN, Color::from_rgb8(0xFF, 0xB0, 0x70), INK];
+            let fade = if age > 0.65 * life { 1.0 - (age - 0.65 * life) / (0.35 * life) } else { 1.0 };
+            for i in 0..70u32 {
+                let angle = -std::f32::consts::FRAC_PI_2 + (i as f32 / 69.0 - 0.5) * 1.9 + (grain(i, 1) - 0.5) * 0.25;
+                let speed = 0.85 + 0.7 * grain(i, 2);
+                let x = ox + angle.cos() * speed * age;
+                let y = oy + angle.sin() * speed * age + 0.5 * 0.0016 * age * age;
+                frame.push_transform();
+                frame.translate(iced::Vector::new(x, y));
+                frame.rotate((grain(i, 3) - 0.5) * 0.03 * age);
+                fill_shapes(&mut frame, &[Shape { x: -3.0 - 6.0 * SKEW, y: -6.0, w: 6.0, h: 12.0, lean: 12.0 * SKEW, round: 0.0, color: Color { a: fade, ..palette[i as usize % palette.len()] } }]);
+                frame.pop_transform();
+            }
+        }
+        renderer.with_layer(window, |renderer| renderer.draw_geometry(frame.into_geometry()));
+    }
+}
+
+/// A version number whose differing tail rolls from the old one to the new one, then flashes
+/// green; without a start it simply shows the new one.
+pub fn roll<'a, Message: 'a>(from: &str, to: &str, start: Option<Instant>, size: f32, color: Color) -> Element<'a, Message> {
+    Element::new(Roll { from: from.to_owned(), to: to.to_owned(), start, size, color })
+}
+struct Roll {
+    from: String,
+    to: String,
+    start: Option<Instant>,
+    size: f32,
+    color: Color,
+}
+impl Roll {
+    fn parts(&self) -> (String, String, String) {
+        let common = self.from.chars().zip(self.to.chars()).take_while(|(a, b)| a == b).count();
+        let prefix: String = self.to.chars().take(common).collect();
+        (prefix, self.from.chars().skip(common).collect(), self.to.chars().skip(common).collect())
+    }
+    fn text(&self, content: String) -> Text<String, Font> {
+        Text { align_y: iced::alignment::Vertical::Top, ..label(content, self.size, Size::INFINITE, text::Alignment::Left) }
+    }
+    fn width(&self) -> f32 {
+        text_width(&self.to, self.size, numbers()).max(text_width(&self.from, self.size, numbers())) + 2.0
+    }
+}
+impl<Message> Widget<Message, Theme, Renderer> for Roll {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Shrink, height: Length::Shrink }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, Size::new(self.width(), (self.size * 1.3).ceil())))
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start)
+            && ready_ms(start, *now) < ready::FLASH.1
+        {
+            shell.request_redraw_at(frame_after(*now));
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let ms = self.start.map_or(f32::MAX, |start| ready_ms(start, Instant::now()));
+        let (prefix, old, new) = self.parts();
+        let roll = smooth(ready_span(ms, ready::ROLL));
+        let flash = ready_span(ms, ready::FLASH);
+        let fresh = if flash > 0.0 && flash < 1.0 {
+            let k = flash * flash;
+            Color { r: FLASH_GREEN.r + (self.color.r - FLASH_GREEN.r) * k, g: FLASH_GREEN.g + (self.color.g - FLASH_GREEN.g) * k, b: FLASH_GREEN.b + (self.color.b - FLASH_GREEN.b) * k, a: self.color.a }
+        } else {
+            self.color
+        };
+        let x = b.x + if prefix.is_empty() { 0.0 } else { text_width(&prefix, self.size, numbers()) };
+        put(renderer, self.text(prefix), Point::new(b.x, b.y), self.color, b);
+        if roll <= 0.0 || roll >= 1.0 {
+            let tail = if roll >= 1.0 { new } else { old };
+            put(renderer, self.text(tail), Point::new(x, b.y), fresh, b);
+            return;
+        }
+        // While rolling, the tails are glyph outlines: a layer clips geometry to the line, but
+        // not ordinary text.
+        renderer.with_layer(b, |renderer| {
+            let mut frame = Frame::new(b);
+            for (content, y, color) in [(old, b.y - roll * b.height, self.color), (new, b.y + (1.0 - roll) * b.height, fresh)] {
+                frame.fill_text(iced_tiny_skia::graphics::geometry::Text {
+                    content,
+                    position: Point::new(x, y),
+                    max_width: f32::INFINITY,
+                    color,
+                    size: Pixels(self.size),
+                    line_height: text::LineHeight::default(),
+                    font: numbers(),
+                    align_x: text::Alignment::Left,
+                    align_y: iced::alignment::Vertical::Top,
+                    shaping: text::Shaping::Basic,
+                });
+            }
+            renderer.draw_geometry(frame.into_geometry());
+        });
+    }
+}
+
+/// The strength tune's sweep in the sliders' segments: a slanted bar per swept strength, as
+/// tall as the noise left after the denoiser (−100…−30 dB). Bars at or under the silence line
+/// (dashed) are green, the chosen one bright; the strength being measured now blinks.
+pub fn tune_curve<'a, Message: 'a>(points: Vec<(u8, f32)>, steps: &'static [u8], chosen: Option<u8>, current: Option<u8>, silent_db: f32) -> Element<'a, Message> {
+    Element::new(TuneCurve { points, steps, chosen, current, silent_db })
+}
+struct TuneCurve {
+    points: Vec<(u8, f32)>,
+    steps: &'static [u8],
+    chosen: Option<u8>,
+    current: Option<u8>,
+    silent_db: f32,
+}
+const CURVE_H: f32 = 62.0;
+impl<Message> Widget<Message, Theme, Renderer> for TuneCurve {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<Painted>() }
+    fn state(&self) -> tree::State { tree::State::new(Painted::default()) }
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fixed(CURVE_H) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, CURVE_H)
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let (top, bottom) = (b.y + 2.0, b.y + b.height - 15.0);
+        let tall = |db: f32| ((db + 100.0) / 70.0).clamp(0.06, 1.0) * (bottom - top);
+        let slot = b.width / self.steps.len() as f32;
+        let w = (slot * 0.5).min(13.0);
+        // The tick clock blinks the bar being measured (the UI redraws every tick meanwhile).
+        let blink = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()) / 190).is_multiple_of(2);
+        let mut shapes = Vec::with_capacity(self.steps.len() * 3 + 60);
+        let line = bottom - tall(self.silent_db);
+        let mut x = b.x;
+        while x < b.x + b.width {
+            slant(&mut shapes, x, line, 4.0, 1.0, 0.0, Color { a: 0.55, ..FLASH_GREEN });
+            x += 8.0;
+        }
+        for (i, &strength) in self.steps.iter().enumerate() {
+            let x = b.x + slot * (i as f32 + 0.5) - w / 2.0 + (bottom - top) * SKEW / 2.0;
+            segment(&mut shapes, x, top, w, bottom - top, OFF_EDGE);
+            segment(&mut shapes, x + 1.0, top + 1.0, w - 2.0, bottom - top - 2.0, OFF);
+            if let Some(&(_, residual)) = self.points.iter().find(|p| p.0 == strength) {
+                let h = tall(residual);
+                let color = if self.chosen == Some(strength) {
+                    HEAD
+                } else if residual <= self.silent_db {
+                    Color { a: 0.85, ..FLASH_GREEN }
+                } else {
+                    lerp(0.35 + 0.65 * i as f32 / self.steps.len() as f32)
+                };
+                segment(&mut shapes, x + (bottom - top - h) * SKEW, bottom - h, w, h, color);
+            } else if self.current == Some(strength) && blink {
+                segment(&mut shapes, x, top, w, bottom - top, Color { a: 0.35, ..HEAD });
+            }
+        }
+        tree.state.downcast_ref::<Painted>().draw(renderer, b.expand(4.0), shapes);
+        for (i, &strength) in self.steps.iter().enumerate() {
+            let at = Point::new(b.x + slot * (i as f32 + 0.5), bottom + 3.0);
+            let lit = self.chosen == Some(strength) || self.current == Some(strength);
+            let text = Text { align_x: text::Alignment::Center, align_y: iced::alignment::Vertical::Top, ..label(strength.to_string(), 10.0, Size::INFINITE, text::Alignment::Center) };
+            put(renderer, text, at, if lit { INK } else { Color::from_rgb8(0x85, 0x86, 0x8D) }, b.expand(2.0));
+        }
+    }
+}
+
 /// Frames drawn by the window (the morph layer is always in it): the update intro waits for
 /// the card to be drawn before its window becomes visible.
 static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1746,6 +2107,14 @@ mod tests {
         assert_eq!(s.lit(0.0).0, s.lit(0.0).1);
         assert_eq!(s.lit(-3.0), (6, 8, 6));
         assert_eq!(s.lit(6.0), (8, 12, 11));
+    }
+    #[test]
+    fn version_rolls_only_its_changed_tail() {
+        let roll = Roll { from: "0.3.19".into(), to: "0.3.20".into(), start: None, size: 13.0, color: INK };
+        assert_eq!(roll.parts(), ("0.3.".into(), "19".into(), "20".into()));
+        let same = Roll { from: "0.3.14".into(), to: "0.3.15".into(), start: None, size: 13.0, color: INK };
+        assert_eq!(same.parts(), ("0.3.1".into(), "4".into(), "5".into()));
+        assert!(ready::DROP.1 <= ready::MOSAIC.0 && ready::MOSAIC.1 <= ready::ROLL.0 && ready::ROLL.1 <= ready::CONFETTI.0 && ready::CONFETTI.1 < ready::END, "D, then B, then A");
     }
     #[test]
     fn dense_sliders_drag_a_step_at_a_time() {
