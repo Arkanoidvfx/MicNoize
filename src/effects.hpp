@@ -295,7 +295,7 @@ public:
 };
 // Finite taps from the captured input only. The output is never written back into the delay.
 class EchoEffect {
-    static constexpr size_t capacity=48000*5;
+    static constexpr size_t capacity=48000*16+1; // Eight 2 s taps, plus the sample being written.
     std::vector<float> history_=std::vector<float>(capacity);
     std::array<float,8> gains_{};
     size_t write_=0,age_=0,remaining_=0,delay_=10560;
@@ -306,7 +306,7 @@ public:
     bool active() const{return wasHeld_||remaining_>0;}
     void process(const float* dry,size_t n,bool held,unsigned delayMs,unsigned repeats,unsigned decay,unsigned level,float* wet){
         if(held&&!wasHeld_){
-            reset();delay_=static_cast<size_t>(std::clamp(delayMs,60u,600u))*48;
+            reset();delay_=static_cast<size_t>(std::clamp(delayMs,60u,2000u))*48;
             repeats_=std::clamp(repeats,1u,8u);
             const float fall=std::clamp(decay,0u,90u)/100.0f;
             float gain=std::clamp(level,0u,100u)/100.0f;
@@ -328,51 +328,6 @@ public:
             }
             wet[i]=std::clamp(wet[i],-1.0f,1.0f);
             write_=(write_+1)%capacity;age_=std::min(age_+1,capacity);
-        }
-    }
-};
-class GranularEffect {
-    static constexpr size_t capacity=24000;
-    struct Voice {size_t start=0,phase=0;bool active=false;};
-    std::array<float,capacity> history_{};
-    std::array<float,7200> window_{};
-    Voice voices_[2]{};
-    size_t write_=0,filled_=0,tick_=0,grain_=0,scatter_=0;
-    unsigned random_=0x6d2b79f5;
-    Ramp wet_;
-public:
-    void reset(){write_=filled_=tick_=grain_=scatter_=0;voices_[0]=voices_[1]={};wet_=Ramp{};}
-    void process(float* data,size_t n,bool held,unsigned grainMs,unsigned scatterMs,int semitones,uint8_t* modified=nullptr){
-        const size_t grain=static_cast<size_t>(std::clamp(grainMs,30u,150u))*48;
-        const size_t scatter=static_cast<size_t>(std::clamp(scatterMs,0u,100u))*48;
-        if(grain!=grain_ || scatter!=scatter_){
-            grain_=grain;scatter_=scatter;tick_=0;voices_[0]=voices_[1]={};
-            for(size_t i=0;i<grain_;++i)window_[i]=0.5f-0.5f*std::cos(6.28318530718f*i/grain_);
-        }
-        const float ratio=std::exp2(std::clamp(semitones,-12,12)/12.0f);
-        for(size_t i=0;i<n;++i){
-            const float dry=std::isfinite(data[i])?data[i]:0;
-            history_[write_]=dry;write_=(write_+1)%capacity;filled_=std::min(filled_+1,capacity);
-            const bool ready=held && filled_>=grain_*2+scatter_;
-            if(ready && tick_==0){
-                random_^=random_<<13;random_^=random_>>17;random_^=random_<<5;
-                const size_t jitter=scatter_?random_%(scatter_+1):0;
-                for(auto& voice:voices_)if(!voice.active){voice={(write_+capacity-grain_*2-jitter)%capacity,0,true};break;}
-            }
-            float sum=0,weight=0;
-            for(auto& voice:voices_)if(voice.active){
-                const float w=window_[voice.phase];
-                const float at=voice.phase*ratio;
-                const size_t base=static_cast<size_t>(at);
-                const float fraction=at-base;
-                const float sample=std::lerp(history_[(voice.start+base)%capacity],history_[(voice.start+base+1)%capacity],fraction);
-                sum+=sample*w;weight+=w;
-                if(++voice.phase==grain_)voice.active=false;
-            }
-            const float mix=wet_.next(ready?1.0f:0.0f);
-            if(mix>0 && weight>0.0001f){data[i]=std::clamp(std::lerp(dry,sum/weight,mix),-1.0f,1.0f);if(modified)modified[i]|=ModifiedEffects;}
-            else data[i]=dry;
-            tick_=(tick_+1)%(grain_/2);
         }
     }
 };
@@ -428,8 +383,8 @@ public:
                 }
             }
         }
-        if(!voiced_){correction_=0;return 0;}
-        const float alpha=1-std::exp(-10.0f/std::clamp(speed,5u,150u));
+        // Keep the delayed stream continuous through consonants; return to neutral smoothly.
+        const float alpha=1-std::exp(-10.0f/(voiced_?std::clamp(speed,5u,150u):60u));
         correction_+=alpha*(desired-correction_);
         return correction_;
     }

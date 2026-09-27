@@ -315,9 +315,9 @@ public:
     std::atomic<unsigned> phraseCancel{0};
     std::atomic<unsigned> replayRequest{0};
     std::atomic<int> pitch{-5};
-    std::atomic<int> formant{0},grainPitch{0},tuneRoot{0},tuneScale{0};
-    std::atomic<unsigned> echoDelayMs{220},echoRepeats{3},echoDecay{55},echoLevel{100};
-    std::atomic<unsigned> stutterMs{120},grainMs{80},grainScatterMs{30},tuneSpeedMs{80},tuneStrength{100};
+    std::atomic<int> formant{0},tuneRoot{0},tuneScale{0};
+    std::atomic<unsigned> echoDelayMs{500},echoRepeats{3},echoDecay{55},echoLevel{100};
+    std::atomic<unsigned> stutterMs{120},tuneSpeedMs{80},tuneStrength{100};
     std::atomic<unsigned> effectActivity{0};
     // Soundpad: library writes happen off the DSP thread; the DSP thread only try-locks.
     std::atomic<uint64_t> soundRequest{0};

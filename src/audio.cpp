@@ -961,7 +961,7 @@ void Engine::dspLoop(Config c) {
             stats.denoiser=cpu.state?3:2;
         }
         PitchEffect pitchEffect; AutoTunePitch autoTune; StutterEffect stutterMic,stutterDiscord;
-        GranularEffect granular; EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect;
+        EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect;
         auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
         std::array<float,block> in{},out{},microphone{},discordSource{},scratch{},echoMicOut{},echoDiscordOut{},captureData{};
         LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
@@ -1056,7 +1056,7 @@ void Engine::dspLoop(Config c) {
                     modified.fill(0); // RVC flags described the microphone, which now travels separately.
                 }
                 const unsigned selected=sourceHeld(flags,fromDiscord);
-                if(fromDiscord!=wasDiscord){pitchEffect.reset();autoTune.reset();granular.reset();boostEffect=OutputEffects{};sourceFade=Ramp{0};wasDiscord=fromDiscord;}
+                if(fromDiscord!=wasDiscord){pitchEffect.reset();autoTune.reset();boostEffect=OutputEffects{};sourceFade=Ramp{0};wasDiscord=fromDiscord;}
                 stats.desktopSource=fromDiscord;
                 if(valid){
                     (fromDiscord?stutterDiscord:stutterMic).process(out.data(),block,(selected&HoldStutter)!=0,stutterMs.load(),modified.data());
@@ -1071,8 +1071,7 @@ void Engine::dspLoop(Config c) {
                 const int manual=pitchHeld?pitch.load():0;
                 const float correction=autoTune.process(out.data(),block,tuneHeld,manual,tuneRoot.load(),tuneScale.load(),tuneSpeedMs.load(),tuneStrength.load());
                 const int formants=pitchHeld?formant.load():0;
-                pitchEffect.processAdvanced(out.data(),block,static_cast<float>(manual)+correction,formants,pitchHeld&&(manual||formants)||(tuneHeld&&autoTune.voiced()),modified.data());
-                granular.process(out.data(),block,valid&&(selected&HoldGranular),grainMs.load(),grainScatterMs.load(),grainPitch.load(),modified.data());
+                pitchEffect.processAdvanced(out.data(),block,static_cast<float>(manual)+correction,formants,(pitchHeld&&(manual||formants))||tuneHeld,modified.data());
                 for(auto& v:out)v*=sourceFade.next(1);
                 stats.pitchActive=pitchEffect.active(); stats.pitchDelayMs=pitchEffect.delayMs();
                 stats.pitchMaxMs=std::max(stats.pitchMaxMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-pitchBegin).count());
@@ -1097,7 +1096,7 @@ void Engine::dspLoop(Config c) {
                     captureData[i]=((captureMain&&(modified[i]&~ModifiedBoost))?out[i]:0)+(recordDiscord?echoDiscordOut[i]:echoMicOut[i]);
                 }
                 effectActivity=sourceRecordFlags((pitchHeld?HoldPitch:0)|
-                    (valid?selected&(HoldStutter|HoldGranular|HoldAutoTune):0),fromDiscord)|
+                    (valid?selected&(HoldStutter|HoldAutoTune):0),fromDiscord)|
                     (micEcho?HoldEcho:0)|(discordEcho?HoldEcho<<4:0);
                 const bool replay=lastEffect.process(out.data(),block,modified.data(),fromDiscord,sourceRecordFlags(selected,fromDiscord),
                     phraseWasActive || phraseEffect.state()!=0 || pitchEffect.active(),valid,epoch,phraseCancel.load(),replayRequest.load(),

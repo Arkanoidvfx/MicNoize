@@ -1658,9 +1658,11 @@ impl App {
                 5 => (
                     "Эхо", glyph::REPEAT,
                     action(label("настроить", 11, DIM), Msg::EffectDetails(5), self.focus == DETAIL_BASE + 5, false).into(),
-                    frame(tacho(60.0..=600.0, self.controls.effects.echo_delay_ms as f32,
-                        |v| Msg::EffectOption(0, v), clock).default(220.0).compact()
-                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE)),
+                    column![label("Интервал повторов", 11, DIM),
+                        frame(tacho(60.0..=2000.0, self.controls.effects.echo_delay_ms as f32,
+                            |v| Msg::EffectOption(0, v), clock).default(500.0).compact()
+                            .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE))]
+                        .spacing(2).into(),
                     NEW_MIC_BIND_BASE, self.effect_activity & ((1 << 10) | (1 << 14)) != 0,
                 ),
                 6 => (
@@ -1670,14 +1672,6 @@ impl App {
                         |v| Msg::EffectOption(4, v), clock).default(120.0).compact()
                         .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE + 4)),
                     NEW_MIC_BIND_BASE + 1, self.effect_activity & ((1 << 11) | (1 << 15)) != 0,
-                ),
-                7 => (
-                    "Granular", glyph::NOTE,
-                    action(label("настроить", 11, DIM), Msg::EffectDetails(7), self.focus == DETAIL_BASE + 7, false).into(),
-                    frame(tacho(30.0..=150.0, self.controls.effects.grain_ms as f32,
-                        |v| Msg::EffectOption(5, v), clock).default(80.0).compact()
-                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE + 5)),
-                    NEW_MIC_BIND_BASE + 2, self.effect_activity & ((1 << 12) | (1 << 16)) != 0,
                 ),
                 _ => (
                     "AutoTune", glyph::NOTE,
@@ -1837,7 +1831,7 @@ impl App {
             2 => (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 1,
             3 => (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 0,
             4 => self.phrase_state >= 9,
-            // Echo, stutter, granular, autotune: bits i + 5 (microphone) and i + 9 (Discord).
+            // Echo, stutter, autotune: bits i + 5 (microphone) and i + 9 (Discord); row 7 retired.
             _ => self.effect_activity & ((1 << (i + 5)) | (1 << (i + 9))) != 0,
         }
     }
@@ -1891,7 +1885,6 @@ impl App {
         let options: &[(usize, &str)] = match row {
             1 => &[(12, "Форманты")],
             5 => &[(1, "Повторы"), (2, "Затухание"), (3, "Уровень")],
-            7 => &[(6, "Разброс"), (7, "Тон зерна")],
             8 => &[(8, "Тоника"), (9, "Гамма"), (11, "Сила")],
             _ => &[],
         };

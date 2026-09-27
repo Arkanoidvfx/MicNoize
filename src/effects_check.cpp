@@ -47,7 +47,20 @@ int main() {try {
             "Discord echo tail gain or dry monitor separation failed");
         echo.reset();input.fill(0);echo.process(input.data(),480,true,60,3,50,100,wet.data());
         require(std::all_of(wet.begin(),wet.end(),[](float v){return v==0;}),"Old echo survived reset");
-        std::cout<<"echo=passed taps=3 tail=180ms dry=excluded\n";
+        // Maximum interval/repeats must survive ring wrap and finish after release.
+        echo.reset();
+        for(int frame=0;frame<3250;++frame){
+            input.fill(0);if(frame==0||frame==1600)input[0]=0.5f;
+            echo.process(input.data(),480,frame<=1600,2000,8,90,100,wet.data());
+            for(int i=0;i<480;++i){
+                float expected=0;
+                for(int start:{0,1600})for(int tap=1;tap<=8;++tap)
+                    if(frame==start+tap*200&&i==0)expected+=0.5f*std::pow(0.9f,tap-1);
+                require(std::abs(wet[i]-expected)<1e-6f,"Long echo interval/tail or ring wrap failed");
+            }
+        }
+        require(!echo.active(),"Maximum echo tail did not finish");
+        std::cout<<"echo=passed taps=3/8 interval=60/2000ms tail=16s dry=excluded\n";
     }
     {
         mic::StutterEffect stutter;
@@ -62,17 +75,7 @@ int main() {try {
         frame.fill(0.2f);stutter.process(frame.data(),480,false,50);
         frame.fill(0.2f);stutter.process(frame.data(),480,false,50);
         require(frame[479]==0.2f,"Stutter did not release to live voice");
-        mic::GranularEffect granular;
-        bool changed=false;
-        for(int block=0;block<120;++block){
-            for(int i=0;i<480;++i)frame[i]=0.2f*std::sin((block*480+i)*0.17f);
-            const auto originalFrame=frame;
-            granular.process(frame.data(),480,true,30,20,7);
-            for(float v:frame)require(std::isfinite(v)&&std::abs(v)<=1,"Granular output escaped bounds");
-            if(block>50&&frame!=originalFrame)changed=true;
-        }
-        require(changed,"Granular never processed live speech");
-        std::cout<<"stutter=passed granular=passed\n";
+        std::cout<<"stutter=passed\n";
     }
     {
         mic::AutoTunePitch tune;
@@ -82,8 +85,35 @@ int main() {try {
             correction=tune.process(voice.data(),480,true,0,0,1,80,100);
         }
         require(correction< -0.25f&&correction> -0.8f,"AutoTune missed A in C major");
-        voice.fill(0);for(int i=0;i<5;++i)correction=tune.process(voice.data(),480,true,0,0,1,80,100);
-        require(correction==0&&!tune.voiced(),"AutoTune corrected an unvoiced passage");
+        voice.fill(0);
+        for(int i=0;i<80;++i){
+            const float previous=correction;
+            correction=tune.process(voice.data(),480,true,0,0,1,80,100);
+            if(!tune.voiced())require(std::abs(correction-previous)<0.1f,"AutoTune jumped on lost voicing");
+        }
+        require(std::abs(correction)<0.00001f&&!tune.voiced(),"AutoTune did not relax to neutral");
+        // Hold through vowels, silence and consonant-like noise without restarting the shifter.
+        mic::PitchEffect continuous;unsigned random=12345;bool heardTail=false;
+        for(int block=0;block<260;++block){
+            for(int i=0;i<480;++i){
+                random=random*1664525u+1013904223u;
+                voice[i]=block<100||block>=160?0.3f*std::sin(6.28318530718f*452*(block*480+i)/48000):
+                    block<120?0:0.15f*(static_cast<float>(random>>8)/8388608.0f-1);
+            }
+            correction=tune.process(voice.data(),480,true,0,0,1,80,100);
+            continuous.processAdvanced(voice.data(),480,correction,0,true);
+            for(float sample:voice){
+                require(std::isfinite(sample)&&std::abs(sample)<=1,"AutoTune transition escaped bounds");
+                if(block>=104&&block<120&&std::abs(sample)>0.01f)heardTail=true;
+            }
+            if(block>20)require(continuous.active(),"AutoTune restarted during a held phrase");
+        }
+        require(heardTail,"AutoTune cut the delayed vowel tail at loss of voicing");
+        voice.fill(0.2f);continuous.processAdvanced(voice.data(),480,0,0,false);
+        voice.fill(0.2f);continuous.processAdvanced(voice.data(),480,0,0,false);
+        require(voice.back()==0.2f&&!continuous.active(),"AutoTune release lost dry bypass");
+        continuous.reset();voice.fill(0);continuous.processAdvanced(voice.data(),480,0,0,true);
+        require(std::all_of(voice.begin(),voice.end(),[](float v){return v==0;}),"AutoTune reset leaked old source");
         mic::PitchEffect formant;unsigned crossings=0;float previous=0;
         for(int block=0;block<180;++block){
             for(int i=0;i<480;++i)voice[i]=0.2f*std::sin(6.28318530718f*440*(block*480+i)/48000);
@@ -339,7 +369,7 @@ int main() {try {
         all.update(1,true,keys,pressed,0,false);
         std::fill(std::begin(pressed),std::end(pressed),true);
         const auto flags=all.update(1,true,keys,pressed,0,false);
-        require(flags==mic::HoldAllMask,"18 hotkeys did not fit the hold mask");
+        require(flags==mic::HoldAllMask && !(flags&((1<<12)|(1<<16))),"Active hotkey mask retained Granular");
         require(mic::heldFlags(mic::packHeld(1000,1,flags),1,1100,true)==flags,"New hold bits were lost in timestamp packing");
         require(all.update(1,true,keys,pressed,0,false,false)==mic::HoldMicMask,"Unavailable Discord retained a new hold");
     }

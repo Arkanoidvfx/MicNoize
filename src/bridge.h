@@ -29,7 +29,7 @@ float mnr_monitor_peak(Mnr*);
 void mnr_controls(Mnr*,float volume,float boost,int32_t pitch,float intensity,int32_t muted,float slow,float fast,int32_t overload,float discordVolume,int32_t rvcEnabled);
 typedef struct {
     int32_t echo_delay_ms,echo_repeats,echo_decay,echo_level;
-    int32_t stutter_ms,grain_ms,grain_scatter_ms,grain_pitch;
+    int32_t stutter_ms,grain_ms,grain_scatter_ms,grain_pitch; // grain_* reserved for ABI compatibility.
     int32_t tune_root,tune_scale,tune_speed_ms,tune_strength,formant;
 } MnrEffectOptions;
 // Additive ABI: existing controls and snapshot layouts stay unchanged.

@@ -44,10 +44,10 @@ fn apply_effect_defaults(settings: &mut Settings) {
     settings.set("effects", "defaults_version", EFFECT_DEFAULTS_VERSION);
 }
 /// The effects page's two groups, by effect row: what sounds while the key is held (boost,
-/// formant shift, echo, granular, autotune), and what records a piece and plays it back
+/// formant shift, echo, autotune), and what records a piece and plays it back
 /// (slow, fast, reverse, stutter). One group at a time keeps the page and the monitor below it
 /// on screen without scrolling.
-const EFFECT_GROUPS: [&[usize]; 2] = [&[0, 1, 5, 7, 8], &[2, 3, 4, 6]];
+const EFFECT_GROUPS: [&[usize]; 2] = [&[0, 1, 5, 8], &[2, 3, 4, 6]];
 /// settings.ini section of tuned strengths: microphone id = percent.
 const PROFILES: &str = "noise_profiles";
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -72,7 +72,7 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 fn load_effect_options(settings: &Settings) -> EffectOptions {
     EffectOptions {
-        echo_delay_ms: settings.number("effects", "echo_delay_ms", 220, 60, 600),
+        echo_delay_ms: settings.number("effects", "echo_delay_ms", 500, 60, 2000),
         echo_repeats: settings.number("effects", "echo_repeats", 3, 1, 8),
         echo_decay: settings.number("effects", "echo_decay", 55, 0, 90),
         echo_level: settings.number("effects", "echo_level", 100, 0, 100),
@@ -1112,11 +1112,11 @@ impl App {
             settings.number("effects", "noise_key", 0, 0, 2046) as u32,
             settings.number("effects", "echo_key", 0, 0, 2046) as u32,
             settings.number("effects", "stutter_key", 0, 0, 2046) as u32,
-            settings.number("effects", "granular_key", 0, 0, 2046) as u32,
+            0, // Retired Granular slot; keep later bindings at their existing indices.
             settings.number("effects", "autotune_key", 0, 0, 2046) as u32,
             settings.number("effects", "discord_echo_key", 0, 0, 2046) as u32,
             settings.number("effects", "discord_stutter_key", 0, 0, 2046) as u32,
-            settings.number("effects", "discord_granular_key", 0, 0, 2046) as u32,
+            0, // Retired Discord Granular slot.
             settings.number("effects", "discord_autotune_key", 0, 0, 2046) as u32,
         ];
         for i in 0..keys.len() {
@@ -4631,7 +4631,7 @@ impl App {
                         _ => vec![DETAIL_BASE + row, OPTION_BASE + [0, 4, 5, 10][row - 5], NEW_MIC_BIND_BASE + row - 5, NEW_DISCORD_BIND_BASE + row - 5],
                     });
                     if self.effect_details == Some(row) {
-                        let options: &[usize] = match row { 1=>&[12],5=>&[1,2,3],7=>&[6,7],8=>&[8,9,11],_=>&[] };
+                        let options: &[usize] = match row { 1=>&[12],5=>&[1,2,3],8=>&[8,9,11],_=>&[] };
                         items.extend(options.iter().map(|&i| OPTION_BASE + i));
                     }
                 }
@@ -5261,14 +5261,23 @@ mod controller_tests {
     use super::*;
     #[test]
     fn extended_effect_settings_and_bindings() {
-        let ini="[effects]\npitch=3\ndefaults_version=2\necho_delay_ms=600\ngrain_pitch=-7\ntune_scale=2\nformant=5\necho_key=130\ndiscord_autotune_key=131";
+        let ini="[effects]\npitch=3\ndefaults_version=2\necho_delay_ms=1500\ngrain_pitch=-7\ntune_scale=2\nformant=5\necho_key=130\ngranular_key=131\ndiscord_granular_key=130\ndiscord_autotune_key=131";
         let (mut app, _) = App::from_settings(Settings::for_test(ini)).unwrap().unwrap();
         assert_eq!(app.controls.pitch,3);
         assert_eq!((app.controls.effects.echo_delay_ms,app.controls.effects.grain_pitch,
-            app.controls.effects.tune_scale,app.controls.effects.formant),(600,-7,2,5));
+            app.controls.effects.tune_scale,app.controls.effects.formant),(1500,-7,2,5));
         assert_eq!((app.keys[13],app.keys[20]),(130,131));
-        let _=app.update(Msg::EffectOption(0,999.0));
-        assert_eq!(app.controls.effects.echo_delay_ms,600);
+        assert_eq!((app.keys[15],app.keys[19]),(0,0));
+        assert_eq!(EFFECT_GROUPS[0], &[0,1,5,8]);
+        assert_eq!(load_effect_options(&Settings::for_test("")).echo_delay_ms,500);
+        let _=app.update(Msg::EffectOption(0,2500.0));
+        assert_eq!(app.controls.effects.echo_delay_ms,2000);
+        let dir=Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".tmp/effect-settings-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        app.settings.path=dir.join("settings.ini");
+        app.benchmark=false;
+        app.save();
+        assert_eq!(load_effect_options(&app.settings).echo_delay_ms,2000);
         let _=app.update(Msg::EffectDetails(5));
         assert_eq!(app.effect_details,Some(5));
         app.effects_page=true;
@@ -6347,7 +6356,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
         assert!(!app.headphone_page && !app.effects_page);
         let _ = app.update(Msg::Page(6));
-        // The group switch first, then «Голос вживую»: boost, formant shift, echo, granular, autotune.
+        // The group switch first, then «Голос вживую»: boost, formant shift, echo, autotune.
         for expected in [focus::effects::GROUP_BASE, focus::effects::GROUP_BASE + 1, 21, 2] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);

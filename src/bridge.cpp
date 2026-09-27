@@ -165,7 +165,7 @@ extern "C" int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity) {
     } catch(const std::exception& e) {copy(e.what(),result,capacity);return 0;} catch(...) {return 0;}
 }
 extern "C" void mnr_effect_options(Mnr* p,const MnrEffectOptions* o) {
-    if(!p||!o||o->echo_delay_ms<60||o->echo_delay_ms>600||o->echo_repeats<1||o->echo_repeats>8||
+    if(!p||!o||o->echo_delay_ms<60||o->echo_delay_ms>2000||o->echo_repeats<1||o->echo_repeats>8||
        o->echo_decay<0||o->echo_decay>90||o->echo_level<0||o->echo_level>100||
        o->stutter_ms<50||o->stutter_ms>300||o->grain_ms<30||o->grain_ms>150||
        o->grain_scatter_ms<0||o->grain_scatter_ms>100||o->grain_pitch< -12||o->grain_pitch>12||
@@ -174,7 +174,7 @@ extern "C" void mnr_effect_options(Mnr* p,const MnrEffectOptions* o) {
        o->formant< -12||o->formant>12)return;
     auto& e=p->engine;
     e.echoDelayMs=o->echo_delay_ms;e.echoRepeats=o->echo_repeats;e.echoDecay=o->echo_decay;e.echoLevel=o->echo_level;
-    e.stutterMs=o->stutter_ms;e.grainMs=o->grain_ms;e.grainScatterMs=o->grain_scatter_ms;e.grainPitch=o->grain_pitch;
+    e.stutterMs=o->stutter_ms;
     e.tuneRoot=o->tune_root;e.tuneScale=o->tune_scale;e.tuneSpeedMs=o->tune_speed_ms;e.tuneStrength=o->tune_strength;e.formant=o->formant;
 }
 extern "C" uint32_t mnr_effect_activity(Mnr* p) {return p?p->engine.effectActivity.load():0;}
@@ -205,6 +205,9 @@ extern "C" int32_t mnr_tag_task_enabled(int32_t mode,char* error,uint32_t capaci
 }
 extern "C" void mnr_bindings(Mnr* p,const uint32_t* keys,uint32_t count) {
     if(!keys || (count!=12 && count!=13 && count!=21))return;
+    std::array<uint32_t,21> active{};
+    std::copy_n(keys,count,active.begin());active[15]=active[19]=0; // Retired Granular slots.
+    keys=active.data();
     auto valid=[](unsigned k){return k==0 || ((k&255)>=3 && (k&255)<=254 && (k>>8)<=7);};
     for(unsigned i=0;i<count;++i){if(!valid(keys[i]))return;for(unsigned j=0;j<i;++j)if(keys[i]&&keys[i]==keys[j])return;}
     {std::lock_guard lock(p->soundKeysMutex);for(const auto& [id,key]:p->soundKeys)for(unsigned i=0;i<count;++i)if(keys[i]&&keys[i]==key)return;}

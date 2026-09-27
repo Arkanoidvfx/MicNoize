@@ -254,7 +254,7 @@ pub struct EffectOptions {
     pub echo_decay: i32,
     pub echo_level: i32,
     pub stutter_ms: i32,
-    pub grain_ms: i32,
+    pub grain_ms: i32, // Retired Granular fields retained for C ABI layout compatibility.
     pub grain_scatter_ms: i32,
     pub grain_pitch: i32,
     pub tune_root: i32,
@@ -264,12 +264,12 @@ pub struct EffectOptions {
     pub formant: i32,
 }
 impl Default for EffectOptions {
-    fn default() -> Self { Self { echo_delay_ms: 220, echo_repeats: 3, echo_decay: 55, echo_level: 100,
+    fn default() -> Self { Self { echo_delay_ms: 500, echo_repeats: 3, echo_decay: 55, echo_level: 100,
         stutter_ms: 120, grain_ms: 80, grain_scatter_ms: 30, grain_pitch: 0,
         tune_root: 0, tune_scale: 0, tune_speed_ms: 80, tune_strength: 100, formant: 0 } }
 }
 impl EffectOptions {
-    pub const RANGES: [(i32, i32); 13] = [(60,600),(1,8),(0,90),(0,100),(50,300),
+    pub const RANGES: [(i32, i32); 13] = [(60,2000),(1,8),(0,90),(0,100),(50,300),
         (30,150),(0,100),(-12,12),(0,11),(0,2),(5,150),(0,100),(-12,12)];
     pub fn value(&self, i: usize) -> i32 { match i {
         0=>self.echo_delay_ms,1=>self.echo_repeats,2=>self.echo_decay,3=>self.echo_level,

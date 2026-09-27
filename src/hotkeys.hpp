@@ -5,10 +5,10 @@ namespace mic {
 // Existing bindings keep bits 0-9. New microphone effects use 10-13 and Discord 14-17.
 enum Hold : unsigned {
     HoldBoost=1, HoldPitch=2, HoldSlow=4, HoldFast=8, HoldReverse=16,
-    HoldEcho=1<<10, HoldStutter=1<<11, HoldGranular=1<<12, HoldAutoTune=1<<13,
-    HoldNew=HoldEcho|HoldStutter|HoldGranular|HoldAutoTune,
+    HoldEcho=1<<10, HoldStutter=1<<11, HoldAutoTune=1<<13, // Bits 12/16 retired (Granular).
+    HoldNew=HoldEcho|HoldStutter|HoldAutoTune,
     HoldPhrases=HoldSlow|HoldFast|HoldReverse, HoldLive=HoldBoost|HoldPitch|HoldNew,
-    DiscordShift=5, HoldMicMask=31|HoldNew, HoldAllMask=(1<<18)-1
+    DiscordShift=5, HoldMicMask=31|HoldNew, HoldAllMask=((1<<18)-1)&~((1<<12)|(1<<16))
 };
 inline unsigned sourceHeld(unsigned flags,bool discord) {
     return discord?((flags>>DiscordShift)&31)|((flags>>4)&HoldNew):flags&HoldMicMask;
@@ -44,7 +44,7 @@ struct HoldLatch {
             else if(!pressed[i]) armed[i]=true;
             if(allowed && armed[i] && keys[i] && pressed[i] && mods==(keys[i]>>8) && !win) flags|=1<<i;
         }
-        return flags;
+        return flags&HoldAllMask;
     }
 };
 }
