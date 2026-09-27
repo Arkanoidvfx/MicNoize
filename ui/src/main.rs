@@ -1595,6 +1595,9 @@ impl App {
         self.studio_loop.then(|| (studio::frame_at(self.studio_loop_start, self.studio_play_bpm),
             studio::frame_at(self.studio_loop_end, self.studio_play_bpm)))
     }
+    fn studio_gain(&self) -> f32 {
+        self.controls.discord_volume * self.studio_volume as f32 / 100.0
+    }
     fn sync_studio_loop(&self) {
         self.engine.sound_loop(studio::TRACK_ID, self.studio_loop_range());
     }
@@ -2852,6 +2855,7 @@ impl App {
             }
             Msg::DiscordVolume(v) => {
                 self.controls.discord_volume = discord_volume_gain(v);
+                self.engine.sound_gain(studio::TRACK_ID, self.studio_gain());
                 self.focus = focus::effects::DISCORD_VOLUME;
                 self.changed();
             }
@@ -3505,7 +3509,7 @@ impl App {
             }
             Msg::StudioVolume(value) => {
                 self.studio_volume = value.min(200);
-                self.engine.sound_gain(studio::TRACK_ID, self.studio_volume as f32 / 100.0);
+                self.engine.sound_gain(studio::TRACK_ID, self.studio_gain());
                 self.focus = focus::studio::VOLUME;
                 self.dirty = Some(Instant::now());
             }
@@ -3686,7 +3690,7 @@ impl App {
                 let folder = self.studio_folder.clone();
                 let events = self.studio_events.clone();
                 let bpm = self.studio_bpm;
-                let volume = self.studio_volume;
+                let gain = self.studio_gain();
                 let loop_range = self.studio_loop.then(|| (studio::frame_at(self.studio_loop_start, bpm),
                     studio::frame_at(self.studio_loop_end, bpm)));
                 if !export { self.studio_play_bpm = bpm; }
@@ -3698,12 +3702,11 @@ impl App {
                         std::fs::create_dir_all(&exports).map_err(|e| e.to_string())?;
                         let path = unique_path(&exports, "Трек.wav");
                         let selected = loop_range.map_or(&audio[..], |(start, end)| &audio[start..end]);
-                        let gain = volume as f32 / 100.0;
                         let selected: Vec<f32> = selected.iter().map(|v| (v * gain).clamp(-1.0, 1.0)).collect();
                         soundpad::write_wav(&path, &selected)?;
                         Ok(Some(path))
                     } else {
-                        loader.load_studio(studio::TRACK_ID, &audio, volume as f32 / 100.0, loop_range)?;
+                        loader.load_studio(studio::TRACK_ID, &audio, gain, loop_range)?;
                         Ok(None)
                     }
                 }, move |r| Msg::StudioRendered(export, r));
@@ -3722,7 +3725,7 @@ impl App {
                         }
                         self.studio_follow = true;
                         self.sync_studio_loop();
-                        self.engine.sound_gain(studio::TRACK_ID, self.studio_volume as f32 / 100.0);
+                        self.engine.sound_gain(studio::TRACK_ID, self.studio_gain());
                         self.engine.sound_restart(studio::TRACK_ID);
                         self.engine.sound_seek(studio::TRACK_ID, self.studio_cursor * 15.0 / self.studio_play_bpm as f32);
                         self.studio_note = "Трек отправлен в виртуальный микрофон".into();
@@ -5143,6 +5146,7 @@ mod controller_tests {
         assert_eq!(defaults.controls.boost, 3.0);
         assert!(!defaults.controls.overload);
         assert!((defaults.controls.discord_volume - 0.08).abs() < 0.0001);
+        assert!((defaults.studio_gain() - 0.08).abs() < 0.0001);
         assert_eq!(
             discord_volume_percent(defaults.controls.discord_volume),
             100.0
@@ -5159,10 +5163,13 @@ mod controller_tests {
         .unwrap()
         .unwrap();
         assert!((new_scale.controls.discord_volume - 0.16).abs() < 0.0001);
+        assert!((new_scale.studio_gain() - 0.16).abs() < 0.0001);
 
         let (mut clamped, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         let _ = clamped.update(Msg::DiscordVolume(250.0));
         assert!((clamped.controls.discord_volume - 0.16).abs() < 0.0001);
+        let _ = clamped.update(Msg::StudioVolume(200));
+        assert!((clamped.studio_gain() - 0.32).abs() < 0.0001);
     }
     #[test]
     fn soundpad_volume_migrates_and_handles_an_old_version_edit() {
