@@ -3001,13 +3001,14 @@ mod tests {
                     anim: Some(tacho::Morph { from: from.clone(), to: to.clone(), from_rect, to_rect, start: Instant::now() - Duration::from_millis(ms), timeline, events: Vec::new() }),
                     hwnd: None,
                     center: None,
+                    shown: None,
                 });
                 save(&app, format!("morph-{kind}-{ms:03}"));
             }
         }
-        app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Running(Instant::now() - Duration::from_millis(270))), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None });
+        app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Running(Instant::now() - Duration::from_millis(270))), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None, shown: None });
         save(&app, "update-window".into());
-        app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Launching), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None });
+        app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Launching), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None, shown: None });
         save(&app, "update-launching".into());
     }
 

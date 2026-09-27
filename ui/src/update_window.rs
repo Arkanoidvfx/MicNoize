@@ -66,24 +66,35 @@ pub fn parse_point(text: &str) -> Option<Point> {
 
 /// Turns Windows colour keying on or off for a window: pixels of exactly [`tacho::KEY`] become
 /// transparent. tiny-skia windows cannot be alpha-transparent, but a keyed layered window can.
-pub fn color_key(hwnd: u64, on: bool) {
+/// `alpha` 0 hides the whole window: the intro opens so until it has drawn its first frame.
+/// While keyed, Windows' open and close animations are off: they draw the window without the
+/// key, so its key-coloured surroundings (near black) flashed around the update card.
+pub fn color_key(hwnd: u64, on: bool, alpha: u8) {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetWindowLongPtrW(window: isize, index: i32) -> isize;
         fn SetWindowLongPtrW(window: isize, index: i32, value: isize) -> isize;
         fn SetLayeredWindowAttributes(window: isize, key: u32, alpha: u8, flags: u32) -> i32;
     }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(window: isize, attribute: u32, value: *const i32, size: u32) -> i32;
+    }
     const GWL_EXSTYLE: i32 = -20;
     const WS_EX_LAYERED: isize = 0x0008_0000;
     const LWA_COLORKEY: u32 = 1;
+    const LWA_ALPHA: u32 = 2;
+    const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
     let key = tacho::KEY;
     let colorref = (key.r * 255.0).round() as u32 | ((key.g * 255.0).round() as u32) << 8 | ((key.b * 255.0).round() as u32) << 16;
     let window = hwnd as isize;
     unsafe {
         let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        let transitions_off = i32::from(on);
+        DwmSetWindowAttribute(window, DWMWA_TRANSITIONS_FORCEDISABLED, &transitions_off, 4);
         if on {
             SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
-            SetLayeredWindowAttributes(window, colorref, 255, LWA_COLORKEY);
+            SetLayeredWindowAttributes(window, colorref, alpha, LWA_COLORKEY | LWA_ALPHA);
         } else {
             SetWindowLongPtrW(window, GWL_EXSTYLE, style & !WS_EX_LAYERED);
         }
@@ -125,7 +136,7 @@ impl Watcher {
                 window::raw_id::<WatchMsg>(id).map(WatchMsg::Handle)
             }
             WatchMsg::Handle(hwnd) => {
-                color_key(hwnd, true);
+                color_key(hwnd, true, 255);
                 let show = self.window.map_or(Task::none(), |id| window::set_mode(id, window::Mode::Windowed));
                 Task::batch([show, after(80, WatchMsg::Shown)])
             }

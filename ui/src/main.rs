@@ -89,6 +89,9 @@ struct MorphView {
     hwnd: Option<u64>,
     /// Set for the shrink: where the watcher's update window must stand.
     center: Option<iced::Point>,
+    /// The intro's window, shown transparent: the frame count then and when. It becomes
+    /// visible once it has drawn the card, so it never shows an unpainted (black) window.
+    shown: Option<(u64, Instant)>,
 }
 fn clip_name() -> String {
     let mut t = LocalTime::default();
@@ -2380,6 +2383,7 @@ impl App {
                         anim: None,
                         hwnd: None,
                         center: None,
+                        shown: None,
                     });
                     return window::raw_id::<Msg>(id).map(Msg::Keyed);
                 }
@@ -2530,7 +2534,7 @@ impl App {
             }
             Msg::UpdateApplied(result) => {
                 if result.is_err() && let Some(m)=self.morph.take() && let Some(hwnd)=m.hwnd {
-                    update_window::color_key(hwnd,false);
+                    update_window::color_key(hwnd,false,255);
                 }
                 if let Err(error)=result {
                     self.quitting=false;self.busy=false;self.apply_after_quit=false;
@@ -4012,24 +4016,35 @@ impl App {
                     }),
                     hwnd: None,
                     center: Some(center),
+                    shown: None,
                 });
                 return window::raw_id::<Msg>(id).map(Msg::Keyed);
             }
             Msg::Keyed(hwnd) => {
                 if let Some(m) = &mut self.morph {
-                    update_window::color_key(hwnd, true);
+                    // The intro's window is still hidden: it opens fully transparent over the
+                    // watcher's update window, draws the same card, and only then shows.
+                    let intro = m.anim.is_none();
+                    update_window::color_key(hwnd, true, if intro { 0 } else { 255 });
                     m.hwnd = Some(hwnd);
-                    // The intro's window is still hidden: show it as the update window, then grow.
-                    if m.anim.is_none() && let Some(id) = self.window {
+                    if intro && let Some(id) = self.window {
+                        m.shown = Some((tacho::frames(), Instant::now()));
                         return Task::batch([
                             window::set_mode(id, window::Mode::Windowed),
-                            Task::perform(async { std::thread::sleep(Duration::from_millis(60)) }, |_| Msg::IntroStart),
+                            Task::perform(async { std::thread::sleep(Duration::from_millis(40)) }, |_| Msg::IntroStart),
                         ]);
                     }
                 }
             }
             Msg::IntroStart => {
-                update_window::signal_ui_shown(&self.runtime_root);
+                // Two drawn frames: the card is on screen, if still transparent. A start too slow
+                // to draw shows anyway after 1.5 s rather than keep the watcher waiting.
+                if let Some((frames, since)) = self.morph.as_ref().and_then(|m| m.shown)
+                    && tacho::frames() < frames + 2
+                    && since.elapsed() < Duration::from_millis(1500)
+                {
+                    return Task::perform(async { std::thread::sleep(Duration::from_millis(30)) }, |_| Msg::IntroStart);
+                }
                 let size = Self::window_size();
                 let card = iced::Rectangle {
                     x: (size.width - view::UPDATE_CARD.width) / 2.0,
@@ -4039,8 +4054,14 @@ impl App {
                 };
                 let from = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Launching, "", env!("CARGO_PKG_VERSION")), view::UPDATE_CARD);
                 let to = self.window_mosaic(size);
+                // Visible now, over the watcher's identical card; then the watcher may close.
+                if let Some(hwnd) = self.morph.as_ref().and_then(|m| m.hwnd) {
+                    update_window::color_key(hwnd, true, 255);
+                }
+                update_window::signal_ui_shown(&self.runtime_root);
                 match (&mut self.morph, from, to) {
                     (Some(m), Some(from), Some(to)) => {
+                        m.shown = None;
                         m.anim = Some(tacho::Morph {
                             from,
                             to,
@@ -4080,7 +4101,7 @@ impl App {
                             return self.hand_over(Some(center));
                         }
                         if let Some(hwnd) = m.hwnd {
-                            update_window::color_key(hwnd, false);
+                            update_window::color_key(hwnd, false, 255);
                         }
                         self.morph = None;
                         // The sliders' warm-up sweep plays once the app is fully there.
@@ -4919,8 +4940,13 @@ mod controller_tests {
         app.intro = Some(iced::Point::new(620.0, 420.0));
         let _ = app.update(Msg::Opened(id));
         assert!(matches!(app.morph.as_ref().unwrap().base, MorphBase::Card(tacho::BarStage::Launching)));
+        // Shown transparent: no grow (and no hand-over) before the window has drawn the card.
+        app.morph.as_mut().unwrap().shown = Some((tacho::frames() + 100, Instant::now()));
         let _ = app.update(Msg::IntroStart);
-        assert!(app.morph.as_ref().unwrap().anim.is_some());
+        assert!(app.morph.as_ref().unwrap().anim.is_none(), "waits for its first frames");
+        app.morph.as_mut().unwrap().shown = Some((0, Instant::now() - Duration::from_secs(2)));
+        let _ = app.update(Msg::IntroStart);
+        assert!(app.morph.as_ref().unwrap().anim.is_some(), "a slow start shows anyway");
         let _ = app.update(Msg::MorphStep(MorphStep::HideBase));
         let _ = app.update(Msg::MorphStep(MorphStep::ShowRoot));
         let _ = app.update(Msg::MorphStep(MorphStep::Done));

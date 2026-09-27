@@ -1548,6 +1548,12 @@ impl MorphState {
         first
     }
 }
+/// Frames drawn by the window (the morph layer is always in it): the update intro waits for
+/// the card to be drawn before its window becomes visible.
+static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn frames() -> u64 {
+    FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub fn morph<'a, Message: Clone + 'a>(morph: Option<&Morph<Message>>) -> Element<'a, Message> {
     Element::new(MorphWidget { morph: morph.cloned() })
 }
@@ -1593,6 +1599,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
         }
     }
     fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(m) = &self.morph else { return };
         let b = layout.bounds();
         let ms = Instant::now().saturating_duration_since(m.start).as_secs_f32() * 1000.0;
