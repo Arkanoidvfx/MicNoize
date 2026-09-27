@@ -1206,16 +1206,17 @@ void Engine::soundSeek(unsigned id,unsigned frame) {
 }
 void Engine::tagLoop(Config c) {
     Event captureEvent;
-    TagClient tag;
     Stream input; input.open(c.input,true,captureEvent.h,c.periodMs);
+    TagClient tag;
     ComPtr<IAudioCaptureClient> capture;
     check(input.client->GetService(IID_PPV_ARGS(&capture)),"TAG microphone capture client");
     std::vector<float> mono(input.capacity+block);
-    std::array<float,16384> output{};
-    std::array<RoutedSample,16384> routed{};
-    std::array<uint8_t,16384> sources{};
-    std::array<uint8_t,16384> modified{};
-    std::array<float,16384> microphone{},effectOnly{},sound{},echoMic{},echoDiscord{},echoOnly{};
+    // Allocate once before rendering: these buffers exceed the audio thread's stack budget.
+    constexpr unsigned capacity=16384;
+    std::vector<float> output(capacity);
+    std::vector<RoutedSample> routed(capacity);
+    std::vector<uint8_t> sources(capacity),modified(capacity);
+    std::vector<float> microphone(capacity),effectOnly(capacity),sound(capacity),echoMic(capacity),echoDiscord(capacity),echoOnly(capacity);
     HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     if(!timer) throw std::runtime_error("TAG high-resolution timer creation failed");
     struct Timer {HANDLE h; ~Timer(){CancelWaitableTimer(h);CloseHandle(h);}} closeTimer{timer};

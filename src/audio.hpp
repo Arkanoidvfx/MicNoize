@@ -262,6 +262,7 @@ inline RoutedSample previewQueued(float effectOnly,uint8_t modified,unsigned sam
     return {previewSample(sample,mask,epoch,audible)+(clip&&audible?sound:0),0,static_cast<uint8_t>(modified|(clip?ModifiedSound|(recording?ModifiedEffects:0):0)),epoch};
 }
 class Engine {
+    friend void checkTagStack();
     friend void checkDiscordCapture(unsigned seconds);
     friend class Monitor;
     HANDLE stop_ = nullptr, data_ = nullptr, ready_ = nullptr;

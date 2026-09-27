@@ -232,7 +232,7 @@ FAISS в установленном VCClient использует `torch/lib/lib
 ```powershell
 .\verify.ps1                                  # пересборка проверок, CTest, Rust-тесты, Clippy
 .\bin\effects_check.exe                       # DSP: bypass, эффекты, фразы, реверс, повтор, RVC playout
-.\bin\bridge_check.exe                        # C ABI, ошибки, контролы, dry bypass RVC
+.\bin\bridge_check.exe                        # C ABI, ошибки, контролы, стек TAG, dry bypass RVC
 .\bin\mic_check.exe --self-test               # очереди, дрейф, часы TAG
 .\bin\MicNoize.exe --ui-benchmark --ui-snapshot "$PWD\results\ui.png"
 ```

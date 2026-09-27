@@ -7,7 +7,31 @@
 #include <cmath>
 #include <numbers>
 static void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
+namespace mic {
+void checkTagStack() {
+    // Leave 64 KiB of the shipped 1 MiB stack for callers/Windows audio APIs.
+    // No microphone or host is opened; mic_check has a larger test stack.
+    auto engine=std::make_unique<Engine>();
+    HANDLE thread=CreateThread(nullptr,960*1024,[](void* context)->DWORD {
+        const HRESULT initialized=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+        if(FAILED(initialized))return 1;
+        DWORD result=1;
+        try {
+            Config c;c.input=L"MicNoize-stack-check-invalid-endpoint";
+            static_cast<Engine*>(context)->tagLoop(c);
+        } catch(const std::exception& error) {
+            result=std::strstr(error.what(),"Selected endpoint disconnected")?0:1;
+        }
+        CoUninitialize();return result;
+    },engine.get(),STACK_SIZE_PARAM_IS_A_RESERVATION,nullptr);
+    require(thread!=nullptr,"Create TAG stack check thread");
+    WaitForSingleObject(thread,INFINITE);
+    DWORD result=1;GetExitCodeThread(thread,&result);CloseHandle(thread);
+    require(result==0,"TAG startup did not reject the invalid endpoint normally");
+}
+}
 int main(){try{
+    mic::checkTagStack();
     mic::checkRvcIdle();
     static_assert(sizeof(MnrSnapshot)==64);
     char error[4096]{};Mnr* p=mnr_create(error,sizeof(error));require(p!=nullptr,error);
