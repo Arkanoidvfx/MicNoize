@@ -43,6 +43,11 @@ fn apply_effect_defaults(settings: &mut Settings) {
     }
     settings.set("effects", "defaults_version", EFFECT_DEFAULTS_VERSION);
 }
+/// The effects page's two groups, by effect row: what sounds while the key is held (boost,
+/// formant shift, echo, granular, autotune), and what records a piece and plays it back
+/// (slow, fast, reverse, stutter). One group at a time keeps the page and the monitor below it
+/// on screen without scrolling.
+const EFFECT_GROUPS: [&[usize]; 2] = [&[0, 1, 5, 7, 8], &[2, 3, 4, 6]];
 /// settings.ini section of tuned strengths: microphone id = percent.
 const PROFILES: &str = "noise_profiles";
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -341,6 +346,8 @@ mod focus {
         pub const NEW_MIC_BIND_BASE: usize = 60;
         pub const NEW_DISCORD_BIND_BASE: usize = 64;
         pub const DETAIL_BASE: usize = 120;
+        /// The effects page's group switch: `GROUP_BASE + group`.
+        pub const GROUP_BASE: usize = 150;
         pub const OPTION_BASE: usize = 130;
         pub const MONITOR: usize = 9;
         pub const MONITOR_BIND: usize = 23;
@@ -550,6 +557,8 @@ enum Msg {
     Pitch(f32),
     EffectOption(usize, f32),
     EffectDetails(usize),
+    /// The effects page shows one group: 0 «Голос вживую», 1 «Фразы и повторы».
+    EffectsGroup(usize),
     Slow(f32),
     Fast(f32),
     Rvc(bool),
@@ -848,7 +857,7 @@ struct App {
     tune: Option<tune::Tune>,
     /// «by ARKANOID» hovered since, and the window's picture its glitch slices.
     glitch: Option<Instant>,
-    glitch_mosaic: Option<Arc<tacho::Mosaic>>,
+    glitch_mosaic: Option<(Instant, iced::Size, Arc<tacho::Mosaic>)>,
     tune_profile_before: Option<String>,
     core_present: bool,
     /// This GPU's denoiser models are on disk, or it has none to download.
@@ -885,6 +894,8 @@ struct App {
     keys: [u32; 21],
     effect_activity: u32,
     effect_details: Option<usize>,
+    /// Which [`EFFECT_GROUPS`] the effects page shows.
+    effects_group: usize,
     discord_state: i32,
     discord_source: bool,
     discord_message: String,
@@ -1154,6 +1165,7 @@ impl App {
         let graphs = settings.number("audio", "cuda_graphs", -1, -1, 1);
         let hint_shown = settings.get("ui", "tray_hint") == Some("1");
         let pixel_shift = settings.number("ui", "page_pixelate", 1, 0, 1) != 0;
+        let effects_group = settings.number("ui", "effects_group", 0, 0, 1) as usize;
         let slider_idle = settings.number("ui", "slider_idle", 1, 0, 1) != 0;
         // On by default: a fresh install starts with Windows until the user unticks it.
         let app_autostart = settings.number("ui", "app_autostart", 1, 0, 1) != 0;
@@ -1366,6 +1378,7 @@ impl App {
                 keys,
                 effect_activity: 0,
                 effect_details: None,
+                effects_group,
                 phrase_state: 0,
                 discord_state: 0,
                 discord_source: false,
@@ -1569,6 +1582,7 @@ impl App {
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
         self.settings.set("ui", "app_autostart", self.app_autostart as i32);
         self.settings.set("ui", "page_pixelate", self.pixel_shift as i32);
+        self.settings.set("ui", "effects_group", self.effects_group);
         self.settings.set("ui", "slider_idle", self.slider_idle as i32);
         self.settings.set("ui", "tag_autostart", self.autostart as i32);
         if let Some(folder) = &self.sound_folder {
@@ -2193,7 +2207,7 @@ impl App {
                 }
                 // A window left in the background gets no «pointer left» from the signature.
                 if self.glitch.is_some() && !self.ui_active() {
-                    (self.glitch, self.glitch_mosaic) = (None, None);
+                    self.glitch = None;
                 }
                 if self.ready_preview.is_some_and(|since| since.elapsed() > Duration::from_secs(8)) {
                     self.ready_preview = None;
@@ -3088,6 +3102,14 @@ impl App {
                 self.controls.effects.set(i, v.round() as i32);
                 self.focus = focus::effects::OPTION_BASE + i;
                 self.changed();
+            }
+            Msg::EffectsGroup(group) => {
+                if group < EFFECT_GROUPS.len() {
+                    self.effects_group = group;
+                    self.effect_details = self.effect_details.filter(|i| EFFECT_GROUPS[group].contains(i));
+                    self.focus = focus::effects::GROUP_BASE + group;
+                    self.dirty = Some(Instant::now());
+                }
             }
             Msg::EffectDetails(i) => {
                 self.effect_details = if self.effect_details == Some(i) { None } else { Some(i) };
@@ -4315,10 +4337,16 @@ impl App {
             Msg::ReadyPreviewEnd => self.ready_preview = None,
             Msg::SignatureHover(on) => {
                 if on && self.morph.is_none() {
-                    self.glitch_mosaic = self.window_mosaic(Self::window_size());
+                    // The picture the glitch slices, at the window's real size. A quick return
+                    // to the signature reuses the last one instead of painting it again.
+                    let size = tacho::window_area().unwrap_or(Self::window_size());
+                    let fresh = self.glitch_mosaic.as_ref().is_some_and(|(at, taken, _)| at.elapsed() < Duration::from_secs(3) && *taken == size);
+                    if !fresh {
+                        self.glitch_mosaic = self.window_mosaic(size).map(|m| (Instant::now(), size, m));
+                    }
                     self.glitch = Some(Instant::now());
                 } else {
-                    (self.glitch, self.glitch_mosaic) = (None, None);
+                    self.glitch = None;
                 }
             }
             Msg::TuneStart => {
@@ -4555,33 +4583,19 @@ impl App {
             } else if self.effects_page {
                 use focus::effects::*;
                 let discord = |effect| DISCORD_BIND_BASE + effect;
-                let mut items = vec![
-                    OVERLOAD,
-                    BOOST,
-                    BOOST_BIND,
-                    discord(0),
-                    DETAIL_BASE + 1,
-                    PITCH,
-                    PITCH_BIND,
-                    discord(1),
-                ];
-                if self.effect_details == Some(1) { items.push(OPTION_BASE + 12); }
-                items.extend([
-                    SLOW,
-                    SLOW_BIND,
-                    discord(2),
-                    FAST,
-                    FAST_BIND,
-                    discord(3),
-                    REVERSE_WORD,
-                    REVERSE_BIND,
-                    discord(4),
-                ]);
-                for (row, primary) in [(5, 0), (6, 4), (7, 5), (8, 10)] {
-                    items.extend([DETAIL_BASE + row, OPTION_BASE + primary,
-                        NEW_MIC_BIND_BASE + row - 5, NEW_DISCORD_BIND_BASE + row - 5]);
+                // The group switch, then only the rows of the shown group.
+                let mut items = vec![GROUP_BASE, GROUP_BASE + 1];
+                for &row in EFFECT_GROUPS[self.effects_group] {
+                    items.extend(match row {
+                        0 => vec![OVERLOAD, BOOST, BOOST_BIND, discord(0)],
+                        1 => vec![DETAIL_BASE + 1, PITCH, PITCH_BIND, discord(1)],
+                        2 => vec![SLOW, SLOW_BIND, discord(2)],
+                        3 => vec![FAST, FAST_BIND, discord(3)],
+                        4 => vec![REVERSE_WORD, REVERSE_BIND, discord(4)],
+                        _ => vec![DETAIL_BASE + row, OPTION_BASE + [0, 4, 5, 10][row - 5], NEW_MIC_BIND_BASE + row - 5, NEW_DISCORD_BIND_BASE + row - 5],
+                    });
                     if self.effect_details == Some(row) {
-                        let options: &[usize] = match row { 5=>&[1,2,3],7=>&[6,7],8=>&[8,9,11],_=>&[] };
+                        let options: &[usize] = match row { 1=>&[12],5=>&[1,2,3],7=>&[6,7],8=>&[8,9,11],_=>&[] };
                         items.extend(options.iter().map(|&i| OPTION_BASE + i));
                     }
                 }
@@ -4985,6 +4999,9 @@ impl App {
                     Msg::Bind(5 + f - DISCORD_BIND_BASE)
                 }
                 OVERLOAD if activate => Msg::Overload(!self.controls.overload),
+                g if (activate || delta != 0) && (GROUP_BASE..GROUP_BASE + EFFECT_GROUPS.len()).contains(&g) => {
+                    Msg::EffectsGroup(if activate { g - GROUP_BASE } else { (g - GROUP_BASE + 1) % EFFECT_GROUPS.len() })
+                }
                 DISCORD_VOLUME if delta != 0 => Msg::DiscordVolume(
                     discord_volume_percent(self.controls.discord_volume) + delta as f32,
                 ),
@@ -6276,13 +6293,26 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
         assert!(!app.headphone_page && !app.effects_page);
         let _ = app.update(Msg::Page(6));
-        for expected in [21, 2] {
+        // The group switch first, then «Голос вживую»: boost, formant shift, echo, granular, autotune.
+        for expected in [focus::effects::GROUP_BASE, focus::effects::GROUP_BASE + 1, 21, 2] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }
-        app.focus = 20;
+        app.focus = 17;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, focus::effects::DETAIL_BASE + 5);
+        assert_eq!(app.focus, focus::effects::DETAIL_BASE + 5, "the phrase rows are not in the live group");
+        // «Фразы и повторы» swaps the rows: slow, fast, reverse, stutter.
+        app.focus = focus::effects::GROUP_BASE + 1;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!(app.effects_group, 1);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, 10, "slow comes right after the switch");
+        app.effect_details = Some(5);
+        let _ = app.update(Msg::EffectsGroup(0));
+        assert_eq!((app.effects_group, app.effect_details), (0, Some(5)), "an open panel of the shown group stays");
+        let _ = app.update(Msg::EffectsGroup(1));
+        assert_eq!(app.effect_details, None, "a panel of the hidden group closes");
+        let _ = app.update(Msg::EffectsGroup(0));
         app.focus = focus::effects::NEW_DISCORD_BIND_BASE + 3;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 9);
@@ -6412,6 +6442,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.keys[3], 122);
         let _ = app.update(Msg::Page(6));
+        let _ = app.update(Msg::EffectsGroup(1));
         app.focus = 13;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 19);
@@ -6453,7 +6484,8 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert!((app.controls.slow - 0.70).abs() < 0.0001);
         app.details = false;
         app.controls.overload = false;
-        app.focus = 37;
+        let _ = app.update(Msg::EffectsGroup(0));
+        app.focus = focus::effects::GROUP_BASE + 1;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 21);
         let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);

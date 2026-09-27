@@ -527,7 +527,7 @@ impl App {
         };
         // The ready card's tag and confetti fly over the whole window, under a running morph.
         let celebrate = tacho::celebrate(self.ready_fx.filter(|_| self.morph.is_none()));
-        let glitch = tacho::glitch(self.glitch.filter(|_| self.morph.is_none()), self.glitch_mosaic.clone());
+        let glitch = tacho::glitch(self.glitch.filter(|_| self.morph.is_none()), self.glitch_mosaic.as_ref().map(|(_, _, m)| m.clone()));
         widget::stack![base, glitch, celebrate, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
     }
 
@@ -542,7 +542,7 @@ impl App {
                         logo,
                         bold("MicNoize", 15, INK),
                         // 40 % smaller than before and 75 % transparent: there, not loud.
-                        numbers(env!("CARGO_PKG_VERSION"), 8, Color { a: 0.25, ..INK }),
+                        numbers(env!("CARGO_PKG_VERSION"), 9, Color { a: 0.25, ..INK }),
                         Space::new().width(Length::Fill),
                         tacho::signature(Msg::SignatureHover),
                     ]
@@ -1539,7 +1539,7 @@ impl App {
         )
         .padding([0, 13]);
         let mut rows = column![head].spacing(6);
-        for i in 0..9 {
+        for &i in EFFECT_GROUPS[self.effects_group] {
             let activity = match i { 1 => Some((1u32 << 1, 1u32 << 6)), 5..=8 => Some((1u32 << (i + 5), 1u32 << (i + 9))), _ => None };
             let (name, glyph, sub, control, bind_focus, active): (&str, &str, Element<'_, Msg>, Element<'_, Msg>, usize, bool) = match i {
                 0 => (
@@ -1792,7 +1792,64 @@ impl App {
             row![column![hear, discord].spacing(14).width(Length::FillPortion(100)), replay].spacing(24),
         )
         .padding([13, 16]);
-        column![title("Эффекты"), rows, bottom].spacing(14).into()
+        column![row![title("Эффекты"), Space::new().width(Length::Fill), self.effect_groups()].align_y(iced::Center), rows, bottom].spacing(14).into()
+    }
+
+    /// Whether effect row `i` is sounding now (from either source).
+    fn effect_live(&self, i: usize) -> bool {
+        match i {
+            0 => self.snapshot.boost_active != 0,
+            1 => self.effect_activity & ((1 << 1) | (1 << 6)) != 0,
+            2 => (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 1,
+            3 => (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 0,
+            4 => self.phrase_state >= 9,
+            // Echo, stutter, granular, autotune: bits i + 5 (microphone) and i + 9 (Discord).
+            _ => self.effect_activity & ((1 << (i + 5)) | (1 << (i + 9))) != 0,
+        }
+    }
+
+    /// The effects page's group switch, in the title row. A group whose effect is sounding while
+    /// the other is shown lights up, so a hotkey never goes unseen.
+    fn effect_groups(&self) -> Element<'_, Msg> {
+        use focus::effects::GROUP_BASE;
+        let mut switch = row![].spacing(2);
+        for (group, name) in ["Голос вживую", "Фразы и повторы"].into_iter().enumerate() {
+            let chosen = self.effects_group == group;
+            let live = EFFECT_GROUPS[group].iter().any(|&i| self.effect_live(i));
+            let focused = self.focus == GROUP_BASE + group;
+            let count = numbers(EFFECT_GROUPS[group].len().to_string(), 11, if chosen { ORANGE } else { FAINT });
+            let dot = container(Space::new().width(6).height(6)).style(move |_| container::Style {
+                background: Some((if live { ORANGE } else { Color::TRANSPARENT }).into()),
+                border: Border { radius: 3.0.into(), ..Border::default() },
+                ..Default::default()
+            });
+            switch = switch.push(
+                button(focus_target(row![dot, label(name, 13, if chosen { INK } else { DIM }), count].spacing(7).align_y(iced::Center), focused))
+                    .padding([6, 12])
+                    .on_press(Msg::EffectsGroup(group))
+                    .style(move |_, status| {
+                        let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                        button::Style {
+                            background: Some((if chosen { HOVER } else if live { LIVE_BG } else if hover { CARD2 } else { Color::TRANSPARENT }).into()),
+                            text_color: INK,
+                            border: Border {
+                                color: if focused { ORANGE } else if live && !chosen { Color { a: 0.5, ..ORANGE } } else { Color::TRANSPARENT },
+                                width: if focused { 2.0 } else { 1.0 },
+                                radius: 7.0.into(),
+                            },
+                            ..Default::default()
+                        }
+                    }),
+            );
+        }
+        container(switch)
+            .padding(3)
+            .style(|_| container::Style {
+                background: Some(CARD.into()),
+                border: Border { color: LINE, width: 1.0, radius: 10.0.into() },
+                ..Default::default()
+            })
+            .into()
     }
 
     fn effect_detail(&self, row: usize) -> Element<'_, Msg> {
@@ -3418,6 +3475,60 @@ mod tests {
             encoder.write_header().unwrap().write_image_data(&data).unwrap();
         }
     }
+    /// «by ARKANOID» hovered: the glitch must cost next to nothing between its patterns and
+    /// repaint only its pieces when the pattern changes.
+    #[test]
+    #[ignore]
+    fn glitch_frames() {
+        use iced::advanced::{Renderer as _, Layout, graphics::{Viewport, damage}};
+        let (w, h) = (1040.0_f32, 740.0_f32);
+        let size = Size::new(w as u32, h as u32);
+        let full = iced::Rectangle::with_size(Size::new(w, h));
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(window::Id::unique());
+        let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+        let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+        let mut tree = iced::advanced::widget::Tree::empty();
+        let mut previous: Vec<iced_tiny_skia::Layer> = Vec::new();
+        let mut frame = |app: &App| {
+            let mut element = app.view(window::Id::unique());
+            tree.diff(element.as_widget());
+            let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h)));
+            let start = Instant::now();
+            renderer.reset(full);
+            element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+            let changes = damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full);
+            previous = renderer.layers().to_vec();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, BG);
+            let area: f32 = changes.iter().map(|r| r.width * r.height).sum();
+            (area / (w * h), start.elapsed().as_secs_f64() * 1000.0)
+        };
+        let _ = frame(&app);
+        let _ = frame(&app);
+        let started = Instant::now();
+        app.glitch_mosaic = app.window_mosaic(App::window_size()).map(|m| (Instant::now(), App::window_size(), m));
+        eprintln!("window picture: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        let start = Instant::now() - Duration::from_millis(300);
+        app.glitch = Some(start);
+        let (area, took) = frame(&app);
+        eprintln!("pattern change: {:.0} % of the window, {took:.1} ms", area * 100.0);
+        let (same, took) = frame(&app);
+        eprintln!("same pattern: {:.0} % of the window, {took:.1} ms", same * 100.0);
+        let mut worst = (0.0_f32, 0.0_f64);
+        for tick in 1..10 {
+            app.glitch = Some(Instant::now() - Duration::from_millis(300 + 70 * tick));
+            let (a, t) = frame(&app);
+            eprintln!("  pattern {tick}: {:.0} %, {t:.1} ms", a * 100.0);
+            worst = (worst.0.max(a), worst.1.max(t));
+        }
+        eprintln!("next patterns, worst: {:.0} % of the window, {:.1} ms", worst.0 * 100.0, worst.1);
+        assert!(same < 0.01, "between patterns nothing repaints");
+        assert!(area < 0.8, "a new pattern repaints its pieces, not the whole window");
+        app.glitch = None;
+        let (gone, _) = frame(&app);
+        assert!(gone > 0.0, "leaving repaints the last pattern away");
+    }
     #[test]
     #[ignore]
     fn design_snapshots() {
@@ -3483,7 +3594,7 @@ mod tests {
             // «by ARKANOID» hovered: the window glitches.
             let page = app.headphone_page;
             app.headphone_page = false;
-            app.glitch_mosaic = app.window_mosaic(App::window_size());
+            app.glitch_mosaic = app.window_mosaic(App::window_size()).map(|m| (Instant::now(), App::window_size(), m));
             app.glitch = Some(Instant::now() - Duration::from_millis(420));
             render(&app, "glitch");
             (app.glitch, app.glitch_mosaic, app.headphone_page) = (None, None, page);
@@ -3599,6 +3710,9 @@ mod tests {
             key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
         }).collect();
         render(&app, "effects");
+        app.effects_group = 1;
+        render(&app, "effects-phrases");
+        app.effects_group = 0;
         app.effect_details = Some(5);
         window.set((960.0, 680.0));
         render(&app, "effects-min-echo-details");

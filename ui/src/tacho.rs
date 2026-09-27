@@ -1940,6 +1940,11 @@ impl<Message> Widget<Message, Theme, Renderer> for TuneCurve {
 /// While the pointer rests on «by ARKANOID» the whole window glitches: bands of its own picture
 /// (a mosaic painted when the hover began) slip sideways with colour fringes, and stray blocks
 /// and scanlines flicker. A new pattern every 70 ms; nothing is drawn otherwise.
+///
+/// Cheap by construction: each band, block and scanline is its own cached piece of geometry,
+/// rebuilt only when the pattern changes. Between changes nothing is repainted, and a change
+/// repaints only the pieces' own rectangles, never the whole window (a full-window layer redrawn
+/// at every frame of the signature's glow is what made the first version lag).
 pub fn glitch<'a, Message: 'a>(start: Option<Instant>, mosaic: Option<std::sync::Arc<Mosaic>>) -> Element<'a, Message> {
     Element::new(Glitch { start, mosaic })
 }
@@ -1947,9 +1952,96 @@ struct Glitch {
     start: Option<Instant>,
     mosaic: Option<std::sync::Arc<Mosaic>>,
 }
+/// The pieces on screen, each with the epoch it was built for.
+#[derive(Default)]
+struct GlitchState(RefCell<Vec<(u32, Cache)>>);
 const GLITCH_TICK: Duration = Duration::from_millis(70);
 const GLITCH_CYAN: Color = Color::from_rgb8(0x56, 0xE0, 0xFF);
+/// The window's size as last drawn (the glitch layer always spans it), for the picture the
+/// glitch slices: painted at another size, its bands would not line up with the window.
+static WINDOW_AREA: std::sync::Mutex<Option<Size>> = std::sync::Mutex::new(None);
+pub fn window_area() -> Option<Size> {
+    WINDOW_AREA.lock().ok().and_then(|area| *area)
+}
+fn glitch_tick(start: Instant, now: Instant) -> u32 {
+    (now.saturating_duration_since(start).as_millis() / GLITCH_TICK.as_millis()) as u32 + 1
+}
+/// Pieces of the glitch: full-width bands of the window's picture, stray blocks, scanlines.
+const GLITCH_BANDS: u32 = 6;
+const GLITCH_BLOCKS: u32 = 14;
+const GLITCH_PIECES: u32 = GLITCH_BANDS + GLITCH_BLOCKS + 2;
+/// Each piece keeps its look for 2 to 5 patterns, staggered: a new pattern changes only a few
+/// pieces, so it repaints a few strips and blocks, never most of the window.
+fn glitch_epoch(piece: u32, tick: u32) -> u32 {
+    let life = 2 + piece % 4;
+    (tick + piece * 3) / life
+}
+/// Piece `k` in its `epoch` over `b`: its rectangle and shapes (none while it rests).
+fn glitch_piece(b: Rectangle, m: &Mosaic, k: u32, epoch: u32) -> (Rectangle, Vec<Shape>) {
+    let rnd = |j: u32| grain(k * 97 + j, epoch);
+    let (cell, row_h) = (b.width / m.width as f32, b.height / m.height as f32);
+    let rgb = |c: [u8; 3]| Color::from_rgb8(c[0], c[1], c[2]);
+    let mut shapes = Vec::new();
+    if k < GLITCH_BANDS {
+        // A band of the window slipping sideways, sometimes with red/cyan fringes.
+        let y0 = b.y + rnd(1) * (b.height - 4.0);
+        let h = (3.0 + rnd(2) * 17.0).min(b.y + b.height - y0);
+        let rect = Rectangle { x: b.x, y: y0, width: b.width, height: h };
+        if rnd(0) < 0.3 {
+            return (rect, shapes);
+        }
+        let dx = (rnd(3) - 0.5) * 140.0;
+        let close = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 6);
+        let r0 = (((y0 - b.y) / row_h) as usize).min(m.height);
+        let r1 = (((y0 + h - b.y) / row_h).ceil() as usize).min(m.height);
+        for r in r0..r1 {
+            let y = b.y + r as f32 * row_h;
+            let mut run: Option<(usize, [u8; 3])> = None;
+            for c in 0..=m.width {
+                let color = (c < m.width).then(|| m.cells[r * m.width + c]);
+                match (run, color) {
+                    (Some((_, current)), Some(next)) if close(current, next) => {}
+                    (current, next) => {
+                        if let Some((first, color)) = current {
+                            slant(&mut shapes, b.x + first as f32 * cell + dx, y, (c - first) as f32 * cell + 0.5, row_h + 0.5, 0.0, rgb(color));
+                        }
+                        run = next.map(|n| (c, n));
+                    }
+                }
+            }
+        }
+        if rnd(4) > 0.45 {
+            slant(&mut shapes, b.x + dx - 6.0, y0, b.width, h, 0.0, Color { a: 0.28, ..GLITCH_CYAN });
+            slant(&mut shapes, b.x + dx + 6.0, y0, b.width, h, 0.0, Color { a: 0.22, ..HOT });
+        }
+        (rect, shapes)
+    } else if k < GLITCH_BANDS + GLITCH_BLOCKS {
+        // A stray block: an accent, or a piece of the picture from elsewhere.
+        let side = 5.0 + rnd(1) * 18.0;
+        let h = side * (0.4 + rnd(2));
+        let (x, y) = (b.x + rnd(3) * (b.width - side), b.y + rnd(4) * (b.height - h));
+        let pick = rnd(5);
+        let color = if pick < 0.3 {
+            TAG
+        } else if pick < 0.5 {
+            GLITCH_CYAN
+        } else if pick < 0.6 {
+            INK
+        } else {
+            let (u, v) = (rnd(6), rnd(7));
+            rgb(m.cells[((v * m.height as f32) as usize).min(m.height - 1) * m.width + ((u * m.width as f32) as usize).min(m.width - 1)])
+        };
+        slant(&mut shapes, x, y, side, h, 0.0, Color { a: 0.55 + 0.4 * rnd(8), ..color });
+        (Rectangle { x, y, width: side, height: h }, shapes)
+    } else {
+        let y = b.y + rnd(1) * (b.height - 1.0);
+        slant(&mut shapes, b.x, y, b.width, 1.0, 0.0, Color { a: 0.14, ..INK });
+        (Rectangle { x: b.x, y, width: b.width, height: 1.0 }, shapes)
+    }
+}
 impl<Message> Widget<Message, Theme, Renderer> for Glitch {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<GlitchState>() }
+    fn state(&self) -> tree::State { tree::State::new(GlitchState::default()) }
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fill, height: Length::Fill }
     }
@@ -1957,71 +2049,40 @@ impl<Message> Widget<Message, Theme, Renderer> for Glitch {
         layout::atomic(limits, Length::Fill, Length::Fill)
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
-        if let (Event::Window(window::Event::RedrawRequested(now)), Some(_)) = (event, self.start) {
-            shell.request_redraw_at(RedrawRequest::At(*now + GLITCH_TICK));
+        // One frame per pattern, on the pattern's own clock.
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start) {
+            shell.request_redraw_at(RedrawRequest::At(start + GLITCH_TICK * glitch_tick(start, *now)));
         }
     }
-    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
-        let (Some(start), Some(m)) = (self.start, &self.mosaic) else { return };
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
-        let ms = Instant::now().saturating_duration_since(start).as_millis();
-        let tick = (ms / GLITCH_TICK.as_millis()) as u32 + 1;
-        let ramp = (ms as f32 / 200.0).min(1.0);
-        let rnd = |k: u32| grain(k, tick);
-        let (cell, row_h) = (b.width / m.width as f32, b.height / m.height as f32);
-        let rgb = |c: [u8; 3]| Color::from_rgb8(c[0], c[1], c[2]);
-        let close = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 6);
-        let mut shapes = Vec::new();
-        // Bands of the window slipping sideways, some with red/cyan fringes.
-        for k in 0..(6 + (rnd(1) * 6.0) as u32) {
-            let y0 = b.y + rnd(10 + k * 7) * b.height;
-            let h = 3.0 + rnd(11 + k * 7) * 26.0 * (0.4 + 0.6 * ramp);
-            let dx = (rnd(12 + k * 7) - 0.5) * 140.0 * ramp;
-            let r0 = (((y0 - b.y) / row_h) as usize).min(m.height);
-            let r1 = (((y0 + h - b.y) / row_h).ceil() as usize).min(m.height);
-            for r in r0..r1 {
-                let y = b.y + r as f32 * row_h;
-                let mut run: Option<(usize, [u8; 3])> = None;
-                for c in 0..=m.width {
-                    let color = (c < m.width).then(|| m.cells[r * m.width + c]);
-                    match (run, color) {
-                        (Some((_, current)), Some(next)) if close(current, next) => {}
-                        (current, next) => {
-                            if let Some((first, color)) = current {
-                                slant(&mut shapes, b.x + first as f32 * cell + dx, y, (c - first) as f32 * cell + 0.5, row_h + 0.5, 0.0, rgb(color));
-                            }
-                            run = next.map(|n| (c, n));
-                        }
-                    }
+        if let Ok(mut area) = WINDOW_AREA.lock() {
+            *area = Some(b.size());
+        }
+        let state = tree.state.downcast_ref::<GlitchState>();
+        let mut pieces = state.0.borrow_mut();
+        let (Some(start), Some(m)) = (self.start, &self.mosaic) else {
+            pieces.clear();
+            return;
+        };
+        let tick = glitch_tick(start, Instant::now());
+        // Only the pieces whose epoch moved on are rebuilt; the rest keep their cache.
+        for k in 0..GLITCH_PIECES {
+            let epoch = glitch_epoch(k, tick);
+            let slot = k as usize;
+            if pieces.get(slot).is_none_or(|(built, _)| *built != epoch) {
+                let (rect, shapes) = glitch_piece(b, m, k, epoch);
+                let cache = geometry(rect, &shapes).cache(Group::unique(), None);
+                if slot < pieces.len() {
+                    pieces[slot] = (epoch, cache);
+                } else {
+                    pieces.push((epoch, cache));
                 }
             }
-            if rnd(13 + k * 7) > 0.45 {
-                slant(&mut shapes, b.x + dx - 6.0, y0, b.width, h, 0.0, Color { a: 0.28 * ramp, ..GLITCH_CYAN });
-                slant(&mut shapes, b.x + dx + 6.0, y0, b.width, h, 0.0, Color { a: 0.22 * ramp, ..HOT });
-            }
         }
-        // Stray pixel blocks: accents, or a piece of the picture from elsewhere.
-        for k in 0..18 {
-            let side = 5.0 + rnd(200 + k * 5) * 18.0;
-            let (x, y) = (b.x + rnd(201 + k * 5) * b.width, b.y + rnd(202 + k * 5) * b.height);
-            let pick = rnd(203 + k * 5);
-            let color = if pick < 0.3 {
-                TAG
-            } else if pick < 0.5 {
-                GLITCH_CYAN
-            } else if pick < 0.6 {
-                INK
-            } else {
-                let (u, v) = (rnd(205 + k * 5), rnd(206 + k * 5));
-                rgb(m.cells[((v * m.height as f32) as usize).min(m.height - 1) * m.width + ((u * m.width as f32) as usize).min(m.width - 1)])
-            };
-            let alpha = (0.55 + 0.4 * rnd(204 + k * 5)) * ramp;
-            slant(&mut shapes, x, y, side, side * (0.4 + rnd(207 + k * 5)), 0.0, Color { a: alpha, ..color });
+        for (_, cache) in pieces.iter() {
+            renderer.draw_geometry(Geometry::load(cache));
         }
-        for k in 0..2 {
-            slant(&mut shapes, b.x, b.y + rnd(300 + k) * b.height, b.width, 1.0, 0.0, Color { a: 0.14 * ramp, ..INK });
-        }
-        renderer.with_layer(b, |renderer| renderer.draw_geometry(geometry(b, &shapes)));
     }
 }
 
@@ -2183,7 +2244,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Signature<'_, Message> {
                     shell.request_redraw();
                 }
             }
-            Event::Window(window::Event::RedrawRequested(now)) if state.hover.is_some() => shell.request_redraw_at(frame_after(*now)),
+            // The glow breathes slowly: 30 frames a second are plenty, and each frame is cheap.
+            Event::Window(window::Event::RedrawRequested(now)) if state.hover.is_some() => shell.request_redraw_at(RedrawRequest::At(*now + Duration::from_millis(33))),
             _ => {}
         }
     }
