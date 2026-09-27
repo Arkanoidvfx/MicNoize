@@ -688,9 +688,10 @@ enum Msg {
     MorphStep(MorphStep),
     /// After an update: the hidden window is keyed and shown as the update window; then it grows.
     IntroStart,
-    /// Settings' «Карточка обновления»: shows the ready card and its celebration for 8 s.
+    /// Settings' «Карточка обновления»: shows the ready card and its celebration for 8 s; its
+    /// «Перезапустить» plays the restart's fall and air, then the card goes, nothing restarts.
     ReadyPreview,
-    ReadyPreviewEnd,
+    ReadyPreviewPlay,
     /// Шумодав's «Подбор под микрофон»: start or stop the tune, undo its result, listen to
     /// yourself (the full-voice monitor).
     /// The pointer came onto (true) or left «by ARKANOID»: the window glitches meanwhile.
@@ -853,6 +854,9 @@ struct App {
     ready_mosaic: Option<Arc<tacho::Mosaic>>,
     ready_fx_due: bool,
     ready_preview: Option<Instant>,
+    /// «Перезапустить» clicked: the button falls out of the card and air rushes into the hole
+    /// until the window morphs; cleared when the restart does not happen after all.
+    restart: Option<tacho::Restart>,
     /// The running or last finished strength tune, and the microphone's saved strength before it.
     tune: Option<tune::Tune>,
     /// «by ARKANOID» hovered since, and the window's picture its glitch slices.
@@ -1346,6 +1350,7 @@ impl App {
                 ready_mosaic: None,
                 ready_fx_due: false,
                 ready_preview: None,
+                restart: None,
                 tune: None,
                 glitch: None,
                 glitch_mosaic: None,
@@ -2209,8 +2214,23 @@ impl App {
                 if self.glitch.is_some() && !self.ui_active() {
                     self.glitch = None;
                 }
-                if self.ready_preview.is_some_and(|since| since.elapsed() > Duration::from_secs(8)) {
-                    self.ready_preview = None;
+                // A played celebration leaves no empty layers behind.
+                if self.ready_fx.is_some_and(|start| start.elapsed().as_secs_f32() * 1000.0 > tacho::ready::END) {
+                    (self.ready_fx, self.ready_mosaic) = (None, None);
+                }
+                if let Some(since) = self.ready_preview {
+                    // The preview's restart only plays: its steps pass by time, then the card goes.
+                    match &mut self.restart {
+                        Some(restart) => {
+                            let played = restart.start.elapsed();
+                            restart.advance(u8::from(played > Duration::from_millis(1400)) + u8::from(played > Duration::from_millis(2600)), Instant::now());
+                            if played > Duration::from_millis(3800) {
+                                (self.ready_preview, self.restart) = (None, None);
+                            }
+                        }
+                        None if since.elapsed() > Duration::from_secs(8) => self.ready_preview = None,
+                        None => {}
+                    }
                 }
                 let status = components::status();
                 if self.rvc_runtime_installing
@@ -2744,17 +2764,26 @@ impl App {
                 if apply && !self.quitting && !self.driver_installing && !self.core_installing {
                     self.apply_pending=true;self.update_checking=true;
                     self.update_status="Проверяем и сохраняем комплект для отката…".into();
+                    if let Some(restart)=&mut self.restart {restart.advance(1,Instant::now());}
                     return Task::perform(async{updater::prepare()},Msg::UpdatePrepared);
                 }
+                self.restart=None;
             }
             Msg::UpdatePrepared(result) => {
                 self.apply_pending=false;self.update_checking=false;
                 match result {
                     Ok(()) if !self.quitting && !self.driver_installing && !self.core_installing => {
-                        self.apply_after_quit=true;return self.update(Msg::Quit);
+                        self.apply_after_quit=true;
+                        if let Some(restart)=&mut self.restart {restart.advance(2,Instant::now());}
+                        // A quick check and copy still let the button fall and the air blow in.
+                        let wait=self.restart.map_or(Duration::ZERO,|r|tacho::restart::HOLD.saturating_sub(r.start.elapsed()));
+                        if !wait.is_zero() && !cfg!(test) {
+                            return Task::perform(async move{std::thread::sleep(wait)},|_|Msg::Quit);
+                        }
+                        return self.update(Msg::Quit);
                     }
-                    Err(error)=>{self.update_status=format!("Подготовка обновления: {error}");}
-                    _=>{}
+                    Err(error)=>{self.restart=None;self.update_status=format!("Подготовка обновления: {error}");}
+                    _=>{self.restart=None;}
                 }
             }
             Msg::UpdateApplied(result) => {
@@ -2762,7 +2791,7 @@ impl App {
                     update_window::color_key(hwnd,false,255);
                 }
                 if let Err(error)=result {
-                    self.quitting=false;self.busy=false;self.apply_after_quit=false;
+                    self.quitting=false;self.busy=false;self.apply_after_quit=false;self.restart=None;
                     self.engine.resume_after_failed_update();
                     self.snapshot.state=0;self.headphone_state=0;self.headphone_busy=false;
                     self.update_status=format!("Обновление не применено: {error}");self.message=self.update_status.clone();
@@ -2776,6 +2805,8 @@ impl App {
                     self.update_checking = true;
                     self.apply_pending = true;
                     self.update_status = "Проверяем последнюю версию…".into();
+                    self.restart = Some(tacho::Restart::new(Instant::now(), tacho::Fall::random()));
+                    self.ready_fx = None;
                     return Task::perform(
                         async { updater::check_and_download() },
                         Msg::UpdateChecked,
@@ -4334,7 +4365,12 @@ impl App {
                 self.ready_preview = Some(Instant::now());
                 self.start_ready_fx();
             }
-            Msg::ReadyPreviewEnd => self.ready_preview = None,
+            Msg::ReadyPreviewPlay => {
+                if self.restart.is_none() {
+                    self.restart = Some(tacho::Restart::new(Instant::now(), tacho::Fall::random()));
+                    self.ready_fx = None;
+                }
+            }
             Msg::SignatureHover(on) => {
                 if on && self.morph.is_none() {
                     // The picture the glitch slices, at the window's real size. A quick return
@@ -5749,6 +5785,7 @@ page_pixelate=0")).unwrap().unwrap();
         assert!(app.update_checking, "a second press while checking is ignored");
         let _ = app.update(Msg::UpdateChecked(updater::Status::Current));
         assert!(!app.apply_pending && !app.apply_after_quit && !app.update_ready);
+        assert!(app.restart.is_none(), "no restart: the button comes back");
         // Enter re-checks first, then applies what that check downloaded: the newest release.
         app.update_ready = true;
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
@@ -5777,10 +5814,26 @@ page_pixelate=0")).unwrap().unwrap();
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         app.update_ready = true;
         let _ = app.update(Msg::ApplyUpdate);
+        assert_eq!(app.restart.map(|r| r.step), Some(0), "the button falls out at the click");
         let _ = app.update(Msg::UpdateChecked(updater::Status::Unavailable("offline".into())));
         assert!(!app.quitting && app.apply_pending);
+        assert_eq!(app.restart.map(|r| r.step), Some(1));
         let _ = app.update(Msg::UpdatePrepared(Ok(())));
         assert!(app.apply_after_quit);
+        assert_eq!(app.restart.map(|r| r.step), Some(2));
+    }
+    #[test]
+    fn ready_preview_plays_the_restart_without_restarting() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let _ = app.update(Msg::ReadyPreview);
+        let _ = app.update(Msg::ReadyPreviewPlay);
+        assert!(app.restart.is_some() && !app.update_checking && !app.apply_pending);
+        app.restart.as_mut().unwrap().start = Instant::now() - Duration::from_millis(2000);
+        let _ = app.update(Msg::Tick);
+        assert_eq!(app.restart.map(|r| r.step), Some(1), "the preview's steps pass by time");
+        app.restart.as_mut().unwrap().start = Instant::now() - Duration::from_millis(4000);
+        let _ = app.update(Msg::Tick);
+        assert!(app.restart.is_none() && app.ready_preview.is_none() && !app.quitting && !app.apply_after_quit);
     }
     #[test]
     fn failed_update_preparation_keeps_processing_intent() {
@@ -5789,6 +5842,7 @@ page_pixelate=0")).unwrap().unwrap();
         let _=app.update(Msg::ApplyUpdate);
         let _=app.update(Msg::UpdateChecked(updater::Status::Ready("0.2.4".into())));
         let _=app.update(Msg::UpdatePrepared(Err("invalid bundle".into())));
+        assert!(app.restart.is_none(),"a failed preparation brings the button back");
         assert_eq!(app.snapshot.state,2);assert!(!app.quitting && !app.apply_pending && !app.apply_after_quit);
         assert!(app.update_status.contains("invalid bundle"));
     }

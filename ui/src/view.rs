@@ -525,10 +525,26 @@ impl App {
                 m.anim.as_ref(),
             ),
         };
-        // The ready card's tag and confetti fly over the whole window, under a running morph.
-        let celebrate = tacho::celebrate(self.ready_fx.filter(|_| self.morph.is_none()));
+        // The glitch layer stays (it keeps track of the window's size for its picture); the
+        // others are there only while they play: tiny-skia rebuilds a window-sized clip mask for
+        // every layer, empty or not, in every patch it repaints.
         let glitch = tacho::glitch(self.glitch.filter(|_| self.morph.is_none()), self.glitch_mosaic.as_ref().map(|(_, _, m)| m.clone()));
-        widget::stack![base, glitch, celebrate, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
+        let mut layers = widget::stack![base, glitch].width(Length::Fill).height(Length::Fill);
+        if self.morph.is_none() {
+            // The ready card's tag and confetti fly over the whole window.
+            if self.ready_fx.is_some() {
+                layers = layers.push(tacho::celebrate(self.ready_fx));
+            }
+            // The restart's air stops where the morph takes over: under its colour key it
+            // would float over the desktop.
+            if self.restart.is_some() {
+                layers = layers.push(tacho::restart_wind(self.restart));
+            }
+        }
+        if anim.is_some() {
+            layers = layers.push(tacho::morph(anim));
+        }
+        layers.into()
     }
 
     /// The whole app window without any morph.
@@ -706,8 +722,12 @@ impl App {
         .width(196)
         .height(Length::Fill);
         if self.update_ready || self.ready_preview.is_some() {
-            // The celebration layer stays in the tree: the card keeps its widget state.
-            rail = rail.push(widget::stack![self.ready_card()].push(tacho::ready_fx(self.ready_fx, self.ready_mosaic.clone(), RAIL)));
+            // The celebration's layer only while it plays: the card keeps its widget state.
+            let mut card = widget::stack![self.ready_card()];
+            if self.ready_fx.is_some() {
+                card = card.push(tacho::ready_fx(self.ready_fx, self.ready_mosaic.clone(), RAIL));
+            }
+            rail = rail.push(card);
             rail = rail.push(Space::new().height(8));
         }
         rail = rail.push(item(glyph::SETTINGS, "Настройки", 2, self.details || self.logs_page));
@@ -724,19 +744,33 @@ impl App {
     /// «Обновление готово» in the rail: the new version in large numbers (it rolls in from the
     /// installed one when the card celebrates) and the restart. Fixed size: its mosaic maps on it.
     pub fn ready_card(&self) -> Element<'_, Msg> {
-        let message = if self.ready_preview.is_some() { Msg::ReadyPreviewEnd } else { Msg::ApplyUpdate };
-        container(
-            column![
-                bold("Обновление готово", 13, INK),
-                row![label("Версия", 12, DIM), tacho::roll(env!("CARGO_PKG_VERSION"), &self.ready_version(), self.ready_fx, 14.0, INK)]
-                    .spacing(6)
-                    .align_y(iced::Center),
-                label("скачана и готова", 12, DIM),
-                Space::new().height(Length::Fill),
+        let message = if self.ready_preview.is_some() { Msg::ReadyPreviewPlay } else { Msg::ApplyUpdate };
+        // After the click the button leaves a hole; the card names the preparation's step.
+        let (heading, step, bottom): (_, _, Element<'_, Msg>) = match self.restart {
+            Some(restart) => (
+                "Готовим перезапуск",
+                ["Проверяем версию…", "Сохраняем откат…", "Останавливаем звук…"][restart.step.min(2) as usize],
+                tacho::restart_slot(restart),
+            ),
+            None => (
+                "Обновление готово",
+                "скачана и готова",
                 action(container(label("Перезапустить", 13, ORANGE_DARK)).center(Length::Fill), message, self.focus == focus::UPDATE_BANNER, true)
                     .padding([0, 12])
                     .width(Length::Fill)
-                    .height(tacho::ready::BUTTON_H),
+                    .height(tacho::ready::BUTTON_H)
+                    .into(),
+            ),
+        };
+        container(
+            column![
+                bold(heading, 13, INK),
+                row![label("Версия", 12, DIM), tacho::roll(env!("CARGO_PKG_VERSION"), &self.ready_version(), self.ready_fx, 14.0, INK)]
+                    .spacing(6)
+                    .align_y(iced::Center),
+                label(step, 12, DIM),
+                Space::new().height(Length::Fill),
+                bottom,
             ]
             .spacing(4),
         )
@@ -3528,6 +3562,30 @@ mod tests {
         app.glitch = None;
         let (gone, _) = frame(&app);
         assert!(gone > 0.0, "leaving repaints the last pattern away");
+        // The restart's air: one frame of it after another, 16 ms apart.
+        app.update_ready = true;
+        let _ = frame(&app);
+        let mut worst = (0.0_f32, 0.0_f64, 0.0_f64);
+        for i in 0..30u64 {
+            let mut restart = tacho::Restart::new(Instant::now() - Duration::from_millis(2500 + 16 * i), tacho::Fall::KnockOut);
+            restart.advance(1, Instant::now() - Duration::from_millis(800));
+            app.restart = Some(restart);
+            let (a, t) = frame(&app);
+            worst = (worst.0.max(a), worst.1.max(t), worst.2 + t / 30.0);
+        }
+        eprintln!("restart air: worst {:.0} % of the window, worst {:.1} ms, mean {:.1} ms", worst.0 * 100.0, worst.1, worst.2);
+        // The ready card's confetti over the window, frame after frame.
+        (app.restart, app.update_ready) = (None, false);
+        app.ready_preview = Some(Instant::now());
+        let _ = frame(&app);
+        let mut worst = (0.0_f32, 0.0_f64, 0.0_f64);
+        let frames = ((tacho::ready::CONFETTI.1 - tacho::ready::CONFETTI.0) / 16.0) as u64;
+        for i in 0..frames {
+            app.ready_fx = Some(Instant::now() - Duration::from_millis(tacho::ready::CONFETTI.0 as u64 + 16 * i));
+            let (a, t) = frame(&app);
+            worst = (worst.0.max(a), worst.1.max(t), worst.2 + t / frames as f64);
+        }
+        eprintln!("confetti: worst {:.0} % of the window, worst {:.1} ms, mean {:.1} ms", worst.0 * 100.0, worst.1, worst.2);
     }
     #[test]
     #[ignore]
@@ -3608,6 +3666,25 @@ mod tests {
                 render(&app, &format!("ready-{ms:04}"));
             }
             (app.ready_fx, app.ready_preview, app.ready_mosaic) = (None, None, None);
+            // «Перезапустить» clicked: pressed, each fall on its way, then the air blowing in.
+            let ready = app.update_ready;
+            app.update_ready = true;
+            let ago = |ms: u64| Instant::now() - Duration::from_millis(ms);
+            app.restart = Some(tacho::Restart::new(ago(90), tacho::Fall::Sink));
+            render(&app, "restart-press");
+            for fall in tacho::Fall::ALL {
+                for ms in [420u64, 700] {
+                    app.restart = Some(tacho::Restart::new(ago(ms), fall));
+                    render(&app, &format!("restart-{fall:?}-{ms}").to_lowercase());
+                }
+            }
+            for (ms, step) in [(1500u64, 0u8), (3200, 1), (5000, 2)] {
+                let mut restart = tacho::Restart::new(ago(ms), tacho::Fall::KnockOut);
+                restart.advance(step, ago(600));
+                app.restart = Some(restart);
+                render(&app, &format!("restart-wind-{ms}"));
+            }
+            (app.restart, app.update_ready) = (None, ready);
             // «Подбор под микрофон»: idle, the quiet sweep half way, the spoken check, the result.
             app.snapshot.state = 2;
             app.denoiser.0 = 1;

@@ -9,7 +9,7 @@ use iced::Renderer;
 use iced_tiny_skia::Geometry;
 use iced_tiny_skia::geometry::{Cache, Frame};
 use iced_tiny_skia::graphics::cache::{Cached as _, Group};
-use iced_tiny_skia::graphics::geometry::{Path, Renderer as _, frame::Backend as _};
+use iced_tiny_skia::graphics::geometry::{Path, Renderer as _, Stroke, frame::Backend as _, gradient};
 use std::cell::RefCell;
 use iced::advanced::widget::{Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell};
@@ -1774,19 +1774,406 @@ impl<Message> Widget<Message, Theme, Renderer> for Celebrate {
             let (ox, oy) = (button.x + button.width / 2.0, button.y + button.height / 2.0);
             let palette = [TAG, HEAD, FLASH_GREEN, Color::from_rgb8(0xFF, 0xB0, 0x70), INK];
             let fade = if age > 0.65 * life { 1.0 - (age - 0.65 * life) / (0.35 * life) } else { 1.0 };
+            // A burst the air slows down, then paper fluttering down: fast only for its first
+            // moments, so it reads smooth (flying at up to 1.5 px/ms all the way, the pieces
+            // jumped 25 px a frame). `settled`: how much of the burst's speed is gone, the sway
+            // grows with it; `spent`: its travel so far, in ms at the starting speed.
+            let settled = 1.0 - (-age / CONFETTI_DRAG).exp();
+            let spent = CONFETTI_DRAG * settled;
+            let mut pieces: [Vec<[Point; 4]>; 5] = Default::default();
             for i in 0..70u32 {
                 let angle = -std::f32::consts::FRAC_PI_2 + (i as f32 / 69.0 - 0.5) * 1.9 + (grain(i, 1) - 0.5) * 0.25;
-                let speed = 0.85 + 0.7 * grain(i, 2);
-                let x = ox + angle.cos() * speed * age;
-                let y = oy + angle.sin() * speed * age + 0.5 * 0.0016 * age * age;
-                frame.push_transform();
-                frame.translate(iced::Vector::new(x, y));
-                frame.rotate((grain(i, 3) - 0.5) * 0.03 * age);
-                fill_shapes(&mut frame, &[Shape { x: -3.0 - 6.0 * SKEW, y: -6.0, w: 6.0, h: 12.0, lean: 12.0 * SKEW, round: 0.0, color: Color { a: fade, ..palette[i as usize % palette.len()] } }]);
-                frame.pop_transform();
+                let speed = 1.0 + 0.8 * grain(i, 2);
+                let swing = (age / (240.0 + 160.0 * grain(i, 6)) + std::f32::consts::TAU * grain(i, 7)).sin();
+                let x = ox + angle.cos() * speed * spent + (8.0 + 10.0 * grain(i, 5)) * swing * settled;
+                let y = oy + angle.sin() * speed * spent + CONFETTI_FALL * (age - spent);
+                let turn = (grain(i, 3) - 0.5) * 0.03 * spent + 0.5 * swing * settled;
+                // The paper turning over: its width breathes.
+                let flip = 0.3 + 0.7 * (age / (170.0 + 90.0 * grain(i, 8)) + std::f32::consts::TAU * grain(i, 9)).cos().abs();
+                let (sin, cos) = turn.sin_cos();
+                let corner = |cx: f32, cy: f32| Point::new(x + cx * flip * cos - cy * sin, y + cx * flip * sin + cy * cos);
+                pieces[i as usize % pieces.len()].push([
+                    corner(-3.0 + 6.0 * SKEW, -6.0),
+                    corner(3.0 + 6.0 * SKEW, -6.0),
+                    corner(3.0 - 6.0 * SKEW, 6.0),
+                    corner(-3.0 - 6.0 * SKEW, 6.0),
+                ]);
+            }
+            // One path per colour: a frame repaints the cloud as one patch, not dozens.
+            for (color, pieces) in palette.into_iter().zip(&pieces) {
+                let path = Path::new(|p| {
+                    for [a, b, c, d] in pieces {
+                        p.move_to(*a);
+                        p.line_to(*b);
+                        p.line_to(*c);
+                        p.line_to(*d);
+                        p.close();
+                    }
+                });
+                frame.fill(&path, Color { a: fade, ..color });
             }
         }
-        renderer.with_layer(window, |renderer| renderer.draw_geometry(frame.into_geometry()));
+        renderer.draw_geometry(frame.into_geometry());
+    }
+}
+/// The confetti's air: its burst slows with this time constant (ms), then it drifts down at
+/// this speed (px/ms).
+const CONFETTI_DRAG: f32 = 380.0;
+const CONFETTI_FALL: f32 = 0.11;
+
+/// «Перезапустить» clicked: the button sinks into its slot and falls out one of four ways, then
+/// air from all over the window rushes into the hole it left while the restart is prepared. The
+/// window itself never moves: its own morph into the update window follows. Milliseconds from
+/// the click.
+pub mod restart {
+    use std::time::Duration;
+    pub const PRESS: f32 = 170.0;
+    pub const DROP: (f32, f32) = (170.0, 890.0);
+    /// The air speeds up over this span, then blows steadily.
+    pub const WIND: (f32, f32) = (820.0, 1300.0);
+    /// The restart waits at least this long after the click: the button has fallen out and the
+    /// air rushes in before the window morphs.
+    pub const HOLD: Duration = Duration::from_millis(1600);
+}
+/// How the button leaves its slot: sinks turning like into a drain, is knocked out and falls
+/// off the window, swings in like a hatch, or cracks into slanted segments that drop one by one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fall {
+    Sink,
+    KnockOut,
+    Hatch,
+    Crack,
+}
+impl Fall {
+    pub const ALL: [Fall; 4] = [Fall::Sink, Fall::KnockOut, Fall::Hatch, Fall::Crack];
+    /// A different one per restart.
+    pub fn random() -> Self {
+        let micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_micros());
+        Self::ALL[micros as usize % Self::ALL.len()]
+    }
+}
+/// A running restart: the click, how the button falls, and the preparation's step (0 newest
+/// version, 1 rollback copy, 2 stopping the sound) with when it began.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Restart {
+    pub start: Instant,
+    pub fall: Fall,
+    pub step: u8,
+    pub step_at: Instant,
+}
+impl Restart {
+    pub fn new(now: Instant, fall: Fall) -> Self {
+        Self { start: now, fall, step: 0, step_at: now }
+    }
+    pub fn advance(&mut self, step: u8, now: Instant) {
+        if step > self.step {
+            (self.step, self.step_at) = (step, now);
+        }
+    }
+    fn ms(&self, now: Instant) -> f32 {
+        ready_ms(self.start, now)
+    }
+    /// The share the hole's floor shows: each step fills its third, slowing as it goes.
+    fn progress(&self, now: Instant) -> f32 {
+        let since = now.saturating_duration_since(self.step_at).as_secs_f32();
+        (self.step.min(2) as f32 + 1.0 - (-since / 1.2).exp()) / 3.0
+    }
+    /// The air's strength: none until the button is out, then more with each step.
+    fn wind(&self, now: Instant) -> f32 {
+        let level = |step: u8| [0.7, 0.85, 1.0][step.min(2) as usize];
+        let since = now.saturating_duration_since(self.step_at).as_secs_f32() * 1000.0;
+        let from = level(self.step.saturating_sub(1));
+        (from + (level(self.step) - from) * smooth((since / 400.0).min(1.0))) * smooth(ready_span(self.ms(now), restart::WIND))
+    }
+    /// The air's own clock: milliseconds at its speed, a third at first and full once it blows.
+    fn tau(&self, now: Instant) -> f32 {
+        let (a, b) = restart::WIND;
+        let t = (self.ms(now) - a).max(0.0);
+        let x = t / (b - a);
+        // The integral of the smoothstep speed-up, then a steady 1.
+        let ramp = if x < 1.0 { x * x * x - x * x * x * x / 2.0 } else { x - 0.5 };
+        0.35 * t + 0.65 * (b - a) * ramp
+    }
+}
+const PRESSED: Color = Color::from_rgb8(0xE3, 0x81, 0x3E);
+const BUTTON_LABEL: Color = Color::from_rgb8(0x3A, 0x22, 0x0E);
+fn mix(a: Color, b: Color, k: f32) -> Color {
+    Color { r: a.r + (b.r - a.r) * k, g: a.g + (b.g - a.g) * k, b: a.b + (b.b - a.b) * k, a: a.a + (b.a - a.a) * k }
+}
+/// Where the slot stood in the last frame: the window layer aims the air at it and drops the
+/// button from it.
+static RESTART_SLOT: std::sync::Mutex<Option<Rectangle>> = std::sync::Mutex::new(None);
+/// The restart button's face around `center`, turned and scaled, with its label.
+fn restart_button(frame: &mut Frame, center: Point, size: Size, degrees: f32, scale: f32, face: Color, label: f32) {
+    frame.push_transform();
+    frame.translate(iced::Vector::new(center.x, center.y));
+    frame.rotate(degrees.to_radians());
+    frame.scale(scale);
+    frame.fill(&Path::rounded_rectangle(Point::new(-size.width / 2.0, -size.height / 2.0), size, 8.0.into()), face);
+    if label > 0.0 {
+        restart_label(frame, Point::ORIGIN, label * face.a);
+    }
+    frame.pop_transform();
+}
+fn restart_label(frame: &mut Frame, at: Point, alpha: f32) {
+    frame.fill_text(iced_tiny_skia::graphics::geometry::Text {
+        content: "Перезапустить".into(),
+        position: at,
+        max_width: f32::INFINITY,
+        color: Color { a: alpha, ..BUTTON_LABEL },
+        size: Pixels(13.0),
+        line_height: text::LineHeight::default(),
+        font: Font::with_name("Segoe UI"),
+        align_x: text::Alignment::Center,
+        align_y: iced::alignment::Vertical::Center,
+        shaping: text::Shaping::Basic,
+    });
+}
+
+/// The restart button's slot in the card: the pressed button, then the dark hole it leaves,
+/// hot at the rim for a moment, with the preparation's progress glowing on its floor.
+pub fn restart_slot<'a, Message: 'a>(restart: Restart) -> Element<'a, Message> {
+    Element::new(RestartSlot(restart))
+}
+struct RestartSlot(Restart);
+impl<Message> Widget<Message, Theme, Renderer> for RestartSlot {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fixed(ready::BUTTON_H) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, ready::BUTTON_H)
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            shell.request_redraw_at(frame_after(*now));
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        if let Ok(mut slot) = RESTART_SLOT.lock() {
+            *slot = Some(b);
+        }
+        let now = Instant::now();
+        let r = self.0;
+        let ms = r.ms(now);
+        let drop = ready_span(ms, restart::DROP);
+        let mut frame = Frame::new(b.expand(6.0));
+        let hole = Path::rounded_rectangle(b.position(), b.size(), 8.0.into());
+        // Black under its top edge, a little lighter at the floor, lit at the lower lip.
+        frame.fill(&hole, gradient::Linear::new(Point::new(b.x, b.y), Point::new(b.x, b.y + b.height)).add_stop(0.0, Color::BLACK).add_stop(1.0, Color::from_rgb8(0x12, 0x12, 0x14)));
+        frame.fill_rectangle(Point::new(b.x + 8.0, b.y + b.height + 0.5), Size::new(b.width - 16.0, 1.0), Color { a: 0.08, ..Color::WHITE });
+        let heat = if ms < restart::DROP.1 {
+            smooth(((drop - 0.18) / 0.25).clamp(0.0, 1.0))
+        } else {
+            let s = (ms - restart::DROP.1) / 1000.0;
+            0.25 + 0.75 * (-s * 2.5).exp() + 0.06 * (ms / 60.0).sin()
+        };
+        if heat > 0.01 {
+            let rim = Path::rounded_rectangle(Point::new(b.x - 1.5, b.y - 1.5), Size::new(b.width + 3.0, b.height + 3.0), 9.5.into());
+            frame.stroke(&rim, Stroke::default().with_width(4.0).with_color(Color { a: 0.2 * heat, ..TAG }));
+            frame.stroke(&hole, Stroke::default().with_width(1.0).with_color(Color { a: heat, ..TAG }));
+        }
+        if ms >= restart::DROP.0 {
+            let w = (b.width - 14.0) * r.progress(now);
+            frame.fill_rectangle(Point::new(b.x + 7.0, b.y + b.height - 7.0), Size::new(w, 6.0), Color { a: 0.18, ..TAG });
+            frame.fill_rectangle(Point::new(b.x + 7.0, b.y + b.height - 5.0), Size::new(w, 2.0), TAG);
+        }
+        let center = Point::new(b.center_x(), b.center_y());
+        if ms < restart::PRESS {
+            // Pressed in: a dark gap shows around it.
+            let press = smooth((ms / restart::PRESS * 2.0).min(1.0));
+            let face = mix(Color::from_rgb8(0xFF, 0xB0, 0x70), PRESSED, press);
+            restart_button(&mut frame, Point::new(center.x, center.y + 1.5 * press), b.size(), 0.0, 1.0 - 0.035 * press, face, 1.0);
+        } else if ms < restart::DROP.1 {
+            match r.fall {
+                Fall::Sink => {
+                    let q = smooth(drop);
+                    let face = Color { a: 1.0 - ((drop - 0.78) / 0.22).clamp(0.0, 1.0), ..mix(PRESSED, Color::from_rgb8(40, 26, 14), q) };
+                    restart_button(&mut frame, Point::new(center.x, center.y + 1.5 + 3.0 * q), b.size(), -32.0 * q, 0.965 * (1.0 - 0.82 * q), face, 1.0 - q);
+                }
+                Fall::Hatch => {
+                    // Hinged at the bottom edge, its top falls away from the viewer.
+                    let q = drop.powf(1.7);
+                    let angle = (96.0 * q).to_radians();
+                    if angle < 88f32.to_radians() {
+                        let (h, w) = (b.height - 1.0, b.width * 0.965);
+                        let base = b.y + b.height;
+                        let top = base - h * angle.cos();
+                        let narrow = 220.0 / (220.0 + h * angle.sin());
+                        let quad = Path::new(|p| {
+                            p.move_to(Point::new(center.x - w / 2.0, base));
+                            p.line_to(Point::new(center.x + w / 2.0, base));
+                            p.line_to(Point::new(center.x + narrow * w / 2.0, top));
+                            p.line_to(Point::new(center.x - narrow * w / 2.0, top));
+                            p.close();
+                        });
+                        frame.fill(&quad, mix(PRESSED, Color::from_rgb8(70, 42, 22), q));
+                        if q < 0.5 {
+                            restart_label(&mut frame, Point::new(center.x, (top + base) / 2.0), 1.0 - 2.0 * q);
+                        }
+                    }
+                }
+                // These leave the slot: the window layer draws them.
+                Fall::KnockOut | Fall::Crack => {}
+            }
+        }
+        renderer.draw_geometry(frame.into_geometry());
+    }
+}
+
+/// The window's layer for the restart: the button falling off the window or crumbling into
+/// segments, and the air: streaks and specks from all over the window rushing into the hole.
+/// Draws nothing else, and never moves the window's own content.
+pub fn restart_wind<'a, Message: 'a>(restart: Option<Restart>) -> Element<'a, Message> {
+    Element::new(RestartWind(restart))
+}
+struct RestartWind(Option<Restart>);
+impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fill }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(_)) = (event, self.0) {
+            shell.request_redraw_at(frame_after(*now));
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let Some(r) = self.0 else { return };
+        let Some(slot) = RESTART_SLOT.lock().ok().and_then(|s| *s) else { return };
+        let now = Instant::now();
+        let ms = r.ms(now);
+        let window = layout.bounds();
+        let mut frame = Frame::new(window);
+        if ms >= restart::DROP.0 && ms < restart::DROP.1 {
+            let lt = ms - restart::DROP.0;
+            match r.fall {
+                Fall::KnockOut => {
+                    // Pops out towards the viewer, tumbles and falls off the window.
+                    let up = if lt < 150.0 { smooth(lt / 150.0) } else { 1.0 };
+                    let fall = (lt - 150.0).max(0.0);
+                    let center = Point::new(slot.center_x() + 0.022 * lt, slot.center_y() - 11.0 * up + 0.00042 * fall * fall);
+                    let degrees = -5.0 * up + 0.085 * fall;
+                    let scale = 1.0 + 0.05 * up;
+                    restart_button(&mut frame, Point::new(center.x, center.y + 4.0 + 6.0 * up), slot.size(), degrees, scale, Color { a: 0.35, ..Color::BLACK }, 0.0);
+                    restart_button(&mut frame, center, slot.size(), degrees, scale, TAG, 1.0);
+                }
+                Fall::Crack => {
+                    // Seven slanted segments, like a slider's, drop one after another.
+                    let crack = smooth((lt / 60.0).min(1.0));
+                    let (piece, lean) = (25.0 - 6.0, 6.0);
+                    let step = (slot.width + 2.0 - 25.0) / 6.0;
+                    for i in 0..7u32 {
+                        let k = i as f32 - 3.0;
+                        let local = (lt - 60.0 - i as f32 * 50.0).max(0.0);
+                        let y = 1.5 + 0.00062 * local * local * (0.85 + 0.3 * grain(i, 3)) - 2.0 * crack * (i % 2) as f32;
+                        let x = k * 0.02 * local + k * 0.6 * crack;
+                        let degrees = if i % 2 == 1 { 1.0 } else { -1.0 } * (8.0 + grain(i, 4) * 22.0) * local / 300.0;
+                        let left = slot.x - 2.0 + i as f32 * step;
+                        frame.push_transform();
+                        frame.translate(iced::Vector::new(left + 12.5 + x, slot.center_y() + y));
+                        frame.rotate(degrees.to_radians());
+                        fill_shapes(&mut frame, &[Shape { x: -12.5, y: -slot.height / 2.0, w: piece, h: slot.height, lean, round: 0.0, color: lerp(i as f32 / 6.0) }]);
+                        frame.pop_transform();
+                    }
+                    if crack < 1.0 {
+                        restart_label(&mut frame, Point::new(slot.center_x(), slot.center_y() + 1.5), 1.0 - crack);
+                    }
+                }
+                Fall::Sink | Fall::Hatch => {}
+            }
+        }
+        let strength = r.wind(now);
+        if strength > 0.001 {
+            restart_air(&mut frame, window, slot, r.tau(now), strength);
+        }
+        renderer.draw_geometry(frame.into_geometry());
+    }
+}
+
+/// Gusts rushing into the hole: each one a few parallel streaks and a speck or two of the
+/// interface, starting somewhere in the window and speeding up towards a point along the slot.
+/// Few gusts, each one path: tiny-skia pays for every repainted patch (it rebuilds a window-sized
+/// clip mask per layer and per patch), so a frame repaints a handful of patches; streaks
+/// scattered one by one cost 70 ms a frame, a dozen thin gusts still 19 ms.
+fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, strength: f32) {
+    const GUSTS: u32 = 6;
+    let (cx, cy) = (slot.center_x(), slot.center_y());
+    let spawn = |seed: u32| {
+        for k in 0..8 {
+            let x = window.x + 6.0 + grain(seed, 20 + k) * (window.width - 12.0);
+            let y = window.y + 4.0 + grain(seed, 30 + k) * (window.height - 8.0);
+            if (x - cx).hypot((y - cy) * 1.6) > 90.0 {
+                return Point::new(x, y);
+            }
+        }
+        Point::new(window.x + window.width - 30.0, window.y + 60.0)
+    };
+    let specks = [TAG, INK, Color::from_rgb8(163, 163, 169), Color::from_rgb8(94, 95, 102)];
+    let active = GUSTS as f32 * (strength + 0.25).min(1.0);
+    for i in 0..GUSTS {
+        let gate = (active - i as f32).clamp(0.0, 1.0);
+        if gate <= 0.0 {
+            break;
+        }
+        let q = tau / (900.0 * (0.8 + 0.4 * grain(i, 3))) + i as f32 / GUSTS as f32 + 0.1 * grain(i, 9);
+        let (round, u) = (q.floor(), q.fract());
+        if round < 1.0 {
+            continue; // not blown yet: every gust starts from its own spot, not mid-flight
+        }
+        let seed = i.wrapping_mul(977).wrapping_add((round as u32).wrapping_mul(131));
+        let from = spawn(seed);
+        let to = Point::new(cx + (grain(seed, 40) - 0.5) * (slot.width - 28.0), cy + (grain(seed, 41) - 0.5) * slot.height * 0.4);
+        let (r0, a0) = ((from.x - to.x).hypot(from.y - to.y), (from.y - to.y).atan2(from.x - to.x));
+        let bend = (grain(seed, 42) - 0.5) * 0.3;
+        let at = |u: f32| {
+            let (r, a) = (r0 * (1.0 - u).sqrt(), a0 + bend * u);
+            Point::new(to.x + r * a.cos(), to.y + r * a.sin())
+        };
+        let fade = (u / 0.14).clamp(0.0, 1.0) * ((1.0 - u) / 0.1).clamp(0.0, 1.0) * gate;
+        let (head, back) = (at(u), at((u - 0.045).max(0.0)));
+        let (dx, dy) = (head.x - back.x, head.y - back.y);
+        let moved = dx.hypot(dy);
+        if moved < 0.01 {
+            continue;
+        }
+        // Along and across the gust; its lanes close in as it nears the slot.
+        let (ux, uy) = (dx / moved, dy / moved);
+        let (nx, ny) = (-uy, ux);
+        let spread = (1.0 - u).sqrt();
+        let length = (moved * 3.0).clamp(10.0, 64.0);
+        let lanes = 5 + (grain(seed, 46) * 4.0) as u32;
+        let streaks = Path::new(|p| {
+            for j in 0..lanes {
+                let off = ((j as f32 - (lanes - 1) as f32 / 2.0) * 7.0 + (grain(seed, 50 + j) - 0.5) * 5.0) * spread;
+                let lag = grain(seed, 60 + j) * 0.35 * length;
+                let h = Point::new(head.x + nx * off - ux * lag, head.y + ny * off - uy * lag);
+                let half = (1.1 + 0.7 * grain(seed, 80 + j)) / 2.0;
+                let reach = length * (0.6 + 0.5 * grain(seed, 70 + j));
+                p.move_to(Point::new(h.x + nx * half, h.y + ny * half));
+                p.line_to(Point::new(h.x - nx * half, h.y - ny * half));
+                p.line_to(Point::new(h.x - ux * reach, h.y - uy * reach));
+                p.close();
+            }
+        });
+        let color = if i % 3 == 0 { TAG } else if i % 7 == 0 { HEAD } else { INK };
+        let alpha = (0.3 + 0.6 * u) * fade;
+        let tail = Point::new(head.x - ux * length * 1.3, head.y - uy * length * 1.3);
+        frame.fill(&streaks, gradient::Linear::new(head, tail).add_stop(0.0, Color { a: alpha, ..color }).add_stop(1.0, Color { a: 0.0, ..color }));
+        // Specks of the interface carried along, a little behind.
+        for j in 0..2 + (grain(seed, 90) * 3.0) as u32 {
+            let at_speck = at((u - 0.03 - 0.05 * grain(seed, 91 + j)).max(0.0));
+            let off = (grain(seed, 95 + j) - 0.5) * 7.0 * lanes as f32 * spread;
+            let side = 2.0 + (grain(seed, 44 + j) * 3.0).floor();
+            let spin = if (i + j) % 2 == 1 { 1.0 } else { -1.0 } * u * 600.0;
+            frame.push_transform();
+            frame.translate(iced::Vector::new(at_speck.x + nx * off, at_speck.y + ny * off));
+            frame.rotate(spin.to_radians());
+            frame.fill_rectangle(Point::new(-side / 2.0, -side / 2.0), Size::new(side, side), Color { a: 0.9 * fade, ..specks[((i + j) % 4) as usize] });
+            frame.pop_transform();
+        }
     }
 }
 
