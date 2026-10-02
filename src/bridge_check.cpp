@@ -78,6 +78,10 @@ int main(){try{
     require(mnr_sound_bindings(p,&clipId,&clipKey,1),"Retired Granular key remained reserved");
     require(mnr_sound_bindings(p,nullptr,nullptr,0),"Clearing retired-key check failed");
     mnr_alternate_intensity(p,0.15f);
+    require(mnr_noise_gate(p,-40)==1 && mnr_noise_gate(p,0)==1 && mnr_noise_gate(p,-72)==1,"Gate threshold range rejected");
+    for(float db:{-73.0f,1.0f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()})
+        require(mnr_noise_gate(p,db)==0,"Invalid gate threshold accepted");
+    require(mnr_noise_gate(nullptr,-40)==0 && mnr_noise_peak(p)==0 && mnr_noise_peak(nullptr)==0,"Gate ABI idle/null handling");
     {
         std::vector<float> tone(48000),shifted(tone.size());
         for(size_t i=0;i<tone.size();++i)tone[i]=0.3f*std::sin(2*std::numbers::pi*440.0*i/48000.0);

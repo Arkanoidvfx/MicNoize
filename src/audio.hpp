@@ -122,6 +122,7 @@ struct Stats {
     // NVIDIA run time distribution: a lone max and a steady overload look the same otherwise.
     std::atomic<unsigned> runsOver5Ms{0}, runsOver10Ms{0}, maxRunBlock{0};
     std::atomic<float> inputPeak{0}, outputPeak{0}, processMs{0}, maxProcessMs{0};
+    std::atomic<float> noisePeak{0}; // Cleaned microphone before the gate, independent of output effects.
     std::atomic<int> rvcState{0}; // Off, Starting, Ready, Bypass
     std::atomic<float> rvcLatencyMs{0};
     std::atomic<unsigned> inputQueue{0}, outputQueue{0}, renderPadding{0};
@@ -347,6 +348,7 @@ public:
     void reportError(const std::string& message);
     std::atomic<float> intensity{1};
     std::atomic<float> alternateIntensity{0.15f};
+    std::atomic<float> noiseGateDb{-72};
     std::atomic<bool> rvcEnabled{false};
     std::atomic<uint64_t> rvcConfig{RvcSettings{}.packed()};
     std::atomic<bool> muted{false};

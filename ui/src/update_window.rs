@@ -97,6 +97,68 @@ pub fn color_key(hwnd: u64, on: bool, alpha: u8) {
             SetLayeredWindowAttributes(window, colorref, alpha, LWA_COLORKEY | LWA_ALPHA);
         } else {
             SetWindowLongPtrW(window, GWL_EXSTYLE, style & !WS_EX_LAYERED);
+            set_region(hwnd, None);
+        }
+    }
+}
+
+/// Clips a window to the rounded rectangle `card` (logical px, in a window `width` logical px
+/// wide): nothing outside it reaches the screen. A card drawn on the colour key kept a ring of
+/// dark dots around its rounded corners: anti-aliased edge pixels blend with the key without
+/// being the key. With `None` the window is whole again.
+pub fn set_region(hwnd: u64, card: Option<(iced::Rectangle, f32)>) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetClientRect(window: isize, rect: *mut [i32; 4]) -> i32;
+        fn SetWindowRgn(window: isize, region: isize, redraw: i32) -> i32;
+    }
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateRoundRectRgn(left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) -> isize;
+    }
+    let window = hwnd as isize;
+    unsafe {
+        let Some((card, width)) = card else {
+            SetWindowRgn(window, 0, 1);
+            return;
+        };
+        let mut client = [0i32; 4];
+        if GetClientRect(window, &mut client) == 0 || width <= 0.0 || client[2] <= 0 {
+            return;
+        }
+        // Physical pixels: the region does not follow the DPI scale by itself.
+        let scale = client[2] as f32 / width;
+        let px = |v: f32| (v * scale).round() as i32;
+        let round = px(2.0 * CARD_RADIUS);
+        let region = CreateRoundRectRgn(px(card.x), px(card.y), px(card.x + card.width) + 1, px(card.y + card.height) + 1, round, round);
+        if region != 0 {
+            // The window owns the region from here on.
+            SetWindowRgn(window, region, 1);
+        }
+    }
+}
+/// The update card's corner radius, as drawn by [`view::update_card`].
+const CARD_RADIUS: f32 = 12.0;
+
+/// A window change held for the app's next frame: `(hwnd, take the key off too)`.
+static NEXT_FRAME: std::sync::Mutex<Option<(u64, bool)>> = std::sync::Mutex::new(None);
+/// Takes the rounded region (and with `unkey` the colour key) off `hwnd` while the app's next
+/// frame is drawn, right before it reaches the screen. A window leaving the layered style loses
+/// its picture: done at once, it stayed black until the next frame, the window-sized black
+/// flash at the end of an update.
+pub fn with_next_frame(hwnd: u64, unkey: bool) {
+    if let Ok(mut next) = NEXT_FRAME.lock() {
+        let unkey = unkey || next.is_some_and(|(_, earlier)| earlier);
+        *next = Some((hwnd, unkey));
+    }
+}
+/// Called by the window's layer while a frame is being drawn.
+pub fn apply_next_frame() {
+    if let Some((hwnd, unkey)) = NEXT_FRAME.lock().ok().and_then(|mut next| next.take()) {
+        if unkey {
+            color_key(hwnd, false, 255);
+        } else {
+            set_region(hwnd, None);
         }
     }
 }
@@ -137,6 +199,7 @@ impl Watcher {
             }
             WatchMsg::Handle(hwnd) => {
                 color_key(hwnd, true, 255);
+                set_region(hwnd, Some((iced::Rectangle::with_size(view::UPDATE_CARD), view::UPDATE_CARD.width)));
                 let show = self.window.map_or(Task::none(), |id| window::set_mode(id, window::Mode::Windowed));
                 Task::batch([show, after(80, WatchMsg::Shown)])
             }

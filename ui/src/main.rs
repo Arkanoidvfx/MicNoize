@@ -329,6 +329,7 @@ mod focus {
         pub const INPUT: usize = 35;
         pub const INTENSITY: usize = 34;
         pub const ALT_INTENSITY: usize = 37;
+        pub const NOISE_GATE: usize = 113;
         pub const NOISE_BIND: usize = 38;
         pub const OVERLOAD: usize = 21;
         pub const BOOST: usize = 2;
@@ -551,6 +552,7 @@ enum Msg {
     Buffer(u32),
     Intensity(f32),
     AlternateIntensity(f32),
+    NoiseGate(f32),
     Boost(f32),
     Overload(bool),
     DiscordVolume(f32),
@@ -805,6 +807,7 @@ struct App {
     epoch: Instant,
     opened_at: Option<Instant>,
     in_peak: f32,
+    noise_peak: f32,
     /// Bound keys held right now (bitset by virtual-key code), for the pressed keycaps.
     keys_down: [u64; 4],
     /// The new page, painted small, while its mosaic resolves over it after a page switch.
@@ -1088,6 +1091,7 @@ impl App {
             intensity: settings.number("audio", "intensity", 40, 0, 200) as f32 / 100.0,
             alternate_intensity: settings.number("audio", "alternate_intensity", 10, 0, 200) as f32
                 / 100.0,
+            noise_gate_db: settings.number("audio", "noise_gate_db", -72, -72, 0) as f32,
             muted: false,
             rvc: settings.number("effects", "rvc_enabled", 0, 0, 1) != 0,
             rvc_options: rvc::Options::load(&settings),
@@ -1322,6 +1326,7 @@ impl App {
                 epoch: Instant::now(),
                 opened_at: None,
                 in_peak: 0.0,
+                noise_peak: 0.0,
                 keys_down: [0; 4],
                 page_shift: None,
                 repaint_all: false,
@@ -1520,6 +1525,7 @@ impl App {
         for (k, v) in [
             ("version", self.version),
             ("buffer_ms", self.buffer as i32),
+            ("noise_gate_db", self.controls.noise_gate_db.round() as i32),
             (
                 "intensity",
                 (self.controls.intensity * 100.0).round() as i32,
@@ -2433,7 +2439,8 @@ impl App {
                     }
                 }
                 let (snapshot, error) = self.engine.snapshot(self.ui_active());
-                self.feed_tune(snapshot.input_peak, snapshot.output_peak, snapshot.state);
+                let noise_peak = if self.ui_active() { self.engine.noise_peak() } else { 0.0 };
+                self.feed_tune(snapshot.input_peak, noise_peak, snapshot.state);
                 let studio_just_started = self.snapshot.state != 3 && snapshot.state == 3;
                 self.snapshot = snapshot;
                 self.effect_activity = self.engine.effect_activity();
@@ -2522,6 +2529,7 @@ impl App {
                 if self.ui_active() {
                     self.peak = snapshot.output_peak.max(self.peak * 0.80);
                     self.in_peak = snapshot.input_peak.max(self.in_peak * 0.80);
+                    self.noise_peak = noise_peak.max(self.noise_peak * 0.80);
                     self.monitor_peak = self.engine.monitor_peak().max(self.monitor_peak * 0.80);
                 }
                 if snapshot.captured_key != 0 && self.binding.is_some() {
@@ -2788,7 +2796,7 @@ impl App {
             }
             Msg::UpdateApplied(result) => {
                 if result.is_err() && let Some(m)=self.morph.take() && let Some(hwnd)=m.hwnd {
-                    update_window::color_key(hwnd,false,255);
+                    update_window::with_next_frame(hwnd,true);
                 }
                 if let Err(error)=result {
                     self.quitting=false;self.busy=false;self.apply_after_quit=false;self.restart=None;
@@ -3107,6 +3115,13 @@ impl App {
                 self.controls.alternate_intensity = (v / 100.0).clamp(0.0, 2.0);
                 self.focus = focus::effects::ALT_INTENSITY;
                 self.changed();
+            }
+            Msg::NoiseGate(v) => {
+                if v.is_finite() {
+                    self.controls.noise_gate_db = v.round().clamp(-72.0, 0.0);
+                    self.focus = focus::effects::NOISE_GATE;
+                    self.changed();
+                }
             }
             Msg::Boost(v) => {
                 self.controls.boost = v / 100.0;
@@ -4311,6 +4326,12 @@ impl App {
                     // watcher's update window, draws the same card, and only then shows.
                     let intro = m.anim.is_none();
                     update_window::color_key(hwnd, true, if intro { 0 } else { 255 });
+                    if intro {
+                        // Shown as the watcher's card, rounded the same way, until it grows.
+                        let size = Self::window_size();
+                        let card = iced::Rectangle::new(iced::Point::new((size.width - view::UPDATE_CARD.width) / 2.0, (size.height - view::UPDATE_CARD.height) / 2.0), view::UPDATE_CARD);
+                        update_window::set_region(hwnd, Some((card, size.width)));
+                    }
                     m.hwnd = Some(hwnd);
                     if intro && let Some(id) = self.window {
                         m.shown = Some((tacho::frames(), Instant::now()));
@@ -4339,9 +4360,11 @@ impl App {
                 };
                 let from = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Launching, "", env!("CARGO_PKG_VERSION")), view::UPDATE_CARD);
                 let to = self.window_mosaic(size);
-                // Visible now, over the watcher's identical card; then the watcher may close.
+                // Visible now, over the watcher's identical card; then the watcher may close. The
+                // rounded region comes off with the growth's first frame.
                 if let Some(hwnd) = self.morph.as_ref().and_then(|m| m.hwnd) {
                     update_window::color_key(hwnd, true, 255);
+                    update_window::with_next_frame(hwnd, false);
                 }
                 update_window::signal_ui_shown(&self.runtime_root);
                 match (&mut self.morph, from, to) {
@@ -4438,13 +4461,16 @@ impl App {
                     MorphStep::ShowCard => m.base = MorphBase::Card(tacho::BarStage::Waiting),
                     MorphStep::ShowRoot => m.base = MorphBase::Root,
                     MorphStep::Done => {
-                        m.anim = None;
-                        // Shrunk into the update window: now hand over to the watcher.
+                        let rects = m.anim.take().map(|a| (a.from_rect, a.to_rect));
+                        // Shrunk into the update window: rounded like the watcher's, then hand over.
                         if let Some(center) = m.center {
+                            if let (Some(hwnd), Some((window, card))) = (m.hwnd, rects) {
+                                update_window::set_region(hwnd, Some((card, window.width)));
+                            }
                             return self.hand_over(Some(center));
                         }
                         if let Some(hwnd) = m.hwnd {
-                            update_window::color_key(hwnd, false, 255);
+                            update_window::with_next_frame(hwnd, true);
                         }
                         self.morph = None;
                         // The sliders' warm-up sweep plays once the app is fully there.
@@ -4667,7 +4693,7 @@ impl App {
                         items.push(LINES);
                     }
                 }
-                items.extend([ROUTE, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE_LISTEN, TUNE]);
+                items.extend([ROUTE, NOISE_GATE, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE_LISTEN, TUNE]);
                 if self.tune.as_ref().is_some_and(|t| t.phase == tune::Phase::Done) {
                     items.push(TUNE_UNDO);
                 }
@@ -5046,6 +5072,9 @@ impl App {
                 ),
                 ALT_INTENSITY if delta != 0 => Msg::AlternateIntensity(
                     (self.controls.alternate_intensity * 100.0 + delta as f32).clamp(0.0, 200.0),
+                ),
+                NOISE_GATE if delta != 0 || activate => Msg::NoiseGate(
+                    if activate { -72.0 } else { self.controls.noise_gate_db + delta as f32 },
                 ),
                 NOISE_BIND if activate => Msg::Bind(12),
                 BOOST if delta != 0 => Msg::Boost(
@@ -5618,11 +5647,26 @@ mic-b=65")).unwrap().unwrap();
             .unwrap();
         assert_eq!(app.controls.intensity, 1.05);
         assert_eq!(app.controls.alternate_intensity, 0.1, "first-install default while held");
+        assert_eq!(app.controls.noise_gate_db, -72.0, "gate is off by default");
         let (fresh, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         assert_eq!((fresh.controls.intensity, fresh.controls.alternate_intensity), (0.4, 0.1), "first-install defaults");
         drop(fresh);
         assert_eq!(app.keys[12], 0);
         app.window = Some(App::open(1.0, None).0);
+        app.focus = focus::effects::ROUTE;
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::effects::NOISE_GATE, "gate is in the noise page Tab order");
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert_eq!(app.controls.noise_gate_db, -71.0);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!(app.controls.noise_gate_db, -72.0, "Enter disables the gate");
+        let _ = app.update(Msg::NoiseGate(5.0));
+        assert_eq!(app.controls.noise_gate_db, 0.0);
+        let _ = app.update(Msg::NoiseGate(-100.0));
+        assert_eq!(app.controls.noise_gate_db, -72.0);
+        let _ = app.update(Msg::NoiseGate(-39.6));
+        let _ = app.update(Msg::NoiseGate(f32::NAN));
+        assert_eq!(app.controls.noise_gate_db, -40.0);
         app.focus = 37;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
         assert_eq!(app.controls.alternate_intensity, 0.11);
@@ -5665,6 +5709,7 @@ mic-b=65")).unwrap().unwrap();
             .unwrap();
         assert_eq!(restored.controls.intensity, 1.05);
         assert_eq!(restored.controls.alternate_intensity, 0.15);
+        assert_eq!(restored.controls.noise_gate_db, -40.0);
         assert_eq!(restored.keys[12], 120 | 256);
         std::fs::remove_file(dir.join("settings.ini")).unwrap();
     }
@@ -6339,9 +6384,9 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.window = Some(App::open(1.0, None).0);
         app.keys = [0; 21];
         use keyboard::{Key, Modifiers, key::Named};
-        // Шумодав: devices, the headphone gear, the folded route, the two strengths, then the
+        // Шумодав: devices, the headphone gear, the folded route, the gate, the two strengths, then the
         // tune panel's «Послушать себя» and «Подобрать».
-        for expected in [35, 50, 81, 82, 34, 38, 37, 111, 110, 40] {
+        for expected in [35, 50, 81, 82, 113, 34, 38, 37, 111, 110, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }

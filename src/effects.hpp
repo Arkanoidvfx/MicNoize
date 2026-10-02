@@ -21,6 +21,24 @@ struct Ramp {
         return value;
     }
 };
+// Microphone gate: 3 dB hysteresis, 120 ms hold and the shared 10 ms gain ramp.
+// No lookahead, allocation or extra buffering. -72 dB is exact dry bypass.
+struct NoiseGate {
+    Ramp gain{0};
+    size_t hold=0;
+    float process(float* data,size_t n,float db) {
+        float peak=0;
+        for(size_t i=0;i<n;++i)peak=std::max(peak,std::abs(data[i]));
+        if(!std::isfinite(db) || db<=-72) {gain=Ramp{1};hold=0;return peak;}
+        const float threshold=std::pow(10.0f,std::min(db,0.0f)/20.0f);
+        const bool detected=peak>=threshold || (hold && peak>=threshold*0.70794578f);
+        if(detected)hold=5760;
+        const bool open=hold!=0;
+        if(!detected)hold=hold>n?hold-n:0;
+        for(size_t i=0;i<n;++i)data[i]*=gain.next(open?1.0f:0.0f);
+        return peak;
+    }
+};
 struct OutputEffects {
     Ramp gain{1},boost{3},wet{0},drive{0},discordGain{0.08f};
     void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.08f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr,const float* sound=nullptr,const float* echoMic=nullptr,const float* echoDiscord=nullptr,float* echoOnly=nullptr) {

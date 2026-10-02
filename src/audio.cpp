@@ -816,7 +816,7 @@ void Engine::fail(const std::exception& error) {
     if(running_.exchange(false)) status(wide(error.what()));
     state=5; releaseEffects(); stats.pitchActive=false;stats.boostActive=false;stats.outputActive=false;stats.phraseState=0;stats.phraseSeconds=0;
     stats.rvcState=rvcEnabled?3:0;
-    stats.inputPeak=0;stats.outputPeak=0;SetEvent(stop_);
+    stats.inputPeak=0;stats.outputPeak=0;stats.noisePeak=0;SetEvent(stop_);
 }
 void Engine::reportError(const std::string& message) {status(wide(message)); state=5;releaseEffects();}
 void Engine::start(const Config& c,uint64_t expectedOperation) {
@@ -845,7 +845,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     config_=c;
     ResetEvent(stop_); ResetEvent(data_); ResetEvent(ready_);
     stats.outputActive=false;
-    stats.inputPeak=0; stats.outputPeak=0; stats.processMs=0; stats.maxProcessMs=0; stats.reconfigureMs=0;
+    stats.inputPeak=0; stats.outputPeak=0; stats.noisePeak=0; stats.processMs=0; stats.maxProcessMs=0; stats.reconfigureMs=0;
     stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; failedAt_=0;
     stats.inputQueue=0; stats.outputQueue=0; stats.renderPadding=0;
     stats.underruns=0; stats.drops=0; stats.discontinuities=0; stats.processed=0;
@@ -923,7 +923,7 @@ void Engine::stop() {
         } catch(...) {OutputDebugStringW(L"Mic Noize: session log unavailable\n");}
     }
     stats.outputActive=false;
-    stats.inputPeak=0; stats.outputPeak=0; stats.inputQueue=0; stats.outputQueue=0;
+    stats.inputPeak=0; stats.outputPeak=0; stats.noisePeak=0; stats.inputQueue=0; stats.outputQueue=0;
     stats.pitchActive=false; stats.boostActive=false; stats.phraseState=0;stats.phraseSeconds=0;state=0;
     stats.rvcState=0;stats.rvcLatencyMs=0;stats.denoiser=0;
     stats.desktopSource=false;stats.desktopState=0;
@@ -961,7 +961,7 @@ void Engine::dspLoop(Config c) {
             stats.denoiser=cpu.state?3:2;
         }
         PitchEffect pitchEffect; AutoTunePitch autoTune; StutterEffect stutterMic,stutterDiscord;
-        EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect;
+        EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect; NoiseGate noiseGate;
         auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
         std::array<float,block> in{},out{},microphone{},discordSource{},scratch{},echoMicOut{},echoDiscordOut{},captureData{};
         LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
@@ -1017,6 +1017,9 @@ void Engine::dspLoop(Config c) {
                 // the converted voice also feeds the background mix while a Discord effect is held.
                 modified.fill(0);
                 rvc->process(out.data(),block,rvcEnabled.load() && !muted,modified.data());
+                // Gate only the live microphone; Discord, soundpad and effect tails bypass it.
+                // Meter the signal before closing it so the UI can still show the noise floor.
+                peakHold(stats.noisePeak,noiseGate.process(out.data(),block,noiseGateDb.load()));
                 // Capture processed microphone before Discord source selection. Publication is a
                 // try-lock swap of buffers reserved before this real-time loop.
                 if(studioRecording && !studioActive && !studioPending && !muted) studioActive=true;

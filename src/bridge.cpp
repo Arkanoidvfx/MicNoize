@@ -217,6 +217,11 @@ extern "C" void mnr_bindings(Mnr* p,const uint32_t* keys,uint32_t count) {
 extern "C" void mnr_alternate_intensity(Mnr* p,float intensity) {
     if(std::isfinite(intensity) && intensity>=0 && intensity<=2)p->engine.alternateIntensity=intensity;
 }
+extern "C" int32_t mnr_noise_gate(Mnr* p,float db) {
+    if(!p || !std::isfinite(db) || db< -72 || db>0)return 0;
+    p->engine.noiseGateDb=db;return 1;
+}
+extern "C" float mnr_noise_peak(Mnr* p) {return p?p->engine.stats.noisePeak.exchange(0):0;}
 extern "C" void mnr_capture_key(Mnr* p,int32_t enabled) {p->captured=0;p->capturing=enabled!=0;++p->captureGeneration;p->engine.releaseEffects();if(auto w=p->window.load())PostMessageW(w,WM_NULL,0,0);}
 extern "C" void mnr_usage(uint64_t* cpu,uint64_t* memory) {
     FILETIME created{},ended{},kernel{},user{};PROCESS_MEMORY_COUNTERS counters{};counters.cb=sizeof(counters);

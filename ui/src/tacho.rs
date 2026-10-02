@@ -1121,18 +1121,24 @@ impl<Message> Widget<Message, Theme, Renderer> for Keycap {
 /// The До / После level bars. The raw microphone is drawn as ragged, gently flickering bars; the denoised output as crisp slanted segments in the sliders'
 /// style, with a glowing head. `level` is 0..1.
 pub fn level_meter<'a, Message: 'a>(level: f32, noisy: bool, color: Color) -> Element<'a, Message> {
-    Element::new(LevelMeter { level: level.clamp(0.0, 1.0), noisy, color })
+    Element::new(LevelMeter { level: level.clamp(0.0, 1.0), noisy, color, gate_db: -72.0, on_change: None })
 }
-struct LevelMeter {
+pub fn gate_meter<'a, Message: 'a>(level: f32, color: Color, db: f32, on_change: impl Fn(f32) -> Message + 'a) -> Element<'a, Message> {
+    Element::new(LevelMeter { level: level.clamp(0.0, 1.0), noisy: false, color, gate_db: db, on_change: Some(Box::new(on_change)) })
+}
+struct LevelMeter<'a, Message> {
     level: f32,
     noisy: bool,
     color: Color,
+    gate_db: f32,
+    on_change: Option<Box<dyn Fn(f32) -> Message + 'a>>,
 }
 const METER_H: f32 = 14.0;
 const CLEAN_SEGMENTS: usize = 40;
 #[derive(Default)]
 struct MeterState {
     painted: Painted,
+    drag: bool,
 }
 /// Stable pseudo-random 0..1 for bar `i` in flicker frame `t`.
 fn grain(i: u32, t: u32) -> f32 {
@@ -1142,14 +1148,46 @@ fn grain(i: u32, t: u32) -> f32 {
     x ^= x >> 12;
     (x & 0xFFFF) as f32 / 65535.0
 }
-impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
+impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<MeterState>() }
     fn state(&self) -> tree::State { tree::State::new(MeterState::default()) }
     fn size(&self) -> Size<Length> {
-        Size { width: Length::Fill, height: Length::Fixed(METER_H) }
+        Size { width: Length::Fill, height: Length::Fixed(if self.on_change.is_some() { 24.0 } else { METER_H }) }
     }
     fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
-        layout::atomic(limits, Length::Fill, Length::Fixed(METER_H))
+        layout::atomic(limits, Length::Fill, self.size().height)
+    }
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        let Some(on_change) = &self.on_change else { return; };
+        let state = tree.state.downcast_mut::<MeterState>();
+        let bounds = layout.bounds();
+        let locate = |x: f32| (-72.0 + 72.0 * ((x - bounds.x - 4.0) / (bounds.width - 8.0).max(1.0)).clamp(0.0, 1.0)).round();
+        let value = match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(bounds) => {
+                state.drag = true;
+                cursor.position().map(|p| locate(p.x))
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => Some(locate(position.x)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag => {
+                state.drag = false;
+                shell.capture_event();
+                shell.request_redraw();
+                None
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if cursor.is_over(bounds) => Some(-72.0),
+            Event::Window(window::Event::Unfocused) => { state.drag = false; None }
+            _ => None,
+        };
+        if let Some(value) = value {
+            if value != self.gate_db { shell.publish(on_change(value)); }
+            shell.capture_event();
+            shell.request_redraw();
+        }
+    }
+    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, _: &Rectangle, _: &Renderer) -> mouse::Interaction {
+        if self.on_change.is_some() && (tree.state.downcast_ref::<MeterState>().drag || cursor.is_over(layout.bounds())) {
+            mouse::Interaction::Pointer
+        } else { mouse::Interaction::default() }
     }
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
@@ -1164,7 +1202,7 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
             let mut shapes = Vec::with_capacity(n * 2 + 8);
             for i in 0..n {
                 let x = b.x + 4.0 + i as f32 * (w + gap);
-                let y = b.y + 1.0;
+                let y = b.center_y() - h / 2.0;
                 if i < lit {
                     // A calm gradient from deep to full colour; the newest segment glows.
                     let t = i as f32 / n as f32;
@@ -1179,6 +1217,14 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
                     segment(&mut shapes, x, y, w, h, OFF_EDGE);
                     segment(&mut shapes, x + 1.0, y + 1.0, w - 2.0, h - 2.0, OFF);
                 }
+            }
+            if self.on_change.is_some() {
+                let db = self.gate_db;
+                let x = b.x + 4.0 + (b.width - 8.0) * ((db + 72.0) / 72.0).clamp(0.0, 1.0);
+                let color = if db <= -72.0 { Color::from_rgb8(0x8A, 0x8B, 0x92) } else { TAG };
+                slant(&mut shapes, x - 1.0, b.y + 2.0, 2.0, b.height - 4.0, 0.0, color);
+                slant(&mut shapes, x - 4.0, b.y + 1.0, 8.0, 3.0, 0.0, color);
+                slant(&mut shapes, x - 4.0, b.y + b.height - 4.0, 8.0, 3.0, 0.0, color);
             }
             m.painted.draw(renderer, b.expand(10.0), shapes);
             return;
@@ -1203,6 +1249,30 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
                 renderer.fill_quad(Quad { bounds: Rectangle { x, y: b.y + METER_H / 2.0 - 1.0, width: w, height: 2.0 }, ..Quad::default() }, track);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    #[test]
+    fn click_drag_outside_release_and_reset() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let mut meter = gate_meter(0.5, Color::WHITE, -42.0, |v| v);
+        let mut tree = Tree::new(meter.as_widget());
+        let node = meter.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(728.0, 24.0)));
+        let bounds = node.bounds();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut send = |event, cursor| meter.as_widget_mut().update(&mut tree, &event, Layout::new(&node), cursor, &renderer, &mut clipboard, &mut Shell::new(&mut messages), &bounds);
+        let at = |x| mouse::Cursor::Available(Point::new(x, 12.0));
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), at(364.0));
+        send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(900.0, 12.0) }), at(900.0));
+        send(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), at(900.0));
+        send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(100.0, 12.0) }), at(100.0));
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), at(364.0));
+        assert_eq!(messages, [-36.0, 0.0, -72.0]);
+        assert!(!tree.state.downcast_ref::<MeterState>().drag);
     }
 }
 
@@ -2093,13 +2163,21 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
     }
 }
 
-/// Gusts rushing into the hole: each one a few parallel streaks and a speck or two of the
-/// interface, starting somewhere in the window and speeding up towards a point along the slot.
-/// Few gusts, each one path: tiny-skia pays for every repainted patch (it rebuilds a window-sized
-/// clip mask per layer and per patch), so a frame repaints a handful of patches; streaks
-/// scattered one by one cost 70 ms a frame, a dozen thin gusts still 19 ms.
+/// Straight streaks and specks of the interface rushing into the hole from all over the
+/// window, each speeding up towards a point along the slot. They are filled as a few paths, one
+/// per colour and brightness step, so a frame repaints the window as one patch: tiny-skia pays
+/// for every separate patch (a window-sized clip mask per layer), and a path per streak cost
+/// 70 ms a frame.
 fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, strength: f32) {
-    const GUSTS: u32 = 6;
+    const STEPS: usize = 8;
+    let colors = [TAG, HEAD, INK, Color::from_rgb8(163, 163, 169), Color::from_rgb8(94, 95, 102)];
+    let mut quads: [[Vec<[Point; 4]>; STEPS]; 5] = Default::default();
+    let mut put = |color: usize, alpha: f32, quad: [Point; 4]| {
+        let step = (alpha * STEPS as f32).round() as usize;
+        if step > 0 {
+            quads[color][step.min(STEPS) - 1].push(quad);
+        }
+    };
     let (cx, cy) = (slot.center_x(), slot.center_y());
     let spawn = |seed: u32| {
         for k in 0..8 {
@@ -2111,68 +2189,70 @@ fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, 
         }
         Point::new(window.x + window.width - 30.0, window.y + 60.0)
     };
-    let specks = [TAG, INK, Color::from_rgb8(163, 163, 169), Color::from_rgb8(94, 95, 102)];
-    let active = GUSTS as f32 * (strength + 0.25).min(1.0);
-    for i in 0..GUSTS {
-        let gate = (active - i as f32).clamp(0.0, 1.0);
-        if gate <= 0.0 {
-            break;
-        }
-        let q = tau / (900.0 * (0.8 + 0.4 * grain(i, 3))) + i as f32 / GUSTS as f32 + 0.1 * grain(i, 9);
-        let (round, u) = (q.floor(), q.fract());
-        if round < 1.0 {
-            continue; // not blown yet: every gust starts from its own spot, not mid-flight
-        }
-        let seed = i.wrapping_mul(977).wrapping_add((round as u32).wrapping_mul(131));
-        let from = spawn(seed);
-        let to = Point::new(cx + (grain(seed, 40) - 0.5) * (slot.width - 28.0), cy + (grain(seed, 41) - 0.5) * slot.height * 0.4);
-        let (r0, a0) = ((from.x - to.x).hypot(from.y - to.y), (from.y - to.y).atan2(from.x - to.x));
-        let bend = (grain(seed, 42) - 0.5) * 0.3;
-        let at = |u: f32| {
-            let (r, a) = (r0 * (1.0 - u).sqrt(), a0 + bend * u);
-            Point::new(to.x + r * a.cos(), to.y + r * a.sin())
-        };
-        let fade = (u / 0.14).clamp(0.0, 1.0) * ((1.0 - u) / 0.1).clamp(0.0, 1.0) * gate;
-        let (head, back) = (at(u), at((u - 0.045).max(0.0)));
-        let (dx, dy) = (head.x - back.x, head.y - back.y);
-        let moved = dx.hypot(dy);
-        if moved < 0.01 {
-            continue;
-        }
-        // Along and across the gust; its lanes close in as it nears the slot.
-        let (ux, uy) = (dx / moved, dy / moved);
-        let (nx, ny) = (-uy, ux);
-        let spread = (1.0 - u).sqrt();
-        let length = (moved * 3.0).clamp(10.0, 64.0);
-        let lanes = 5 + (grain(seed, 46) * 4.0) as u32;
-        let streaks = Path::new(|p| {
-            for j in 0..lanes {
-                let off = ((j as f32 - (lanes - 1) as f32 / 2.0) * 7.0 + (grain(seed, 50 + j) - 0.5) * 5.0) * spread;
-                let lag = grain(seed, 60 + j) * 0.35 * length;
-                let h = Point::new(head.x + nx * off - ux * lag, head.y + ny * off - uy * lag);
-                let half = (1.1 + 0.7 * grain(seed, 80 + j)) / 2.0;
-                let reach = length * (0.6 + 0.5 * grain(seed, 70 + j));
-                p.move_to(Point::new(h.x + nx * half, h.y + ny * half));
-                p.line_to(Point::new(h.x - nx * half, h.y - ny * half));
-                p.line_to(Point::new(h.x - ux * reach, h.y - uy * reach));
-                p.close();
+    // (seed offset, count, lifetime on the air's clock, specks rather than streaks)
+    for (v, count, life, speck) in [(2u32, 96u32, 850.0f32, false), (5, 32, 1250.0, true)] {
+        let density = count as f32 * (strength + 0.25).min(1.0);
+        for i in 0..count {
+            let gate = (density - i as f32).clamp(0.0, 1.0);
+            if gate <= 0.0 {
+                break;
             }
-        });
-        let color = if i % 3 == 0 { TAG } else if i % 7 == 0 { HEAD } else { INK };
-        let alpha = (0.3 + 0.6 * u) * fade;
-        let tail = Point::new(head.x - ux * length * 1.3, head.y - uy * length * 1.3);
-        frame.fill(&streaks, gradient::Linear::new(head, tail).add_stop(0.0, Color { a: alpha, ..color }).add_stop(1.0, Color { a: 0.0, ..color }));
-        // Specks of the interface carried along, a little behind.
-        for j in 0..2 + (grain(seed, 90) * 3.0) as u32 {
-            let at_speck = at((u - 0.03 - 0.05 * grain(seed, 91 + j)).max(0.0));
-            let off = (grain(seed, 95 + j) - 0.5) * 7.0 * lanes as f32 * spread;
-            let side = 2.0 + (grain(seed, 44 + j) * 3.0).floor();
-            let spin = if (i + j) % 2 == 1 { 1.0 } else { -1.0 } * u * 600.0;
-            frame.push_transform();
-            frame.translate(iced::Vector::new(at_speck.x + nx * off, at_speck.y + ny * off));
-            frame.rotate(spin.to_radians());
-            frame.fill_rectangle(Point::new(-side / 2.0, -side / 2.0), Size::new(side, side), Color { a: 0.9 * fade, ..specks[((i + j) % 4) as usize] });
-            frame.pop_transform();
+            let q = tau / (life * (0.75 + 0.5 * grain(i, v + 3))) + grain(i, v + 9);
+            let (round, u) = (q.floor(), q.fract());
+            if round < 1.0 {
+                continue; // not blown yet: every one starts from its own spot, not mid-flight
+            }
+            let seed = i.wrapping_mul(977).wrapping_add((round as u32).wrapping_mul(131)).wrapping_add(v * 71);
+            let from = spawn(seed);
+            let to = Point::new(cx + (grain(seed, 40) - 0.5) * (slot.width - 28.0), cy + (grain(seed, 41) - 0.5) * slot.height * 0.4);
+            let (r0, a0) = ((from.x - to.x).hypot(from.y - to.y), (from.y - to.y).atan2(from.x - to.x));
+            let (pull, bend) = if speck { (0.55, (grain(seed, 43) - 0.5) * 0.7) } else { (0.5, (grain(seed, 42) - 0.5) * 0.3) };
+            let at = |u: f32| {
+                let (r, a) = (r0 * (1.0 - u).powf(pull), a0 + bend * u);
+                Point::new(to.x + r * a.cos(), to.y + r * a.sin())
+            };
+            let fade = (u / 0.14).clamp(0.0, 1.0) * ((1.0 - u) / 0.1).clamp(0.0, 1.0) * gate;
+            let (head, back) = (at(u), at((u - 0.045).max(0.0)));
+            if speck {
+                let half = (2.0 + (grain(seed, 44) * 3.0).floor()) / 2.0;
+                let (sin, cos) = (if i % 2 == 1 { 1.0f32 } else { -1.0 } * u * 600.0).to_radians().sin_cos();
+                let corner = |x: f32, y: f32| Point::new(head.x + x * cos - y * sin, head.y + x * sin + y * cos);
+                put([0, 2, 3, 4][i as usize % 4], 0.9 * fade, [corner(-half, -half), corner(half, -half), corner(half, half), corner(-half, half)]);
+                continue;
+            }
+            let (dx, dy) = (head.x - back.x, head.y - back.y);
+            let moved = dx.hypot(dy);
+            if moved < 0.01 {
+                continue;
+            }
+            // A thin wedge from the head back along the path, in three pieces fading to its tail.
+            let (ux, uy) = (dx / moved, dy / moved);
+            let length = (moved * 2.1).clamp(2.0, 56.0);
+            let half = (1.3 + 0.6 * grain(seed, 45)) / 2.0;
+            let color = if i % 4 == 0 { 0 } else if i % 9 == 0 { 1 } else { 2 };
+            let alpha = (0.16 + 0.6 * u) * fade;
+            for (k, dim) in [1.0, 0.55, 0.22].into_iter().enumerate() {
+                let (near, far) = (k as f32 / 3.0, (k + 1) as f32 / 3.0);
+                let point = |along: f32, side: f32| {
+                    let w = half * (1.0 - along) * side;
+                    Point::new(head.x - ux * length * along - uy * w, head.y - uy * length * along + ux * w)
+                };
+                put(color, alpha * dim, [point(near, 1.0), point(near, -1.0), point(far, -1.0), point(far, 1.0)]);
+            }
+        }
+    }
+    for (color, steps) in colors.into_iter().zip(&quads) {
+        for (step, quads) in steps.iter().enumerate().filter(|(_, q)| !q.is_empty()) {
+            let path = Path::new(|p| {
+                for [a, b, c, d] in quads {
+                    p.move_to(*a);
+                    p.line_to(*b);
+                    p.line_to(*c);
+                    p.line_to(*d);
+                    p.close();
+                }
+            });
+            frame.fill(&path, Color { a: (step + 1) as f32 / STEPS as f32, ..color });
         }
     }
 }
@@ -2442,6 +2522,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Glitch {
         }
     }
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        // This layer is drawn in every frame of the app window, right before it is presented.
+        crate::update_window::apply_next_frame();
         let b = layout.bounds();
         if let Ok(mut area) = WINDOW_AREA.lock() {
             *area = Some(b.size());

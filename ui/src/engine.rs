@@ -91,6 +91,8 @@ unsafe extern "C" {
     fn mnr_tag_device_state(detail: *mut c_char, capacity: u32) -> i32;
     fn mnr_bindings(p: usize, keys: *const u32, count: u32);
     fn mnr_alternate_intensity(p: usize, intensity: f32);
+    fn mnr_noise_gate(p: usize, threshold_db: f32) -> i32;
+    fn mnr_noise_peak(p: usize) -> f32;
     fn mnr_capture_key(p: usize, enabled: i32);
     fn mnr_events(p: usize) -> u32;
     fn mnr_shell_start(p: usize, error: *mut c_char, cap: u32) -> i32;
@@ -233,6 +235,7 @@ pub struct Controls {
     pub effects: EffectOptions,
     pub intensity: f32,
     pub alternate_intensity: f32,
+    pub noise_gate_db: f32,
     pub muted: bool,
     pub rvc: bool,
     pub rvc_options: crate::rvc::Options,
@@ -448,6 +451,7 @@ impl Engine {
         unsafe {
             let o = controls.rvc_options;
             mnr_alternate_intensity(p, controls.alternate_intensity);
+            mnr_noise_gate(p, controls.noise_gate_db);
             mnr_rvc_settings(p, o.slot, o.pitch, o.index, o.chunk, o.gain);
             mnr_controls(
                 p,
@@ -679,6 +683,7 @@ impl Engine {
         unsafe {
             let o = c.rvc_options;
             mnr_alternate_intensity(self.p, c.alternate_intensity);
+            mnr_noise_gate(self.p, c.noise_gate_db);
             mnr_rvc_settings(self.p, o.slot, o.pitch, o.index, o.chunk, o.gain);
             mnr_controls(
                 self.p,
@@ -697,6 +702,7 @@ impl Engine {
         }
     }
     pub fn effect_activity(&self) -> u32 { unsafe { mnr_effect_activity(self.p) } }
+    pub fn noise_peak(&self) -> f32 { unsafe { mnr_noise_peak(self.p) } }
     pub fn bindings(&self, keys: [u32; 21]) {
         unsafe { mnr_bindings(self.p, keys.as_ptr(), keys.len() as u32) }
     }

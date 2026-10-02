@@ -314,7 +314,10 @@ pub fn update_card<'a, M: 'a>(stage: tacho::BarStage, from: &str, to: &str) -> E
 }
 /// The update card centred on the colour key, so a keyed window shows only the card.
 pub fn update_card_on_key<'a, M: 'a>(stage: tacho::BarStage, from: &str, to: &str) -> Element<'a, M> {
-    container(update_card(stage, from, to))
+    // Its rounded corners blend into the border colour, not into the key: the window's rounded
+    // region (`update_window::set_region`) cuts the square around them.
+    let card = container(update_card(stage, from, to)).style(|_| container::Style { background: Some(Color::from_rgb8(0x2A, 0x2B, 0x30).into()), ..Default::default() });
+    container(card)
         .center(Length::Fill)
         .style(|_| container::Style { background: Some(tacho::KEY.into()), ..Default::default() })
         .into()
@@ -946,7 +949,7 @@ impl App {
         });
 
         let before = self.in_peak;
-        let after = self.peak;
+        let after = self.noise_peak;
         // From −72 dB: the raw microphone's hiss (about −60 dB) shows on «До», while what is
         // left after the denoiser (around −80 dB) reads as silence on «После».
         let level = |p: f32| ((db(p) + 72.0) / 72.0).clamp(0.0, 1.0);
@@ -955,9 +958,14 @@ impl App {
                 row![label("До", 12, DIM).width(56), tacho::level_meter(level(before), true, Color::from_rgb8(0x8A, 0x8B, 0x92)), container(numbers(db_text(before), 12, DIM)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
-                row![label("После", 12, INK).width(56), tacho::level_meter(level(after), false, if level(after) > 0.93 { ORANGE } else { GREEN }), container(numbers(db_text(after), 12, INK)).align_right(64)]
+                row![label("После", 12, INK).width(56), frame(tacho::gate_meter(level(after), if level(after) > 0.93 { ORANGE } else { GREEN }, self.controls.noise_gate_db, Msg::NoiseGate), self.ring(self.focus == NOISE_GATE)), container(numbers(db_text(after), 12, INK)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
+                row![
+                    label(if self.controls.noise_gate_db <= -72.0 { "Гейт выключен".into() } else { format!("Гейт: {:.0} dB", self.controls.noise_gate_db) }, 12, if self.controls.noise_gate_db <= -72.0 { DIM } else { ORANGE }),
+                    label("Порог на «После» · слева / ПКМ — выкл.", 12, DIM),
+                ].spacing(12).align_y(iced::Center),
+                label("«После» показывает уровень до гейта. Не забудьте отключить гейт в Discord.", 12, DIM),
             ]
             .spacing(10),
         )
@@ -3630,6 +3638,19 @@ mod tests {
         app.keys[..13].copy_from_slice(&[3 << 8 | 0x54, 3 << 8 | 36, 1 << 8 | 36, 2 << 8 | 36, 36, 0, 3 << 8 | 6, 1 << 8 | 6, 2 << 8 | 6, 6, 1 << 8 | 4, 2 << 8 | 4, 4]);
         app.in_peak = 0.2;
         app.peak = 0.08;
+        app.noise_peak = 0.08;
+        if std::env::var_os("MNR_GATE_ONLY").is_some() {
+            render(&app, "gate-off");
+            app.controls.noise_gate_db = -42.0;
+            app.focus = focus::effects::NOISE_GATE;
+            render(&app, "gate-voice");
+            app.noise_peak = 0.001;
+            render(&app, "gate-quiet");
+            window.set((820.0, 600.0));
+            scale.set(2.0);
+            render(&app, "gate-small-2x");
+            return;
+        }
         app.controls.intensity = 0.99;
         render(&app, "main");
         app.controls.intensity = 1.35;

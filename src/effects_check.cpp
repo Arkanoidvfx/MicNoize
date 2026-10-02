@@ -8,6 +8,34 @@
 static void require(bool ok,const char* message){if(!ok) throw std::runtime_error(message);}
 int main() {try {
     {
+        mic::NoiseGate gate;std::array<float,480> data{};
+        data.fill(0.001f);
+        require(gate.process(data.data(),data.size(),-40)==0.001f,"Gate lost its pre-gate meter");
+        for(float v:data)require(v==0,"Closed gate leaked quiet microphone");
+        data.fill(0.1f);gate.process(data.data(),data.size(),-40);
+        require(data.front()>0 && data.front()<0.001f && data.back()==0.1f,"Gate attack is not a bounded ramp");
+        data.fill(0.008f);gate.process(data.data(),data.size(),-40);
+        for(float v:data)require(v==0.008f,"Gate hysteresis chopped quiet speech");
+        for(unsigned frame=0;frame<12;++frame){data.fill(0.001f);gate.process(data.data(),data.size(),-40);require(data.back()==0.001f,"Gate hold cut a word ending");}
+        data.fill(0.001f);gate.process(data.data(),data.size(),-40);
+        require(data.front()>0 && data.front()<0.001f && data.back()==0,"Gate release is not a bounded ramp");
+        data.fill(0.1f);gate.process(data.data(),data.size(),-40);
+        require(data.back()==0.1f,"Gate did not reopen");
+        for(unsigned i=0;i<data.size();++i)data[i]=0.2f*std::sin(i*0.1f);
+        const auto dry=data;gate.process(data.data(),data.size(),-72);
+        require(data==dry,"Disabled gate is not exact dry bypass");
+        gate=mic::NoiseGate{};data.fill(0.5f);gate.process(data.data(),data.size(),0);
+        for(float v:data)require(v==0,"Gate upper threshold ignored");
+        // The common output mixer used by TAG and WASAPI receives a gated microphone,
+        // while Discord and soundpad keep their own samples; final Mute is still downstream.
+        data.fill(0.001f);gate.process(data.data(),data.size(),-40);
+        auto microphone=data;data.fill(0.1f);std::array<float,480> sound{};sound.fill(0.2f);
+        std::array<uint8_t,480> discord{};discord.fill(1);mic::OutputEffects mix;
+        mix.process(data.data(),data.size(),1,1,false,false,discord.data(),0.08f,nullptr,microphone.data(),nullptr,sound.data());
+        for(float v:data)require(std::isfinite(v) && std::abs(v-0.208f)<1e-6f,"Microphone gate muted Discord or soundpad");
+        std::cout<<"noise_gate=passed bypass=exact hysteresis_hold_ramps=passed source_isolation=passed\n";
+    }
+    {
         // Grain reverse: 50 % Hann overlap must add to unity (steady input stays steady),
         // stay bounded, reverse order inside a grain, and reset to silence.
         mic::GrainReverse reverse;std::vector<float> x(48000,0.5f);

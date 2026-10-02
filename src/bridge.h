@@ -63,6 +63,9 @@ int32_t mnr_tag_autostart(int32_t mode,char* error,uint32_t capacity);
 void mnr_tag_task_warning(char* error,uint32_t capacity);
 void mnr_bindings(Mnr*,const uint32_t* keys,uint32_t count);
 void mnr_alternate_intensity(Mnr*,float intensity);
+// Microphone gate threshold -72..0 dBFS; -72 disables it. Invalid values are rejected.
+int32_t mnr_noise_gate(Mnr*,float threshold_db);
+float mnr_noise_peak(Mnr*); // Peak before the gate since the previous call.
 void mnr_capture_key(Mnr*,int32_t enabled);
 uint32_t mnr_events(Mnr*);
 int32_t mnr_shell_start(Mnr*,char* error,uint32_t capacity);
