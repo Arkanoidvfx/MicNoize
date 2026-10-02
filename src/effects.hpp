@@ -26,17 +26,32 @@ struct Ramp {
 struct NoiseGate {
     Ramp gain{0};
     size_t hold=0;
-    float process(float* data,size_t n,float db) {
+    float process(float* data,size_t n,float db,float* envelope=nullptr) {
         float peak=0;
         for(size_t i=0;i<n;++i)peak=std::max(peak,std::abs(data[i]));
-        if(!std::isfinite(db) || db<=-72) {gain=Ramp{1};hold=0;return peak;}
+        if(!std::isfinite(db) || db<=-72) {
+            gain=Ramp{1};hold=0;
+            if(envelope)std::fill_n(envelope,n,1.0f);
+            return peak;
+        }
         const float threshold=std::pow(10.0f,std::min(db,0.0f)/20.0f);
         const bool detected=peak>=threshold || (hold && peak>=threshold*0.70794578f);
         if(detected)hold=5760;
         const bool open=hold!=0;
         if(!detected)hold=hold>n?hold-n:0;
-        for(size_t i=0;i<n;++i)data[i]*=gain.next(open?1.0f:0.0f);
+        for(size_t i=0;i<n;++i){
+            const float level=gain.next(open?1.0f:0.0f);
+            if(envelope)envelope[i]=level;
+            data[i]*=level;
+        }
         return peak;
+    }
+    // Hotkey playback keeps its samples; converted live voice still passes the gate.
+    static void applyVoice(float* data,size_t n,const float* envelope,uint8_t* modified,bool discord) {
+        for(size_t i=0;i<n;++i){
+            if(!discord && !(modified[i]&~ModifiedVoice))data[i]*=envelope[i];
+            if(modified[i]&ModifiedVoice)modified[i]=static_cast<uint8_t>((modified[i]&~ModifiedVoice)|ModifiedEffects);
+        }
     }
 };
 struct OutputEffects {

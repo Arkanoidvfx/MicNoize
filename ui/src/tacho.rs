@@ -1701,12 +1701,11 @@ fn ready_button(card: Rectangle) -> Rectangle {
 
 /// The card's own layer: hides it while the tag falls, then its mosaic dissolves in a wave
 /// from the bottom left; later a ring around the button and a gleam across it.
-pub fn ready_fx<'a, Message: 'a>(start: Option<Instant>, mosaic: Option<std::sync::Arc<Mosaic>>, cover: Color) -> Element<'a, Message> {
-    Element::new(ReadyFx { start, mosaic, cover })
+pub fn ready_fx<'a, Message: 'a>(start: Option<Instant>, cover: Color) -> Element<'a, Message> {
+    Element::new(ReadyFx { start, cover })
 }
 struct ReadyFx {
     start: Option<Instant>,
-    mosaic: Option<std::sync::Arc<Mosaic>>,
     cover: Color,
 }
 impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
@@ -1736,9 +1735,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
         let mut shapes = Vec::new();
         if ms < ready::MOSAIC.0 {
             slant(&mut shapes, b.x - 1.0, b.y - 1.0, b.width + 2.0, b.height + 2.0, 0.0, self.cover);
-        } else if ms < ready::MOSAIC.1
-            && let Some(m) = &self.mosaic
-        {
+        } else if ms < ready::MOSAIC.1 {
             let p = ready_span(ms, ready::MOSAIC);
             let side = 11.0;
             let (cols, rows) = ((b.width / side).ceil() as usize, (b.height / side).ceil() as usize);
@@ -1747,17 +1744,23 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
                     let u = ((c as f32 + 0.5) / cols as f32 + (rows - 1 - r) as f32 / rows as f32) / 2.0;
                     let local = (p * 1.6 - u * 0.6).clamp(0.0, 1.0);
                     let alpha = ((1.0 - local) * 10.0).round() / 10.0;
-                    let (u0, v0) = (c as f32 / cols as f32, r as f32 / rows as f32);
-                    let (u1, v1) = ((c + 1) as f32 / cols as f32, (r + 1) as f32 / rows as f32);
-                    let [red, green, blue] = sample(m, u0, v0, u1, v1).map(|v| v.round() as u8);
-                    slant(&mut shapes, b.x + c as f32 * side, b.y + r as f32 * side, side + 0.6, side + 0.6, 0.0, Color { a: alpha, ..Color::from_rgb8(red, green, blue) });
+                    slant(&mut shapes, b.x + c as f32 * side, b.y + r as f32 * side, side + 0.6, side + 0.6, 0.0, Color { a: alpha, ..self.cover });
                 }
             }
         }
         let button = ready_button(b);
         renderer.with_layer(b, |renderer| {
             let mut frame = Frame::new(b);
-            fill_shapes(&mut frame, &shapes);
+            // One contour per opacity band instead of hundreds of cell-sized layers.
+            for step in 1..=10 {
+                let alpha = step as f32 / 10.0;
+                let path = Path::new(|p| {
+                    for s in shapes.iter().filter(|s| (s.color.a-alpha).abs()<0.001) {
+                        p.rectangle(Point::new(s.x,s.y),Size::new(s.w,s.h));
+                    }
+                });
+                frame.fill(&path,Color { a:alpha,..self.cover });
+            }
             let ring = ready_span(ms, ready::RING);
             if ring > 0.0 && ring < 1.0 {
                 let grow = 6.0 * (1.0 - (1.0 - ring).powi(3));
@@ -1903,7 +1906,7 @@ pub mod restart {
     pub const WIND: (f32, f32) = (820.0, 1300.0);
     /// The restart waits at least this long after the click: the button has fallen out and the
     /// air rushes in before the window morphs.
-    pub const HOLD: Duration = Duration::from_millis(1600);
+    pub const HOLD: Duration = Duration::from_millis(3500);
 }
 /// How the button leaves its slot: sinks turning like into a drain, is knocked out and falls
 /// off the window, swings in like a hatch, or cracks into slanted segments that drop one by one.
@@ -2037,7 +2040,7 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartSlot {
         } else {
             let s = (ms - restart::DROP.1) / 1000.0;
             0.25 + 0.75 * (-s * 2.5).exp() + 0.06 * (ms / 60.0).sin()
-        };
+        }.clamp(0.0,1.0);
         if heat > 0.01 {
             let rim = Path::rounded_rectangle(Point::new(b.x - 1.5, b.y - 1.5), Size::new(b.width + 3.0, b.height + 3.0), 9.5.into());
             frame.stroke(&rim, Stroke::default().with_width(4.0).with_color(Color { a: 0.2 * heat, ..TAG }));
@@ -2093,11 +2096,11 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartSlot {
 
 /// The window's layer for the restart: the button falling off the window or crumbling into
 /// segments, and the air: streaks and specks from all over the window rushing into the hole.
-/// Draws nothing else, and never moves the window's own content.
-pub fn restart_wind<'a, Message: 'a>(restart: Option<Restart>) -> Element<'a, Message> {
-    Element::new(RestartWind(restart))
+/// Pieces of the actual interface detach into the hole while the remaining window stays put.
+pub fn restart_wind<'a, Message: 'a>(restart: Option<Restart>, mosaic: Option<std::sync::Arc<Mosaic>>) -> Element<'a, Message> {
+    Element::new(RestartWind(restart, mosaic))
 }
-struct RestartWind(Option<Restart>);
+struct RestartWind(Option<Restart>, Option<std::sync::Arc<Mosaic>>);
 impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fill, height: Length::Fill }
@@ -2158,6 +2161,7 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
         let strength = r.wind(now);
         if strength > 0.001 {
             restart_air(&mut frame, window, slot, r.tau(now), strength);
+            if let Some(mosaic)=&self.1 {restart_debris(&mut frame,window,slot,mosaic,ms);}
         }
         renderer.draw_geometry(frame.into_geometry());
     }
@@ -2190,18 +2194,16 @@ fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, 
         Point::new(window.x + window.width - 30.0, window.y + 60.0)
     };
     // (seed offset, count, lifetime on the air's clock, specks rather than streaks)
-    for (v, count, life, speck) in [(2u32, 96u32, 850.0f32, false), (5, 32, 1250.0, true)] {
-        let density = count as f32 * (strength + 0.25).min(1.0);
+    for (v, count, life, speck) in [(2u32, 72u32, 850.0f32, false), (5, 24, 1250.0, true)] {
         for i in 0..count {
-            let gate = (density - i as f32).clamp(0.0, 1.0);
-            if gate <= 0.0 {
-                break;
-            }
-            let q = tau / (life * (0.75 + 0.5 * grain(i, v + 3))) + grain(i, v + 9);
-            let (round, u) = (q.floor(), q.fract());
-            if round < 1.0 {
-                continue; // not blown yet: every one starts from its own spot, not mid-flight
-            }
+            let gate = (strength*2.0-grain(i,v+91)).clamp(0.0,1.0);
+            let flight = life * (0.7 + 0.8 * grain(i, v + 3));
+            let period = flight + 450.0 + 1800.0 * grain(i,v+7);
+            let age=tau-2000.0*grain(i,v+9);
+            if age<0.0 {continue;}
+            let round=(age/period).floor();
+            let u=(age-period*round)/flight;
+            if u>=1.0 || gate<=0.0 {continue;}
             let seed = i.wrapping_mul(977).wrapping_add((round as u32).wrapping_mul(131)).wrapping_add(v * 71);
             let from = spawn(seed);
             let to = Point::new(cx + (grain(seed, 40) - 0.5) * (slot.width - 28.0), cy + (grain(seed, 41) - 0.5) * slot.height * 0.4);
@@ -2254,6 +2256,54 @@ fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, 
             });
             frame.fill(&path, Color { a: (step + 1) as f32 / STEPS as f32, ..color });
         }
+    }
+}
+
+/// Bounded pieces of the actual interface, with staggered lift, turn and accelerating pull.
+/// Seven colour paths preserve the snapshot's text/controls without a layer per pixel.
+fn restart_debris(frame: &mut Frame, window: Rectangle, slot: Rectangle, mosaic: &Mosaic, ms: f32) {
+    let palette=[Color::from_rgb8(20,21,23),Color::from_rgb8(34,35,38),Color::from_rgb8(75,77,82),INK,HEAD,TAG,Color::from_rgb8(92,165,116)];
+    let mut pieces: [Vec<[Point;4]>;7]=Default::default();
+    let mut holes: [Vec<Rectangle>;2]=Default::default();
+    for i in 0..12u32 {
+        let delay=980.0+grain(i,121)*1000.0;
+        if ms<delay {continue;}
+        let source=if i<4 {
+            Rectangle { x:window.x+20.0,y:window.y+96.0+i as f32*44.0,width:152.0,height:28.0 }
+        } else {
+            Rectangle { x:window.x+window.width*(0.28+0.57*grain(i,122)),y:window.y+window.height*(0.12+0.67*grain(i,123)),width:64.0+32.0*grain(i,124),height:24.0+12.0*grain(i,125) }
+        };
+        holes[usize::from(i>=4)].push(source);
+        let t=((ms-delay)/(750.0+grain(i,126)*700.0)).clamp(0.0,1.0);
+        if t>=1.0 {continue;}
+        let q=t.powf(2.2);
+        let origin=Point::new(source.center_x(),source.center_y());
+        let target=Point::new(slot.center_x(),slot.center_y());
+        let bend=(grain(i,127)-0.5)*120.0*(std::f32::consts::PI*t).sin();
+        let center=Point::new(origin.x+(target.x-origin.x)*q+bend,origin.y+(target.y-origin.y)*q-14.0*(std::f32::consts::PI*t).sin());
+        let scale=1.0-q;
+        let (sin,cos)=((grain(i,128)-0.5)*4.0*t*t).sin_cos();
+        let point=|x:f32,y:f32| {let (x,y)=((x-origin.x)*scale,(y-origin.y)*scale);Point::new(center.x+x*cos-y*sin,center.y+x*sin+y*cos)};
+        let side=MOSAIC_CELL;
+        for row in 0..(source.height/side).ceil() as usize {
+            for col in 0..(source.width/side).ceil() as usize {
+                let x=source.x+col as f32*side;let y=source.y+row as f32*side;
+                let pixel=sample(mosaic,(x-window.x)/window.width,(y-window.y)/window.height,(x+side-window.x)/window.width,(y+side-window.y)/window.height);
+                let color=palette.iter().enumerate().min_by_key(|(_,c)| {
+                    ((pixel[0]-c.r*255.0).powi(2)+(pixel[1]-c.g*255.0).powi(2)+(pixel[2]-c.b*255.0).powi(2)) as u32
+                }).map_or(0,|(index,_)|index);
+                let (right,bottom)=((x+side).min(source.x+source.width),(y+side).min(source.y+source.height));
+                pieces[color].push([point(x,y),point(right,y),point(right,bottom),point(x,bottom)]);
+            }
+        }
+    }
+    for (rects,color) in holes.iter().zip([Color::from_rgb8(17,18,20),Color::from_rgb8(13,14,16)]) {
+        let path=Path::new(|p| {for r in rects {p.rectangle(r.position(),r.size());}});
+        frame.fill(&path,color);
+    }
+    for (quads,color) in pieces.iter().zip(palette) {
+        let path=Path::new(|p| {for [a,b,c,d] in quads {p.move_to(*a);p.line_to(*b);p.line_to(*c);p.line_to(*d);p.close();}});
+        frame.fill(&path,color);
     }
 }
 

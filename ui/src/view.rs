@@ -541,7 +541,7 @@ impl App {
             // The restart's air stops where the morph takes over: under its colour key it
             // would float over the desktop.
             if self.restart.is_some() {
-                layers = layers.push(tacho::restart_wind(self.restart));
+                layers = layers.push(tacho::restart_wind(self.restart,self.restart_mosaic.clone()));
             }
         }
         if anim.is_some() {
@@ -728,7 +728,7 @@ impl App {
             // The celebration's layer only while it plays: the card keeps its widget state.
             let mut card = widget::stack![self.ready_card()];
             if self.ready_fx.is_some() {
-                card = card.push(tacho::ready_fx(self.ready_fx, self.ready_mosaic.clone(), RAIL));
+                card = card.push(tacho::ready_fx(self.ready_fx, RAIL));
             }
             rail = rail.push(card);
             rail = rail.push(Space::new().height(8));
@@ -3525,6 +3525,7 @@ mod tests {
         let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
         let mut tree = iced::advanced::widget::Tree::empty();
         let mut previous: Vec<iced_tiny_skia::Layer> = Vec::new();
+        let mut previous_backdrop=BG;
         let mut frame = |app: &App| {
             let mut element = app.view(window::Id::unique());
             tree.diff(element.as_widget());
@@ -3532,10 +3533,12 @@ mod tests {
             let start = Instant::now();
             renderer.reset(full);
             element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
-            let changes = damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full);
+            let backdrop=app.backdrop();
+            let changes = if backdrop!=previous_backdrop {vec![full]} else {damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full)};
+            previous_backdrop=backdrop;
             previous = renderer.layers().to_vec();
             let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
-            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, BG);
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, backdrop);
             let area: f32 = changes.iter().map(|r| r.width * r.height).sum();
             (area / (w * h), start.elapsed().as_secs_f64() * 1000.0)
         };
@@ -3566,19 +3569,34 @@ mod tests {
         // The restart's air: one frame of it after another, 16 ms apart.
         app.update_ready = true;
         let _ = frame(&app);
+        app.restart_mosaic=app.window_mosaic(App::window_size());
         let mut worst = (0.0_f32, 0.0_f64, 0.0_f64);
-        for i in 0..30u64 {
-            let mut restart = tacho::Restart::new(Instant::now() - Duration::from_millis(2500 + 16 * i), tacho::Fall::KnockOut);
+        let mut times=Vec::new();
+        for i in 0..200u64 {
+            let mut restart = tacho::Restart::new(Instant::now() - Duration::from_millis(850 + 16 * i), tacho::Fall::KnockOut);
             restart.advance(1, Instant::now() - Duration::from_millis(800));
             app.restart = Some(restart);
             let (a, t) = frame(&app);
-            worst = (worst.0.max(a), worst.1.max(t), worst.2 + t / 30.0);
+            worst = (worst.0.max(a), worst.1.max(t), worst.2 + t / 200.0);
+            times.push(t);
         }
+        times.sort_by(f64::total_cmp);
         eprintln!("restart air: worst {:.0} % of the window, worst {:.1} ms, mean {:.1} ms", worst.0 * 100.0, worst.1, worst.2);
+        eprintln!("restart air/debris p95: {:.1} ms",times[190]);
+        assert!(worst.2<16.0 && times[190]<24.0,"restart animation fell below the frame budget");
         // The ready card's confetti over the window, frame after frame.
         (app.restart, app.update_ready) = (None, false);
         app.ready_preview = Some(Instant::now());
         let _ = frame(&app);
+        let mut times=Vec::new();
+        for i in 0..90u64 {
+            app.ready_fx=Some(Instant::now()-Duration::from_millis(i*16));
+            times.push(frame(&app).1);
+        }
+        let mean=times.iter().sum::<f64>()/times.len() as f64;
+        times.sort_by(f64::total_cmp);
+        eprintln!("ready reveal: mean {mean:.1} ms, p95 {:.1} ms",times[85]);
+        assert!(mean<16.0 && times[85]<24.0,"ready button reveal fell below the frame budget");
         let mut worst = (0.0_f32, 0.0_f64, 0.0_f64);
         let frames = ((tacho::ready::CONFETTI.1 - tacho::ready::CONFETTI.0) / 16.0) as u64;
         for i in 0..frames {
@@ -3674,15 +3692,15 @@ mod tests {
         {
             app.headphone_page = false;
             app.ready_preview = Some(Instant::now());
-            app.ready_mosaic = mosaic_of(app.ready_card(), tacho::ready::CARD);
             for ms in [250u64, 560, 950, 1350, 1750, 2150, 2600, 3000, 3400] {
                 app.ready_fx = Some(Instant::now() - Duration::from_millis(ms));
                 render(&app, &format!("ready-{ms:04}"));
             }
-            (app.ready_fx, app.ready_preview, app.ready_mosaic) = (None, None, None);
+            (app.ready_fx, app.ready_preview) = (None, None);
             // «Перезапустить» clicked: pressed, each fall on its way, then the air blowing in.
             let ready = app.update_ready;
             app.update_ready = true;
+            app.restart_mosaic=app.window_mosaic(App::window_size());
             let ago = |ms: u64| Instant::now() - Duration::from_millis(ms);
             app.restart = Some(tacho::Restart::new(ago(90), tacho::Fall::Sink));
             render(&app, "restart-press");
@@ -3692,7 +3710,7 @@ mod tests {
                     render(&app, &format!("restart-{fall:?}-{ms}").to_lowercase());
                 }
             }
-            for (ms, step) in [(1500u64, 0u8), (3200, 1), (5000, 2)] {
+            for (ms, step) in [(1500u64, 0u8), (2200,0), (2800,1), (3200, 1), (5000, 2)] {
                 let mut restart = tacho::Restart::new(ago(ms), tacho::Fall::KnockOut);
                 restart.advance(step, ago(600));
                 app.restart = Some(restart);

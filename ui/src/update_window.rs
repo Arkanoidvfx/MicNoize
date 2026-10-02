@@ -96,7 +96,9 @@ pub fn color_key(hwnd: u64, on: bool, alpha: u8) {
             SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
             SetLayeredWindowAttributes(window, colorref, alpha, LWA_COLORKEY | LWA_ALPHA);
         } else {
-            SetWindowLongPtrW(window, GWL_EXSTYLE, style & !WS_EX_LAYERED);
+            // Keep the composed surface: clearing WS_EX_LAYERED discards its picture and
+            // can expose a black client area for a DWM frame before tiny-skia presents.
+            SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
             set_region(hwnd, None);
         }
     }
@@ -139,6 +141,34 @@ pub fn set_region(hwnd: u64, card: Option<(iced::Rectangle, f32)>) {
 }
 /// The update card's corner radius, as drawn by [`view::update_card`].
 const CARD_RADIUS: f32 = 12.0;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn removing_key_keeps_composed_surface() {
+        #[link(name="user32")]
+        unsafe extern "system" {
+            fn CreateWindowExW(ex:u32,class:*const u16,title:*const u16,style:u32,x:i32,y:i32,w:i32,h:i32,parent:isize,menu:isize,instance:isize,param:*const std::ffi::c_void)->isize;
+            fn DestroyWindow(hwnd:isize)->i32;
+            fn GetWindowLongPtrW(hwnd:isize,index:i32)->isize;
+            fn GetLayeredWindowAttributes(hwnd:isize,key:*mut u32,alpha:*mut u8,flags:*mut u32)->i32;
+        }
+        let class:Vec<u16>="STATIC\0".encode_utf16().collect();
+        unsafe {
+            let hwnd=CreateWindowExW(0,class.as_ptr(),class.as_ptr(),0x80000000,0,0,32,32,0,0,0,std::ptr::null());
+            assert_ne!(hwnd,0);
+            super::color_key(hwnd as u64,true,255);
+            super::color_key(hwnd as u64,false,255);
+            let style=GetWindowLongPtrW(hwnd,-20);
+            let (mut key,mut alpha,mut flags)=(0,0,0);
+            let got=GetLayeredWindowAttributes(hwnd,&mut key,&mut alpha,&mut flags);
+            DestroyWindow(hwnd);
+            assert_ne!(style & 0x00080000,0,"unkey discarded the composed surface");
+            assert_ne!(got,0);
+            assert_eq!((alpha,flags),(255,2),"opaque surface kept its colour key");
+        }
+    }
+}
 
 /// A window change held for the app's next frame: `(hwnd, take the key off too)`.
 static NEXT_FRAME: std::sync::Mutex<Option<(u64, bool)>> = std::sync::Mutex::new(None);

@@ -523,6 +523,7 @@ enum Msg {
     HeadphonePitch(f32),
     HeadphoneReverse(bool),
     Tick,
+    ShellTick,
     Opened(window::Id),
     WindowFocus(window::Id, bool),
     /// Windows minimized the window (0×0 resize), e.g. a taskbar click on the active window.
@@ -851,10 +852,11 @@ struct App {
     driver_ready: bool,
     /// The device lists arrived once: before that a missing microphone is no problem yet.
     devices_known: bool,
-    /// The «Обновление готово» card's celebration: when it started, its mosaic, and whether a
+    /// The «Обновление готово» card's celebration: when it started, and whether a
     /// newly downloaded update still waits to be celebrated where the user sees it.
     ready_fx: Option<Instant>,
-    ready_mosaic: Option<Arc<tacho::Mosaic>>,
+    /// The interface snapshot whose pieces detach during restart preparation.
+    restart_mosaic: Option<Arc<tacho::Mosaic>>,
     ready_fx_due: bool,
     ready_preview: Option<Instant>,
     /// «Перезапустить» clicked: the button falls out of the card and air rushes into the hole
@@ -999,6 +1001,9 @@ fn timer(visible: bool) -> Task<Msg> {
         },
         |_| Msg::Tick,
     )
+}
+fn shell_timer() -> Task<Msg> {
+    Task::perform(async {std::thread::sleep(Duration::from_millis(25));}, |_| Msg::ShellTick)
 }
 fn exit_ui() -> Task<Msg> {
     // Winit 0.30.13 can enter MsgWaitForMultipleObjectsEx after AboutToWait
@@ -1352,7 +1357,7 @@ impl App {
                 driver_ready,
                 devices_known: false,
                 ready_fx: None,
-                ready_mosaic: None,
+                restart_mosaic: None,
                 ready_fx_due: false,
                 ready_preview: None,
                 restart: None,
@@ -1458,6 +1463,7 @@ impl App {
             Task::batch([
                 open,
                 timer(true),
+                shell_timer(),
                 preload,
                 logs,
                 if cfg!(test) {
@@ -1732,10 +1738,15 @@ impl App {
             }
         }
     }
-    /// Plays the ready card's celebration from now; its mosaic is the card painted offscreen.
+    /// Plays the ready card's reveal from now, without an offscreen card repaint.
     fn start_ready_fx(&mut self) {
         self.ready_fx = Some(Instant::now());
-        self.ready_mosaic = view::mosaic_of(self.ready_card(), tacho::ready::CARD);
+    }
+    fn start_restart_fx(&mut self) {
+        let size=tacho::window_area().unwrap_or(Self::window_size());
+        self.restart_mosaic=self.window_mosaic(size);
+        self.restart=Some(tacho::Restart::new(Instant::now(),tacho::Fall::random()));
+        self.ready_fx=None;
     }
     /// The version the ready card shows: the download, or one patch up for the preview.
     fn ready_version(&self) -> String {
@@ -1787,7 +1798,11 @@ impl App {
     /// 2–10 ms for one full pass. A changed background is its only switch to a full pass, so
     /// `repaint_all` flips the lowest mantissa bit: a different colour, the same pixels.
     fn backdrop(&self) -> iced::Color {
-        iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ self.repaint_all as u32), ..view::BG }
+        // Animated overlays overlap many damage regions. One full pass is cheaper than
+        // repainting the same pixels several times; the mantissa changes remain invisible.
+        let motion=self.restart.map(|r|r.start).or(self.ready_fx);
+        let stamp=motion.map_or(0,|start|((start.elapsed().as_millis() as u32)&255)<<1);
+        iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ stamp ^ self.repaint_all as u32), ..view::BG }
     }
     fn page_key(&self) -> [bool; 6] {
         [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page, self.studio_page]
@@ -2189,6 +2204,23 @@ impl App {
             self.repaint_all ^= !matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize | Msg::WindowFocus(..));
         }
         match msg {
+            Msg::ShellTick => {
+                // Tray commands never wait for device/status polling or the meter timer.
+                let events=self.engine.events();
+                if events & 32 != 0 && !self.quitting {self.engine.refresh();}
+                if events & 16 != 0 {
+                    self.tray_ok=false;
+                    self.message="Не удалось создать значок трея. Окно останется доступным.".into();
+                }
+                let monitor=if events & 8 != 0 && !self.busy && matches!(self.snapshot.state,2|3) {self.update(Msg::Monitor)} else {Task::none()};
+                if restart_requested(events) {RESTART.store(true,Ordering::Relaxed);}
+                if events & (EXIT_EVENT|RESTART_EVENT)!=0 && !self.quitting {
+                    if self.repair_resume.is_some() {self.quit_after_repair=true;}
+                    else {self.quitting=true;self.save();self.engine.quit();}
+                }
+                let show=if events & 17 != 0 && !self.quitting {self.update(Msg::Show)} else {Task::none()};
+                return Task::batch([shell_timer(),monitor,show]);
+            }
             Msg::Tick => {
                 self.ticks += 1;
                 self.keys_down = if self.ui_active() && !cfg!(test) {
@@ -2222,7 +2254,7 @@ impl App {
                 }
                 // A played celebration leaves no empty layers behind.
                 if self.ready_fx.is_some_and(|start| start.elapsed().as_secs_f32() * 1000.0 > tacho::ready::END) {
-                    (self.ready_fx, self.ready_mosaic) = (None, None);
+                    self.ready_fx = None;
                 }
                 if let Some(since) = self.ready_preview {
                     // The preview's restart only plays: its steps pass by time, then the card goes.
@@ -2543,23 +2575,6 @@ impl App {
                     self.candidate = snapshot.captured_key;
                     return Task::batch([self.update(Msg::AcceptBind), timer(self.ui_active())]);
                 }
-                let events = self.engine.events();
-                if events & 32 != 0 && !self.quitting { self.engine.refresh(); }
-                if events & 16 != 0 {
-                    self.tray_ok = false;
-                    self.message =
-                        "Не удалось создать значок трея. Окно останется доступным.".into();
-                }
-                if events & 8 != 0 && !self.busy && matches!(self.snapshot.state, 2 | 3) {
-                    let _ = self.update(Msg::Monitor);
-                }
-                if restart_requested(events) {
-                    RESTART.store(true, Ordering::Relaxed);
-                }
-                if events & (EXIT_EVENT | RESTART_EVENT) != 0 && !self.quitting {
-                    if self.repair_resume.is_some() {self.quit_after_repair=true;}
-                    else {self.quitting = true;self.save();self.engine.quit();}
-                }
                 if self
                     .dirty
                     .is_some_and(|t| t.elapsed() > Duration::from_millis(400))
@@ -2576,9 +2591,6 @@ impl App {
                 if studio_just_started && self.studio_page && self.ui_active() && self.studio_loop
                     && self.studio_live && !self.studio_events.is_empty() {
                     return Task::batch([next, self.update(Msg::StudioRender(false))]);
-                }
-                if events & 17 != 0 {
-                    return Task::batch([next, self.update(Msg::Show)]);
                 }
                 if let Some((generation, samples)) = self.engine.last_clip(self.clip_generation) {
                     self.clip_generation = generation;
@@ -2693,13 +2705,14 @@ impl App {
             }
             Msg::Show => {
                 if let Some(id) = self.window {
-                    return Task::batch([window::minimize(id, false), window::gain_focus(id)]);
+                    // An in-flight hide/Opened callback may leave a tracked window hidden.
+                    return window::set_mode(id,window::Mode::Windowed)
+                        .chain(Task::batch([window::minimize(id,false),window::gain_focus(id)]));
                 }
                 if let Some(id) = self.hidden_window.take() {
                     self.window = Some(id);
                     return window::set_mode(id, window::Mode::Windowed)
-                        .chain(window::minimize(id, false))
-                        .chain(window::gain_focus(id));
+                        .chain(Task::batch([window::minimize(id, false),window::gain_focus(id)]));
                 }
                 let (id, t) = Self::open(self.qa_scale, None);
                 self.window = Some(id);
@@ -2813,8 +2826,7 @@ impl App {
                     self.update_checking = true;
                     self.apply_pending = true;
                     self.update_status = "Проверяем последнюю версию…".into();
-                    self.restart = Some(tacho::Restart::new(Instant::now(), tacho::Fall::random()));
-                    self.ready_fx = None;
+                    self.start_restart_fx();
                     return Task::perform(
                         async { updater::check_and_download() },
                         Msg::UpdateChecked,
@@ -4292,7 +4304,7 @@ impl App {
                 let Some(position) = position else { return self.hand_over(None) };
                 let center = iced::Point::new(position.x + size.width / 2.0, position.y + size.height / 2.0);
                 let to_version = self.update_version.clone().filter(|_| !self.rehearse_after_quit).unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
-                let from = self.window_mosaic(size);
+                let from = view::mosaic_of(self.view(window::Id::unique()),size);
                 let to = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Waiting, env!("CARGO_PKG_VERSION"), &to_version), view::UPDATE_CARD);
                 let (Some(from), Some(to), Some(id)) = (from, to, self.window) else { return self.hand_over(Some(center)) };
                 let card = iced::Rectangle {
@@ -4390,8 +4402,7 @@ impl App {
             }
             Msg::ReadyPreviewPlay => {
                 if self.restart.is_none() {
-                    self.restart = Some(tacho::Restart::new(Instant::now(), tacho::Fall::random()));
-                    self.ready_fx = None;
+                    self.start_restart_fx();
                 }
             }
             Msg::SignatureHover(on) => {

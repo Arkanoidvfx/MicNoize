@@ -47,6 +47,8 @@ Controller tests use in-memory settings and skip the native shell, device discov
 
 ## Install and reopen the UI
 
+Install local development builds only into `bin/MicNoize.exe`. Never copy them over a Velopack installation's `current/MicNoize.exe` or rewrite its bundle hash: the updater validates the installed UI/host against the official current-version full package before preserving rollback, so changing only `micnoize-bundle.json` still blocks updates. Use the normal updater for published packages. If a local build was copied into `current`, restore the original official UI and bundle from a hash-verified backup/package before checking for updates; leave the TAG host running.
+
 After build and selected checks pass, stop the matching installed UI and wait for its exit before copying. This resets processing; the relaunched UI starts the saved route itself after device discovery (there is no Start button). Do not restart for documentation-only changes.
 
 ```powershell

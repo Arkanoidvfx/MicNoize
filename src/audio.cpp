@@ -963,7 +963,7 @@ void Engine::dspLoop(Config c) {
         PitchEffect pitchEffect; AutoTunePitch autoTune; StutterEffect stutterMic,stutterDiscord;
         EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect; NoiseGate noiseGate;
         auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
-        std::array<float,block> in{},out{},microphone{},discordSource{},scratch{},echoMicOut{},echoDiscordOut{},captureData{};
+        std::array<float,block> in{},out{},microphone{},microphoneRaw{},gateEnvelope{},discordSource{},scratch{},echoMicOut{},echoDiscordOut{},captureData{};
         LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
         bool clipPending=false,studioActive=false,studioPending=false;
         {std::lock_guard lock(clipMutex_);clip_.clear();clip_.reserve(48000*20);} // publishing never allocates
@@ -1017,9 +1017,11 @@ void Engine::dspLoop(Config c) {
                 // the converted voice also feeds the background mix while a Discord effect is held.
                 modified.fill(0);
                 rvc->process(out.data(),block,rvcEnabled.load() && !muted,modified.data());
-                // Gate only the live microphone; Discord, soundpad and effect tails bypass it.
-                // Meter the signal before closing it so the UI can still show the noise floor.
-                peakHold(stats.noisePeak,noiseGate.process(out.data(),block,noiseGateDb.load()));
+                // Keep raw input for effects and a gated copy for live/background voice.
+                // RVC is still voice: its monitor marks must not bypass the gate.
+                microphoneRaw=out;microphone=out;
+                for(auto& mark:modified)if(mark)mark=ModifiedVoice;
+                peakHold(stats.noisePeak,noiseGate.process(microphone.data(),block,noiseGateDb.load(),gateEnvelope.data()));
                 // Capture processed microphone before Discord source selection. Publication is a
                 // try-lock swap of buffers reserved before this real-time loop.
                 if(studioRecording && !studioActive && !studioPending && !muted) studioActive=true;
@@ -1027,7 +1029,7 @@ void Engine::dspLoop(Config c) {
                     if(!studioRecording || muted) {
                         studioRecording=false;studioActive=false;studioPending=!studioBuffer.empty();
                     } else {
-                        studioBuffer.insert(studioBuffer.end(),out.begin(),out.end());
+                        studioBuffer.insert(studioBuffer.end(),microphone.begin(),microphone.end());
                         if(studioBuffer.size()>=rate*20) {
                             studioRecording=false;studioActive=false;studioPending=true;
                         }
@@ -1042,7 +1044,6 @@ void Engine::dspLoop(Config c) {
                 bool valid=heldFresh(hold,epoch,GetTickCount64()) && running_ && stats.outputActive && !muted;
                 const unsigned flags=valid?static_cast<unsigned>(hold&HoldAllMask):0;
                 bool fromDiscord=routing.select(flags,phraseEffect.state()!=0);
-                microphone=out;
                 if(desktop_.size()>block*6){desktop_.trim(block*2);discordDrift={};}
                 if(stats.desktopState!=2){desktop_.trim(0);discordPrimed=false;echoDiscord.reset();}
                 if(!discordPrimed && desktop_.size()>=block*2)discordPrimed=true;
@@ -1056,7 +1057,7 @@ void Engine::dspLoop(Config c) {
                 if(fromDiscord){
                     out=discordSource;
                     valid=valid && stats.desktopState==2;
-                    modified.fill(0); // RVC flags described the microphone, which now travels separately.
+                    modified.fill(0); // Converted microphone now travels separately.
                 }
                 const unsigned selected=sourceHeld(flags,fromDiscord);
                 if(fromDiscord!=wasDiscord){pitchEffect.reset();autoTune.reset();boostEffect=OutputEffects{};sourceFade=Ramp{0};wasDiscord=fromDiscord;}
@@ -1066,7 +1067,7 @@ void Engine::dspLoop(Config c) {
                     scratch.fill(0);
                     (fromDiscord?stutterMic:stutterDiscord).process(scratch.data(),block,false,stutterMs.load());
                 }else{scratch.fill(0);stutterMic.process(scratch.data(),block,false,stutterMs.load());stutterDiscord.process(scratch.data(),block,false,stutterMs.load());}
-                stutterMic.feed(microphone.data(),block);
+                stutterMic.feed(microphoneRaw.data(),block);
                 if(haveDiscord)stutterDiscord.feed(discordSource.data(),block);else stutterDiscord.reset();
                 const auto pitchBegin=std::chrono::steady_clock::now();
                 const bool pitchHeld=valid && (selected&HoldPitch)!=0;
@@ -1091,6 +1092,7 @@ void Engine::dspLoop(Config c) {
                 echoDiscord.process(fromDiscord?out.data():nullptr,block,echoHeld&&fromDiscord,echoDelayMs.load(),echoRepeats.load(),echoDecay.load(),echoLevel.load(),echoDiscordOut.data());
                 const bool micEcho=micEchoBefore||echoMic.active(),discordEcho=discordEchoBefore||echoDiscord.active();
                 if(echoHeld){out.fill(0);modified.fill(0);}
+                NoiseGate::applyVoice(out.data(),block,gateEnvelope.data(),modified.data(),fromDiscord);
                 const bool recordDiscord=(selected&LastEffect::recordable)?fromDiscord:lastEffect.recordingDiscord();
                 const bool chosenEcho=recordDiscord?discordEcho:micEcho;
                 const bool captureMain=(selected&LastEffect::recordable)!=0 || phraseWasActive || phraseEffect.state()!=0;

@@ -18,6 +18,8 @@ inline unsigned sourceRecordFlags(unsigned selected,bool discord) {
 }
 // Per-sample effect categories carried through the output queues for effects-only monitoring.
 enum Modified : uint8_t { ModifiedEffects=1, ModifiedBoost=2, ModifiedSound=4 }; // ModifiedSound: monitor mask bit; set only on preview-queue samples
+// DSP-only RVC marker: still gated voice, restored to ModifiedEffects before queuing.
+constexpr uint8_t ModifiedVoice=8;
 inline uint64_t packHeld(uint64_t now,unsigned epoch,unsigned flags,bool eligible=true) {
     return ((now&((1ull<<29)-1))<<35)|((static_cast<uint64_t>(epoch)&65535)<<19)|(eligible?1ull<<18:0)|(flags&HoldAllMask);
 }

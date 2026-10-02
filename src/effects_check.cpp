@@ -36,6 +36,77 @@ int main() {try {
         std::cout<<"noise_gate=passed bypass=exact hysteresis_hold_ramps=passed source_isolation=passed\n";
     }
     {
+        // Quiet effect inputs stay intact, but every unmodified/live sample is gated.
+        std::array<float,480> raw{},voice{},envelope{},data{};
+        std::array<uint8_t,480> marks{};mic::NoiseGate gate;
+        for(unsigned i=0;i<raw.size();++i)raw[i]=0.001f*std::sin(i*0.1f);
+        voice=raw;gate.process(voice.data(),voice.size(),-40,envelope.data());
+        for(float v:voice)require(v==0,"Quiet background voice escaped the gate");
+        auto check=[&](bool discord=false){
+            const auto before=data;const auto categories=marks;
+            mic::NoiseGate::applyVoice(data.data(),data.size(),envelope.data(),marks.data(),discord);
+            bool heard=false;
+            for(unsigned i=0;i<data.size();++i){
+                const bool effect=(categories[i]&~mic::ModifiedVoice)!=0;
+                require(data[i]==((discord||effect)?before[i]:0),"Gate chopped playback or leaked live voice");
+                require(!(marks[i]&mic::ModifiedVoice),"Internal voice marker leaked into the output queue");
+                if(categories[i]&mic::ModifiedVoice)require(marks[i]&mic::ModifiedEffects,"RVC lost its monitor category");
+                heard|=effect && std::abs(data[i])>1e-6f;
+            }
+            return heard;
+        };
+        data=raw;marks.fill(mic::ModifiedVoice);check(); // RVC remains live voice.
+        data=raw;marks.fill(0);check(true);require(data==raw,"Discord was gated");
+        marks.fill(0);mic::OutputEffects boost;data=raw;
+        boost.process(data.data(),data.size(),1,3,true,false,nullptr,1,marks.data());
+        require(check(),"Quiet boost effect was gated");
+        mic::StutterEffect stutter;
+        for(int frame=0;frame<5;++frame)stutter.feed(raw.data(),raw.size());
+        data.fill(0);marks.fill(0);stutter.process(data.data(),data.size(),true,50,marks.data());
+        require(check(),"Quiet stutter history was gated");
+        for(unsigned held:{mic::HoldSlow,mic::HoldFast,mic::HoldReverse}){
+            mic::PhraseEffect phrase;bool heard=false;
+            data.fill(0);phrase.process(data.data(),data.size(),0,0.7f,1.5f,true,1,0);
+            for(int frame=0;frame<180;++frame){
+                data=raw;marks.fill(mic::ModifiedVoice);
+                phrase.process(data.data(),data.size(),frame<40?held:0,0.7f,1.5f,true,1,0,true,marks.data());
+                heard|=check();
+                if(frame<40)for(float v:data)require(v==0,"Phrase recording leaked quiet live voice");
+            }
+            require(heard,"Quiet slow/fast/reverse playback was gated");
+            require(!phrase.state(),"Phrase did not finish in gate regression");
+        }
+        for(float semitones:{0.0f,4.0f}){ // Shared pitch/formant and AutoTune playback stage.
+            mic::PitchEffect pitch;bool heard=false;
+            for(int frame=0;frame<40;++frame){
+                data=raw;marks.fill(mic::ModifiedVoice);
+                pitch.processAdvanced(data.data(),data.size(),semitones,semitones,true,marks.data());
+                heard|=check();
+            }
+            require(heard,"Quiet pitch/AutoTune playback was gated");
+        }
+        mic::EchoEffect echo;std::array<float,480> tail{};bool heardEcho=false;
+        for(int frame=0;frame<25;++frame){
+            echo.process(frame==0?raw.data():nullptr,raw.size(),frame==0,60,3,50,100,tail.data());
+            data=raw;marks.fill(0);check();
+            mic::OutputEffects mixer;
+            mixer.process(data.data(),data.size(),1,1,false,false,nullptr,1,nullptr,voice.data(),nullptr,nullptr,tail.data());
+            for(unsigned i=0;i<data.size();++i){require(data[i]==tail[i],"Gate chopped an echo tail or leaked background voice");heardEcho|=std::abs(data[i])>1e-6f;}
+        }
+        require(heardEcho,"Quiet echo was not captured before the gate");
+        mic::LastEffect replay;bool discord=false;
+        data.fill(0);marks.fill(0);replay.process(data.data(),data.size(),marks.data(),discord,0,false,true,1,0,0);
+        data=raw;marks.fill(mic::ModifiedEffects);check();
+        replay.process(data.data(),data.size(),marks.data(),discord,mic::HoldStutter,false,true,1,0,0);
+        data=raw;marks.fill(0);check();replay.process(data.data(),data.size(),marks.data(),discord,0,false,true,1,0,0);
+        data=raw;marks.fill(0);check();
+        require(replay.process(data.data(),data.size(),marks.data(),discord,0,false,true,1,0,1) && data==raw,"Gate chopped the last-effect replay");
+        voice=raw;gate.process(voice.data(),voice.size(),-72,envelope.data());
+        data=raw;marks.fill(0);mic::NoiseGate::applyVoice(data.data(),data.size(),envelope.data(),marks.data(),false);
+        require(data==raw && voice==raw,"Disabled split gate is not exact dry bypass");
+        std::cout<<"noise_gate_effect_playback=passed live_voice_rvc=passed quiet_hotkeys_replay_echo=passed\n";
+    }
+    {
         // Grain reverse: 50 % Hann overlap must add to unity (steady input stays steady),
         // stay bounded, reverse order inside a grain, and reset to silence.
         mic::GrainReverse reverse;std::vector<float> x(48000,0.5f);
