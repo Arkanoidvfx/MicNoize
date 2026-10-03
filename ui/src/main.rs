@@ -839,6 +839,8 @@ struct App {
     /// Set by the title-bar "−": that minimize stays in the taskbar instead of hiding to tray.
     own_minimize: bool,
     hidden_window: Option<window::Id>,
+    /// A tray restore passes through a still-minimized state; that must not hide it again.
+    shown_at: Option<Instant>,
     inputs: Vec<Device>,
     outputs: Vec<Device>,
     input: Option<Device>,
@@ -993,6 +995,22 @@ fn held_keys(bindings: impl Iterator<Item = u32>) -> [u64; 4] {
         }
     }
     down
+}
+/// iced runs every task on this pool, window actions (drag, focus, show) included. Ours block
+/// (sleep timers, downloads, installs); iced's one-thread-per-core pool filled up with them on a
+/// first install, and the window crawled behind its own download.
+// ponytail: fixed oversized pool; give blocking bodies their own threads if 32 ever fills.
+struct Pool(iced::futures::executor::ThreadPool);
+impl iced::executor::Executor for Pool {
+    fn new() -> Result<Self, iced::futures::io::Error> {
+        iced::futures::executor::ThreadPool::builder().pool_size(32).create().map(Pool)
+    }
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.0.spawn_ok(future);
+    }
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        iced::futures::executor::block_on(future)
+    }
 }
 fn timer(visible: bool) -> Task<Msg> {
     Task::perform(
@@ -1319,6 +1337,7 @@ impl App {
                 window_focused: false,
                 own_minimize: false,
                 hidden_window: None,
+                shown_at: None,
                 inputs: vec![],
                 outputs: vec![],
                 input: None,
@@ -2186,6 +2205,9 @@ impl App {
         self.save();
         self.engine.start(c);
     }
+    fn restoring(&self) -> bool {
+        self.shown_at.is_some_and(|at| at.elapsed() < Duration::from_millis(1500))
+    }
     fn update(&mut self, msg: Msg) -> Task<Msg> {
         if matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize
             | Msg::WindowFocus(_, false) | Msg::SoundpadFilter(_) | Msg::SoundpadSort(_)
@@ -2656,6 +2678,7 @@ impl App {
                 if self.window == Some(id) {
                     self.window_focused = focused;
                     self.own_minimize &= !focused;
+                    if focused { self.shown_at = None; }
                     if !focused {
                         self.studio_scrubbing = false;
                         self.studio_loop_drag = None;
@@ -2666,17 +2689,18 @@ impl App {
             }
             Msg::Minimized(id) => {
                 // Like OBS: clicking the taskbar icon of the active window hides it to tray.
-                if self.window == Some(id) && !self.own_minimize {
+                if self.window == Some(id) && !self.own_minimize && !self.restoring() {
                     return self.update(Msg::Hide);
                 }
             }
             Msg::Restored(id) => {
                 if self.window == Some(id) {
                     self.own_minimize = false;
+                    self.shown_at = None;
                 }
             }
             Msg::MinimizedState(id, Some(true)) => {
-                if self.window == Some(id) && !self.own_minimize {
+                if self.window == Some(id) && !self.own_minimize && !self.restoring() {
                     return self.update(Msg::Hide);
                 }
             }
@@ -2704,6 +2728,7 @@ impl App {
                 }
             }
             Msg::Show => {
+                self.shown_at = Some(Instant::now());
                 if let Some(id) = self.window {
                     // An in-flight hide/Opened callback may leave a tracked window hidden.
                     return window::set_mode(id,window::Mode::Windowed)
@@ -5272,6 +5297,7 @@ fn main() {
         .style(|s: &App, _| iced::theme::Style { background_color: s.backdrop(), text_color: view::INK })
         .default_font(Font::with_name("Segoe UI"))
         .subscription(App::subscription)
+        .executor::<Pool>()
         .scale_factor(|s: &App, _| s.qa_scale)
         .run()
         .map_err(|e| e.to_string())
@@ -5789,6 +5815,9 @@ page_pixelate=0")).unwrap().unwrap();
         let _ = app.update(Msg::Minimized(id));
         assert_eq!(app.hidden_window, Some(id), "the next taskbar click hides even without a focus event");
         let _ = app.update(Msg::Show);
+        let _ = app.update(Msg::MinimizedState(id, Some(true)));
+        let _ = app.update(Msg::Minimized(id));
+        assert_eq!(app.window, Some(id), "a tray restore still passing through minimized is not hidden again");
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
         let _ = app.update(Msg::MinimizedState(id, Some(true)));

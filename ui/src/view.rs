@@ -3605,6 +3605,20 @@ mod tests {
             worst = (worst.0.max(a), worst.1.max(t), worst.2 + t / frames as f64);
         }
         eprintln!("confetti: worst {:.0} % of the window, worst {:.1} ms, mean {:.1} ms", worst.0 * 100.0, worst.1, worst.2);
+        // Changing dense controls every frame must stay within the same raster budget.
+        (app.ready_fx, app.ready_preview, app.glitch_mosaic) = (None, None, None);
+        let _ = app.update(Msg::Page(6));
+        let _ = frame(&app);
+        let mut times = Vec::new();
+        for i in 0..120 {
+            app.controls.boost = 1.0 + (i % 100) as f32 * 0.19;
+            app.controls.discord_volume = discord_volume_gain((i % 100) as f32 * 2.0);
+            times.push(frame(&app).1);
+        }
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        times.sort_by(f64::total_cmp);
+        eprintln!("slider values: mean {mean:.1} ms, p95 {:.1} ms", times[114]);
+        assert!(mean < 16.0 && times[114] < 24.0, "slider changes fell below the frame budget");
     }
     #[test]
     #[ignore]

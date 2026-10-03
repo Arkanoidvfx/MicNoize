@@ -24,7 +24,6 @@ const SKEW: f32 = 0.364; // tan 20°
 const WAVE_CYCLE: f32 = 8000.0;
 const WAVE_STEP: f32 = 64.0;
 const WAVE_LEN: f32 = 568.0;
-const STAGGER: f32 = 9.0;
 const IGNITE_STEP: f32 = 14.0;
 const IDLE_AFTER: Duration = Duration::from_millis(1500);
 /// Animation frame cap. `RedrawRequest::NextFrame` is unthrottled on the tiny-skia backend:
@@ -84,11 +83,53 @@ pub struct Tacho<'a, Message> {
     wheel: bool,
     width: Length,
 }
-/// Drag pixels per step where the track has fewer than this many pixels per step: there the
-/// value follows the drag's distance, not the cursor, so every step can be hit.
+/// Shift-drag keeps even the densest scale reachable one step at a time.
 const FINE_PX: f32 = 2.0;
 /// Touchpad pixels per wheel step.
 const WHEEL_PX: f32 = 24.0;
+
+/// Shared pointer mapping for segmented sliders and the gate's meter.
+struct SliderScale {
+    range: RangeInclusive<f32>,
+    step: f32,
+    track: Rectangle,
+}
+impl SliderScale {
+    fn snap(&self, value: f32) -> f32 {
+        let (min, max) = (*self.range.start(), *self.range.end());
+        (((value - min) / self.step).round() * self.step + min).clamp(min, max)
+    }
+    fn locate(&self, x: f32) -> f32 {
+        let t = ((x - self.track.x) / self.track.width.max(1.0)).clamp(0.0, 1.0);
+        self.snap(self.range.start() + t * (self.range.end() - self.range.start()))
+    }
+    fn begin(&self, x: f32, value: f32, fine: bool) -> (f32, f32) {
+        let span = (self.range.end() - self.range.start()).max(self.step);
+        let head = self.track.x + (value - self.range.start()) / span * self.track.width;
+        // Picking up the current edge (or holding Shift) must not jump its value.
+        (x, if fine || (x - head).abs() <= 8.0 { value } else { self.locate(x) })
+    }
+    fn dragged(&self, anchor: &mut (f32, f32), x: f32, fine: bool) -> f32 {
+        let steps = ((self.range.end() - self.range.start()) / self.step).max(1.0);
+        let pixels = self.track.width.max(1.0) / steps;
+        let pixels = if fine { (pixels * 5.0).max(FINE_PX) } else { pixels };
+        // Keep fractional motion across events and mode switches. Clamp the raw anchor,
+        // so reversing at an end responds immediately, even outside the widget.
+        let value = (anchor.1 + (x - anchor.0) / pixels * self.step)
+            .clamp(*self.range.start(), *self.range.end());
+        *anchor = (x, value);
+        self.snap(value)
+    }
+}
+fn wheel_steps(accumulated: &mut f32, delta: mouse::ScrollDelta) -> f32 {
+    *accumulated += match delta {
+        mouse::ScrollDelta::Lines { y, .. } => y,
+        mouse::ScrollDelta::Pixels { y, .. } => y / WHEEL_PX,
+    };
+    let whole = accumulated.trunc();
+    *accumulated -= whole;
+    whole
+}
 
 pub fn tacho<'a, Message>(
     range: RangeInclusive<f32>,
@@ -176,28 +217,17 @@ impl<'a, Message> Tacho<'a, Message> {
         let w = self.seg_width();
         track.x + (track.width - w) * i as f32 / (self.segments - 1) as f32
     }
-    fn locate(&self, track: Rectangle, x: f32) -> f32 {
-        let (min, max) = (*self.range.start(), *self.range.end());
-        let t = ((x - track.x) / track.width).clamp(0.0, 1.0);
-        self.snap(min + t * (max - min))
+    fn scale(&self, track: Rectangle) -> SliderScale {
+        SliderScale { range: self.range.clone(), step: self.step, track }
+    }
+    fn grab(&self, track: Rectangle, x: f32, value: f32, fine: bool) -> (f32, f32) {
+        let (_, _, head) = self.lit(value);
+        let drawn_head = self.seg_x(track, head.max(0) as usize) + self.seg_width() / 2.0;
+        self.scale(track).begin(x, value, fine || (x - drawn_head).abs() <= self.seg_width() / 2.0 + 4.0)
     }
     /// The nearest step, inside the range.
     fn snap(&self, v: f32) -> f32 {
-        let (min, max) = (*self.range.start(), *self.range.end());
-        (((v - min) / self.step).round() * self.step + min).clamp(min, max)
-    }
-    /// The value a drag to `x` sets, and the anchor for the next move. The press anchors the
-    /// drag at (x, value). On a dense track the value moves a step per `FINE_PX` from there;
-    /// past an end the anchor moves along, so turning back answers at once.
-    fn dragged(&self, track: Rectangle, anchor: (f32, f32), x: f32) -> (f32, (f32, f32)) {
-        let steps = ((*self.range.end() - *self.range.start()) / self.step).max(1.0);
-        if track.width / steps >= FINE_PX {
-            return (self.locate(track, x), anchor);
-        }
-        let (x0, v0) = anchor;
-        let v = v0 + ((x - x0) / FINE_PX).round() * self.step;
-        let snapped = self.snap(v);
-        (snapped, if (snapped - v).abs() > self.step * 0.5 { (x, snapped) } else { anchor })
+        self.scale(Rectangle::default()).snap(v)
     }
 }
 
@@ -206,16 +236,14 @@ struct State {
     ready: bool,
     drag: bool,
     mods: keyboard::Modifiers,
-    shown: f32,
     last: f32,
-    old: (i32, i32),
-    changed: Option<Instant>,
     head_at: Option<Instant>,
     peak: Option<(i32, Instant)>,
     touched: Option<Instant>,
-    frame: Option<Instant>,
-    /// Where the drag was pressed or last re-anchored: (x, value).
+    /// Last pointer position and unrounded drag value.
     anchor: (f32, f32),
+    /// Last model and proposed value; several input events can arrive before a rebuild.
+    input: Option<(f32, f32)>,
     /// Wheel notches not applied yet (touchpads send fractions).
     wheel: f32,
     painted: Painted,
@@ -243,12 +271,16 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         _: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        if !self.enabled { state.drag = false; }
         let bounds = layout.bounds();
         let track = self.track(bounds);
+        let scale = self.scale(track);
         let hit = Rectangle { width: track.width + 12.0, x: track.x - 6.0, ..bounds };
-        let publish = |v: f32, shell: &mut Shell<'_, Message>| {
+        let mut current = state.input.filter(|(model, _)| *model == self.value).map_or(self.value, |(_, v)| v);
+        let publish = |v: f32, current: &mut f32, shell: &mut Shell<'_, Message>| {
             let v = v.clamp(*self.range.start(), *self.range.end());
-            if (v - self.value).abs() > f32::EPSILON {
+            if (v - *current).abs() > f32::EPSILON {
+                *current = v;
                 shell.publish((self.on_change)(v));
             }
         };
@@ -256,12 +288,13 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if self.enabled => {
                 if let Some(p) = cursor.position_over(hit) {
                     if state.mods.command() {
-                        publish(self.default, shell);
+                        publish(self.default, &mut current, shell);
                     } else {
-                        let v = self.locate(track, p.x);
-                        publish(v, shell);
+                        state.anchor = self.grab(track, p.x, current, state.mods.shift());
+                        current = state.anchor.1;
+                        // Also focus a slider picked up at its existing value.
+                        shell.publish((self.on_change)(current));
                         state.drag = true;
-                        state.anchor = (p.x, v);
                     }
                     state.touched = Some(Instant::now());
                     shell.capture_event();
@@ -269,26 +302,27 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag => {
+                if let Some(p) = cursor.position() {
+                    let v = scale.dragged(&mut state.anchor, p.x, state.mods.shift());
+                    publish(v, &mut current, shell);
+                }
                 state.drag = false;
                 state.touched = Some(Instant::now());
+                shell.capture_event();
                 shell.request_redraw();
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => {
-                let (v, anchor) = self.dragged(track, state.anchor, position.x);
-                state.anchor = anchor;
-                publish(v, shell);
+                let v = scale.dragged(&mut state.anchor, position.x, state.mods.shift());
+                publish(v, &mut current, shell);
                 state.touched = Some(Instant::now());
                 shell.capture_event();
+                shell.request_redraw();
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if self.enabled && self.wheel && cursor.is_over(hit) => {
-                state.wheel += match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / WHEEL_PX,
-                };
-                let whole = state.wheel.trunc();
+                let whole = wheel_steps(&mut state.wheel, *delta);
                 if whole != 0.0 {
-                    state.wheel -= whole;
-                    publish(self.snap(self.value + whole * self.step), shell);
+                    publish(self.snap(current + whole * self.step), &mut current, shell);
+                    if state.drag { state.anchor.1 = current; }
                     state.touched = Some(Instant::now());
                     shell.request_redraw();
                 }
@@ -296,21 +330,22 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.mods = *m,
+            Event::Window(window::Event::Unfocused) => {
+                state.drag = false;
+                state.mods = keyboard::Modifiers::default();
+                state.wheel = 0.0;
+                shell.request_redraw();
+            }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let now = *now;
                 let v = self.value;
                 if !state.ready {
                     state.ready = true;
-                    state.shown = v;
                     state.last = v;
-                    let (lo, hi, _) = self.lit(v);
-                    state.old = (lo, hi);
                 }
                 if (v - state.last).abs() > f32::EPSILON {
-                    let (lo, hi, head) = self.lit(state.last);
+                    let (_, _, head) = self.lit(state.last);
                     let (_, _, new_head) = self.lit(v);
-                    state.old = (lo, hi);
-                    state.changed = Some(now);
                     state.touched = Some(now);
                     if new_head != head {
                         state.head_at = Some(now);
@@ -321,13 +356,6 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                     }
                     state.last = v;
                 }
-                let dt = state.frame.map_or(0.0, |f| now.saturating_duration_since(f).as_secs_f32());
-                state.frame = Some(now);
-                let k = 1.0 - (-dt / 0.06).exp();
-                state.shown += (v - state.shown) * k;
-                if (v - state.shown).abs() < self.step * 0.5 {
-                    state.shown = v;
-                }
                 if state.peak.is_some_and(|(_, at)| now.saturating_duration_since(at) > Duration::from_millis(600)) {
                     state.peak = None;
                 }
@@ -337,6 +365,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             _ => {}
         }
+        state.input = Some((self.value, current));
     }
 
     fn draw(
@@ -358,9 +387,8 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         let (lo, hi, head) = self.lit(self.value);
         let red_from = self.red_from();
         let in_red = self.in_red(self.value);
-        let ignition = self.ignition(now);
+        let ignition = self.ignition(state, now);
         let idle = self.idle(state, now);
-        let since_change = state.changed.map(|c| now.saturating_duration_since(c).as_secs_f32() * 1000.0);
         let flash = state.head_at
             .map(|a| now.saturating_duration_since(a).as_secs_f32() / 0.3)
             .filter(|t| *t < 1.0);
@@ -379,13 +407,6 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             let ii = i as i32;
             let mut lit = ii >= lo && ii < hi;
             let mut is_head = lit && ii == head;
-            if let (Some(ms), false) = (since_change, ignition.is_some()) {
-                // Segments change in a ripple that starts at the new head.
-                if ms < (ii - head).unsigned_abs() as f32 * STAGGER {
-                    lit = ii >= state.old.0 && ii < state.old.1;
-                    is_head = false;
-                }
-            }
             if let Some(sweep) = ignition {
                 match sweep {
                     Sweep::Up(t) => { lit = t >= i as f32 * IGNITE_STEP; is_head = false; }
@@ -447,8 +468,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         let text_value = if matches!(ignition, Some(Sweep::Up(_))) {
             "MAX".to_owned()
         } else {
-            let shown = if state.ready { state.shown } else { self.value };
-            (self.format)((shown / self.step).round() * self.step)
+            (self.format)(self.snap(self.value))
         };
         let red_text = (in_red || overdrive) && ignition.is_none();
         if self.compact {
@@ -491,8 +511,9 @@ enum Sweep {
 }
 
 impl<Message> Tacho<'_, Message> {
-    fn ignition(&self, now: Instant) -> Option<Sweep> {
+    fn ignition(&self, state: &State, now: Instant) -> Option<Sweep> {
         let opened = self.clock.opened?;
+        if state.touched.is_some_and(|at| at >= opened) { return None; }
         let t = now.saturating_duration_since(opened).as_secs_f32() * 1000.0 - 300.0;
         let up = self.segments as f32 * IGNITE_STEP + 260.0;
         let down = self.segments as f32 * IGNITE_STEP + 60.0;
@@ -511,7 +532,7 @@ impl<Message> Tacho<'_, Message> {
             && self.clock.idle
             && self.enabled
             && !state.drag
-            && self.ignition(now).is_none()
+            && self.ignition(state, now).is_none()
             && state.touched.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_AFTER)
     }
     fn wave_time(&self, now: Instant, i: usize) -> f32 {
@@ -527,11 +548,9 @@ impl<Message> Tacho<'_, Message> {
         }
         let soon = |ms: u64| RedrawRequest::At(now + Duration::from_millis(ms));
         let busy = state.drag
-            || (self.value - state.shown).abs() > f32::EPSILON
-            || state.changed.is_some_and(|c| now.saturating_duration_since(c) < Duration::from_millis(self.segments as u64 * STAGGER as u64 + 20))
             || state.head_at.is_some_and(|a| now.saturating_duration_since(a) < Duration::from_millis(320))
             || state.peak.is_some()
-            || self.ignition(now).is_some()
+            || self.ignition(state, now).is_some()
             || self.clock.opened.is_some_and(|o| now.saturating_duration_since(o) < Duration::from_millis(300));
         if busy {
             return Some(frame_after(now));
@@ -1139,6 +1158,10 @@ const CLEAN_SEGMENTS: usize = 40;
 struct MeterState {
     painted: Painted,
     drag: bool,
+    anchor: (f32, f32),
+    mods: keyboard::Modifiers,
+    wheel: f32,
+    input: Option<(f32, f32)>,
 }
 /// Stable pseudo-random 0..1 for bar `i` in flicker frame `t`.
 fn grain(i: u32, t: u32) -> f32 {
@@ -1161,28 +1184,53 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
         let Some(on_change) = &self.on_change else { return; };
         let state = tree.state.downcast_mut::<MeterState>();
         let bounds = layout.bounds();
-        let locate = |x: f32| (-72.0 + 72.0 * ((x - bounds.x - 4.0) / (bounds.width - 8.0).max(1.0)).clamp(0.0, 1.0)).round();
+        let scale = SliderScale { range: -72.0..=0.0, step: 1.0,
+            track: Rectangle { x: bounds.x + 4.0, width: (bounds.width - 8.0).max(1.0), ..bounds } };
+        let current = state.input.filter(|(model, _)| *model == self.gate_db).map_or(self.gate_db, |(_, v)| v);
         let value = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(bounds) => {
                 state.drag = true;
-                cursor.position().map(|p| locate(p.x))
+                cursor.position().map(|p| {
+                    state.anchor = scale.begin(p.x, current, state.mods.shift());
+                    state.anchor.1
+                })
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => Some(locate(position.x)),
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag =>
+                Some(scale.dragged(&mut state.anchor, position.x, state.mods.shift())),
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag => {
                 state.drag = false;
                 shell.capture_event();
                 shell.request_redraw();
+                cursor.position().map(|p| scale.dragged(&mut state.anchor, p.x, state.mods.shift()))
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
+                let value = scale.snap(current + wheel_steps(&mut state.wheel, *delta));
+                if state.drag { state.anchor.1 = value; }
+                Some(value)
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if cursor.is_over(bounds) => {
+                state.drag = false;
+                state.wheel = 0.0;
+                Some(-72.0)
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => { state.mods = *m; None }
+            Event::Window(window::Event::Unfocused) => {
+                state.drag = false;
+                state.mods = keyboard::Modifiers::default();
+                state.wheel = 0.0;
+                shell.request_redraw();
                 None
             }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if cursor.is_over(bounds) => Some(-72.0),
-            Event::Window(window::Event::Unfocused) => { state.drag = false; None }
             _ => None,
         };
         if let Some(value) = value {
-            if value != self.gate_db { shell.publish(on_change(value)); }
+            if value != current || matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) {
+                shell.publish(on_change(value));
+            }
             shell.capture_event();
             shell.request_redraw();
         }
+        state.input = Some((self.gate_db, value.unwrap_or(current)));
     }
     fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, _: &Rectangle, _: &Renderer) -> mouse::Interaction {
         if self.on_change.is_some() && (tree.state.downcast_ref::<MeterState>().drag || cursor.is_over(layout.bounds())) {
@@ -1273,6 +1321,30 @@ mod gate_tests {
         send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), at(364.0));
         assert_eq!(messages, [-36.0, 0.0, -72.0]);
         assert!(!tree.state.downcast_ref::<MeterState>().drag);
+    }
+    #[test]
+    fn gate_pickup_shift_wheel_and_batched_return() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let mut meter = gate_meter(0.5, Color::WHITE, -36.0, |v| v);
+        let mut tree = Tree::new(meter.as_widget());
+        let node = meter.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(728.0, 24.0)));
+        let bounds = node.bounds();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let at = |x| mouse::Cursor::Available(Point::new(x, 12.0));
+        let moved = |x| Event::Mouse(mouse::Event::CursorMoved { position: Point::new(x, 12.0) });
+        let mut send = |event, x| meter.as_widget_mut().update(&mut tree, &event, Layout::new(&node), at(x), &renderer, &mut clipboard, &mut Shell::new(&mut messages), &bounds);
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), 366.0);
+        send(moved(386.0), 386.0);
+        send(moved(366.0), 366.0);
+        send(Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)), 366.0);
+        send(moved(416.0), 416.0);
+        send(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), 416.0);
+        for _ in 0..2 {
+            send(Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } }), 416.0);
+        }
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), 416.0);
+        assert_eq!(messages, [-36.0, -34.0, -36.0, -35.0, -34.0, -33.0, -72.0]);
     }
 }
 
@@ -2850,23 +2922,91 @@ mod tests {
         assert!(ready::DROP.1 <= ready::MOSAIC.0 && ready::MOSAIC.1 <= ready::ROLL.0 && ready::ROLL.1 <= ready::CONFETTI.0 && ready::CONFETTI.1 < ready::END, "D, then B, then A");
     }
     #[test]
-    fn dense_sliders_drag_a_step_at_a_time() {
-        let clock = Clock { epoch: Instant::now(), opened: None, animate: false, idle: false };
-        let track = Rectangle { x: 0.0, y: 0.0, width: 190.0, height: 16.0 };
-        // Boost: 1900 steps on 190 px; the press lands on 300, then every 2 px is one step.
-        let boost = tacho(100.0..=2000.0, 300.0, |v| v, clock);
-        let anchor = (20.0, 300.0);
-        assert_eq!(boost.dragged(track, anchor, 22.0).0, 301.0);
-        assert_eq!(boost.dragged(track, anchor, 20.8).0, 300.0, "less than a step stays");
-        assert_eq!(boost.dragged(track, anchor, 12.0).0, 296.0);
-        let (end, moved) = boost.dragged(track, anchor, -2000.0);
-        assert_eq!(end, 100.0);
-        assert_eq!(boost.dragged(track, moved, moved.0 + 2.0).0, 101.0, "turning back at the end answers at once");
-        // Pitch: 24 steps on 190 px follow the cursor itself.
-        let pitch = tacho(-12.0..=12.0, 0.0, |v| v, clock);
-        assert_eq!(pitch.dragged(track, (95.0, 0.0), 190.0).0, 12.0);
-        assert_eq!(boost.snap(299.6), 300.0);
-        assert_eq!(boost.snap(5000.0), 2000.0);
+    fn slider_drag_is_fast_and_every_step_is_reachable() {
+        for width in [90.0, 190.0, 728.0] {
+            for range in [100.0..=2000.0, 60.0..=2000.0, 0.0..=200.0, -12.0..=12.0, -72.0..=0.0] {
+                let s = SliderScale { range, step: 1.0, track: Rectangle { width, ..Rectangle::default() } };
+                let mut anchor = s.begin(0.0, *s.range.start(), false);
+                assert_eq!(s.dragged(&mut anchor, width, false), *s.range.end(), "one track crosses the whole range");
+                assert_eq!(s.dragged(&mut anchor, width * 3.0, false), *s.range.end());
+                let pixels = (width / (s.range.end() - s.range.start()) * 5.0).max(FINE_PX);
+                assert_eq!(s.dragged(&mut anchor, width * 3.0 - pixels, true), s.range.end() - 1.0, "an end reverses immediately");
+                // Many subpixel events must equal one movement, including on a high-DPI mouse.
+                let mid = s.snap((s.range.start() + s.range.end()) / 2.0);
+                anchor = s.begin(width / 2.0, mid, true);
+                for i in 1..=20 { s.dragged(&mut anchor, width / 2.0 + pixels * i as f32 / 20.0, true); }
+                assert_eq!(s.snap(anchor.1), mid + 1.0);
+            }
+        }
+    }
+    #[test]
+    fn slider_pickup_uses_the_visible_segment_not_just_its_numeric_position() {
+        let slider = t(0.0..=200.0, 40.0);
+        let track = Rectangle { width: 716.0, ..Rectangle::default() };
+        // A segmented head has a coarser position than the exact value on a wide track.
+        let drawn_edge = slider.seg_x(track, 3) + slider.seg_width();
+        assert!(slider.scale(track).locate(drawn_edge) < 40.0);
+        assert_eq!(slider.grab(track, drawn_edge, 40.0, false).1, 40.0);
+        assert_eq!(slider.grab(track, track.width, 40.0, false).1, 200.0);
+    }
+    #[test]
+    fn touching_cancels_warmup_only_for_the_current_window_open() {
+        let mut slider = t(0.0..=200.0, 40.0);
+        let opened = Instant::now();
+        slider.clock.opened = Some(opened);
+        let mut state = State { touched: Some(opened - Duration::from_millis(1)), ..State::default() };
+        assert!(slider.ignition(&state, opened + Duration::from_millis(400)).is_some());
+        state.touched = Some(opened);
+        assert!(slider.ignition(&state, opened + Duration::from_millis(400)).is_none());
+        slider.clock.opened = Some(opened + Duration::from_secs(1));
+        assert!(slider.ignition(&state, opened + Duration::from_millis(1400)).is_some());
+    }
+    #[test]
+    fn slider_events_preserve_pickup_fractions_and_batched_reversals() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let mut slider: Element<'_, f32> = tacho(100.0..=2000.0, 300.0, |v| v,
+            Clock { epoch: Instant::now(), opened: None, animate: false, idle: false }).into();
+        let mut tree = Tree::new(slider.as_widget());
+        let node = slider.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(202.0, 66.0)));
+        let bounds = node.bounds();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let at = |x| mouse::Cursor::Available(Point::new(x, 45.0));
+        let moved = |x| Event::Mouse(mouse::Event::CursorMoved { position: Point::new(x, 45.0) });
+        let mut send = |event, cursor| slider.as_widget_mut().update(&mut tree, &event, Layout::new(&node), cursor, &renderer, &mut clipboard, &mut Shell::new(&mut messages), &bounds);
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), at(28.0));
+        send(moved(47.0), at(47.0));
+        send(moved(28.0), at(28.0));
+        send(Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)), at(28.0));
+        for i in 1..=20 { let x = 28.0 + i as f32 / 10.0; send(moved(x), at(x)); }
+        // The release position must be applied even without a preceding CursorMoved event.
+        send(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), at(34.0));
+        send(moved(200.0), at(200.0));
+        assert_eq!(messages, [300.0, 490.0, 300.0, 301.0, 303.0]);
+        assert!(!tree.state.downcast_ref::<State>().drag);
+    }
+    #[test]
+    fn slider_wheel_accumulates_before_rebuild_and_focus_loss_cancels_drag() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let mut slider: Element<'_, f32> = tacho(0.0..=200.0, 100.0, |v| v,
+            Clock { epoch: Instant::now(), opened: None, animate: false, idle: false }).compact().into();
+        let mut tree = Tree::new(slider.as_widget());
+        let node = slider.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(190.0, 30.0)));
+        let bounds = node.bounds();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let cursor = mouse::Cursor::Available(Point::new(66.0, 15.0));
+        let mut send = |event| slider.as_widget_mut().update(&mut tree, &event, Layout::new(&node), cursor, &renderer, &mut clipboard, &mut Shell::new(&mut messages), &bounds);
+        let wheel = |y| Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Pixels { x: 0.0, y } });
+        for _ in 0..4 { send(wheel(12.0)); }
+        send(wheel(-48.0));
+        send(Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::SHIFT)));
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)));
+        send(Event::Window(window::Event::Unfocused));
+        send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(500.0, 15.0) }));
+        assert_eq!(messages, [101.0, 102.0, 100.0, 100.0]);
+        let state = tree.state.downcast_ref::<State>();
+        assert!(!state.drag && !state.mods.shift());
     }
     #[test]
     fn page_shift_starts_at_its_first_frame() {
