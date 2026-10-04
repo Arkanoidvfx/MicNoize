@@ -211,7 +211,7 @@ enum WatchMsg {
     Poll,
 }
 fn after(ms: u64, message: WatchMsg) -> Task<WatchMsg> {
-    Task::perform(async move { std::thread::sleep(Duration::from_millis(ms)) }, move |_| message.clone())
+    crate::perform(async move { std::thread::sleep(Duration::from_millis(ms)) }, move |_| message.clone())
 }
 fn quit() -> Task<WatchMsg> {
     // As in the app: wake Winit's message wait so a finished daemon really exits.

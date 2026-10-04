@@ -998,10 +998,8 @@ fn held_keys(bindings: impl Iterator<Item = u32>) -> [u64; 4] {
     }
     down
 }
-/// iced runs every task on this pool, window actions (drag, focus, show) included. Ours block
-/// (sleep timers, downloads, installs); iced's one-thread-per-core pool filled up with them on a
-/// first install, and the window crawled behind its own download.
-// ponytail: fixed oversized pool; give blocking bodies their own threads if 32 ever fills.
+/// iced runs tasks on this pool after their first poll, window actions (drag, focus, show)
+/// included. Our blocking bodies go through [`perform`] and never occupy it.
 struct Pool(iced::futures::executor::ThreadPool);
 impl iced::executor::Executor for Pool {
     fn new() -> Result<Self, iced::futures::io::Error> {
@@ -1014,8 +1012,24 @@ impl iced::executor::Executor for Pool {
         iced::futures::executor::block_on(future)
     }
 }
+/// `Task::perform` with the future on its own thread. iced 0.14 polls every new task on the UI
+/// thread until it first returns `Pending`, and `Task::batch` re-polls a woken future in that
+/// same pass, so blocking bodies (sleep timers, downloads, file work) ran on the UI thread. A
+/// stack sampler caught the 50 ms tick sleeping there while pointer input waited between ticks:
+/// sliders moved about ten times a second. The thread starts on first poll, so an unused task
+/// starts nothing.
+pub(crate) fn perform<T: Send + 'static, M: Send + 'static>(
+    future: impl Future<Output = T> + Send + 'static,
+    map: impl FnOnce(T) -> M + Send + 'static,
+) -> Task<M> {
+    Task::perform(async move {
+        let (done, result) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || { let _ = done.send(iced::futures::executor::block_on(future)); });
+        result.await.expect("task thread ended without a result")
+    }, map)
+}
 fn timer(visible: bool) -> Task<Msg> {
-    Task::perform(
+    perform(
         async move {
             std::thread::sleep(Duration::from_millis(if visible { 50 } else { 250 }));
         },
@@ -1023,7 +1037,7 @@ fn timer(visible: bool) -> Task<Msg> {
     )
 }
 fn shell_timer() -> Task<Msg> {
-    Task::perform(async {std::thread::sleep(Duration::from_millis(25));}, |_| Msg::ShellTick)
+    perform(async {std::thread::sleep(Duration::from_millis(25));}, |_| Msg::ShellTick)
 }
 fn exit_ui() -> Task<Msg> {
     // Winit 0.30.13 can enter MsgWaitForMultipleObjectsEx after AboutToWait
@@ -1491,10 +1505,10 @@ impl App {
                 if cfg!(test) {
                     Task::none()
                 } else {
-                    Task::perform(async { updater::check_and_download() }, Msg::UpdateChecked)
+                    perform(async { updater::check_and_download() }, Msg::UpdateChecked)
                 },
                 if core_installing {
-                    Task::perform(
+                    perform(
                         async move { components::install_core(&component_root, arch.as_deref()) },
                         Msg::CoreInstalled,
                     )
@@ -1502,7 +1516,7 @@ impl App {
                     Task::none()
                 },
                 if autostart_busy {
-                    Task::perform(async move { engine::tag_autostart(i32::from(autostart)) }, Msg::AutostartUpdated)
+                    perform(async move { engine::tag_autostart(i32::from(autostart)) }, Msg::AutostartUpdated)
                 } else {
                     Task::none()
                 },
@@ -1842,14 +1856,14 @@ impl App {
             return self.apply_update(center);
         }
         let runtime = self.runtime_root.clone();
-        Task::perform(async move { update_window::rehearse(&runtime, center) }, Msg::RehearsalReady)
+        perform(async move { update_window::rehearse(&runtime, center) }, Msg::RehearsalReady)
     }
     /// Hands the update to Velopack and the watcher; `center` places the watcher's update
     /// window (centred on screen when the app window is not shown).
     fn apply_update(&self, center: Option<iced::Point>) -> Task<Msg> {
         let intent = self.update_resume;
         let at = center.map_or("centered".to_owned(), |c| format!("{:.1},{:.1}", c.x, c.y));
-        Task::batch([Task::perform(async move { updater::apply_and_restart(intent, Some(at)) }, Msg::UpdateApplied), timer(false)])
+        Task::batch([perform(async move { updater::apply_and_restart(intent, Some(at)) }, Msg::UpdateApplied), timer(false)])
     }
     /// The window background. tiny-skia repaints every damaged region separately with all
     /// that overlaps it; a page swap damages 7–30 regions and cost 10–120 ms a frame, against
@@ -2003,7 +2017,7 @@ impl App {
             Self::clip_id(index),
             self.clip_loads,
         );
-        Task::perform(
+        perform(
             async move {
                 let mut pcm = soundpad::decode(&path)?;
                 // Old files have no source metadata; use the former Discord 100% gain.
@@ -2049,7 +2063,7 @@ impl App {
             Self::sound_id(index),
             self.sound_generation,
         );
-        Task::perform(
+        perform(
             async move {
                 let pcm = decode_for(&path, window)?;
                 load_if_live(&loader, &live, generation, id, &pcm, gain)?;
@@ -2204,7 +2218,7 @@ impl App {
             if self.message.is_empty() { "-" } else { &self.message },
         );
         let runtime = self.runtime_root.clone();
-        Task::perform(
+        perform(
             async move { logs::report(&runtime, &header) },
             move |text| Msg::Logs(text, copy),
         )
@@ -2417,7 +2431,7 @@ impl App {
                             if self.repair_resume.is_some() && !self.repair_started {
                                 self.repair_started=true;
                                 let root=self.runtime_root.clone();let reinstall=self.repair_reinstall;let lines=self.repair_lines;
-                                return Task::batch([Task::perform(async move {maintenance::repair(&root,reinstall,lines)},Msg::Repaired),timer(false)]);
+                                return Task::batch([perform(async move {maintenance::repair(&root,reinstall,lines)},Msg::Repaired),timer(false)]);
                             }
                             telemetry::record_blocking(
                                 self.settings.path.parent().unwrap(),
@@ -2654,7 +2668,7 @@ impl App {
                     let (folder, name) = (self.clips_folder.clone(), clip_name());
                     return Task::batch([
                         next,
-                        Task::perform(
+                        perform(
                             async move {
                                 std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
                                 soundpad::write_wav(&unique_path(&folder, &name), &samples)
@@ -2667,7 +2681,7 @@ impl App {
                     self.studio_generation = generation;
                     let folder = self.studio_folder.clone();
                     let name = clip_name().replace("Запись", "Сэмпл").replace(" (mix)", "");
-                    return Task::batch([next, Task::perform(async move {
+                    return Task::batch([next, perform(async move {
                         std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
                         let path = unique_path(&folder, &name);
                         soundpad::write_wav(&path, &samples)?;
@@ -2810,7 +2824,7 @@ impl App {
                 if !self.update_checking {
                     self.update_checking = true;
                     self.update_status = "Проверяем обновления…".into();
-                    return Task::perform(
+                    return perform(
                         async { updater::check_and_download() },
                         Msg::UpdateChecked,
                     );
@@ -2852,7 +2866,7 @@ impl App {
                     self.apply_pending=true;self.update_checking=true;
                     self.update_status="Проверяем и сохраняем комплект для отката…".into();
                     if let Some(restart)=&mut self.restart {restart.advance(1,Instant::now());}
-                    return Task::perform(async{updater::prepare()},Msg::UpdatePrepared);
+                    return perform(async{updater::prepare()},Msg::UpdatePrepared);
                 }
                 self.restart=None;
             }
@@ -2865,7 +2879,7 @@ impl App {
                         // A quick check and copy still let the button fall and the air blow in.
                         let wait=self.restart.map_or(Duration::ZERO,|r|tacho::restart::HOLD.saturating_sub(r.start.elapsed()));
                         if !wait.is_zero() && !cfg!(test) {
-                            return Task::perform(async move{std::thread::sleep(wait)},|_|Msg::Quit);
+                            return perform(async move{std::thread::sleep(wait)},|_|Msg::Quit);
                         }
                         return self.update(Msg::Quit);
                     }
@@ -2893,7 +2907,7 @@ impl App {
                     self.apply_pending = true;
                     self.update_status = "Проверяем последнюю версию…".into();
                     self.start_restart_fx();
-                    return Task::perform(
+                    return perform(
                         async { updater::check_and_download() },
                         Msg::UpdateChecked,
                     );
@@ -3115,7 +3129,7 @@ impl App {
                 self.focus = focus::settings::AUTOSTART;
                 if !self.autostart_busy {
                     self.autostart_busy = true;
-                    return Task::perform(async move { if cfg!(test) { Ok(enabled) } else { engine::tag_autostart(i32::from(enabled)) } }, Msg::AutostartUpdated);
+                    return perform(async move { if cfg!(test) { Ok(enabled) } else { engine::tag_autostart(i32::from(enabled)) } }, Msg::AutostartUpdated);
                 }
             }
             Msg::AutostartUpdated(result) => {
@@ -3274,7 +3288,7 @@ impl App {
                     self.rvc_runtime_installing = true;
                     self.rvc_import_note = "Подготовка загрузки RVC runtime…".into();
                     let root = self.component_root.clone();
-                    return Task::perform(
+                    return perform(
                         async move { components::install_rvc(&root) },
                         Msg::RvcInstalled,
                     );
@@ -3326,7 +3340,7 @@ impl App {
                     if !self.autostart_busy && engine::tag_autostart(-1).ok() != Some(self.autostart) {
                         self.autostart_busy = true;
                         let enabled = self.autostart;
-                        return Task::perform(async move { engine::tag_autostart(i32::from(enabled)) }, Msg::AutostartUpdated);
+                        return perform(async move { engine::tag_autostart(i32::from(enabled)) }, Msg::AutostartUpdated);
                     }
                 }
             }
@@ -3341,7 +3355,7 @@ impl App {
                     self.transfer_moved = Instant::now();
                     let root = self.component_root.clone();
                     let arch = self.gpu.as_ref().ok().map(|(arch, _)| arch.clone());
-                    return Task::perform(async move { components::install_core(&root, arch.as_deref()) }, Msg::CoreInstalled);
+                    return perform(async move { components::install_core(&root, arch.as_deref()) }, Msg::CoreInstalled);
                 }
             }
             Msg::InstallDriver => {
@@ -3350,7 +3364,7 @@ impl App {
                     self.driver_installing = true;
                     self.driver_error.clear();
                     let root = self.runtime_root.clone();
-                    return Task::perform(
+                    return perform(
                         async move { components::install_driver(&root) },
                         Msg::DriverInstalled,
                     );
@@ -3412,7 +3426,7 @@ impl App {
                     self.report_sending = true;
                     self.message = "Отправляем логи…".into();
                     let runtime = self.runtime_root.clone();
-                    return Task::perform(
+                    return perform(
                         async move {
                             telemetry::report(&paths::Paths::resolve()?.data, &runtime, &note)
                         },
@@ -3510,7 +3524,7 @@ impl App {
                 self.rvc_import_note =
                     "Выберите .pth и, при наличии, его .index через Ctrl + щелчок".into();
                 let root = self.runtime_root.clone();
-                return Task::perform(async move { rvc::import(&root) }, Msg::RvcImported);
+                return perform(async move { rvc::import(&root) }, Msg::RvcImported);
             }
             Msg::RvcImported(result) => {
                 self.rvc_importing = false;
@@ -3631,7 +3645,7 @@ impl App {
                     return Task::none();
                 }
                 self.sound_dialog = true;
-                return Task::perform(async move { engine::pick_paths(folder) }, move |r| {
+                return perform(async move { engine::pick_paths(folder) }, move |r| {
                     Msg::SoundpadPicked(folder, r)
                 });
             }
@@ -4028,7 +4042,7 @@ impl App {
                 self.focus = focus::studio::IMPORT;
                 if self.studio_busy { return Task::none(); }
                 self.studio_busy = true;
-                return Task::perform(async { engine::pick_paths(false) }, Msg::StudioPicked);
+                return perform(async { engine::pick_paths(false) }, Msg::StudioPicked);
             }
             Msg::StudioPicked(result) => {
                 let files = match result {
@@ -4037,7 +4051,7 @@ impl App {
                 };
                 if files.is_empty() { self.studio_busy=false; return Task::none(); }
                 let folder = self.studio_folder.clone();
-                return Task::perform(async move {
+                return perform(async move {
                     std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
                     soundpad::import(&folder, &files).map(|_| ())
                 }, Msg::StudioImported);
@@ -4070,7 +4084,7 @@ impl App {
                     studio::frame_at(self.studio_loop_end, bpm)));
                 if !export { self.studio_play_bpm = bpm; }
                 let loader = self.engine.sound_loader();
-                return Task::perform(async move {
+                return perform(async move {
                     let audio = studio::render(&folder, bpm, &events)?;
                     if export {
                         let exports = folder.parent().unwrap().join("Треки");
@@ -4137,7 +4151,7 @@ impl App {
                 self.studio_busy = true;
                 let folder = self.studio_folder.clone();
                 let target_name = name.clone();
-                return Task::perform(async move {
+                return perform(async move {
                     let deleted = folder.parent().unwrap().join("Удалённые");
                     std::fs::create_dir_all(&deleted).map_err(|e| e.to_string())?;
                     std::fs::rename(folder.join(&target_name), unique_path(&deleted, &target_name)).map_err(|e| e.to_string())
@@ -4282,7 +4296,7 @@ impl App {
                         if to_soundpad {
                             self.clip_note = "Выберите папку саундпада…".into();
                         }
-                        return Task::perform(async { engine::pick_paths(true) }, move |r| {
+                        return perform(async { engine::pick_paths(true) }, move |r| {
                             Msg::ClipPicked(i, to_soundpad, r)
                         });
                     }
@@ -4415,7 +4429,7 @@ impl App {
                         m.shown = Some((tacho::frames(), Instant::now()));
                         return Task::batch([
                             window::set_mode(id, window::Mode::Windowed),
-                            Task::perform(async { std::thread::sleep(Duration::from_millis(40)) }, |_| Msg::IntroStart),
+                            perform(async { std::thread::sleep(Duration::from_millis(40)) }, |_| Msg::IntroStart),
                         ]);
                     }
                 }
@@ -4427,7 +4441,7 @@ impl App {
                     && tacho::frames() < frames + 2
                     && since.elapsed() < Duration::from_millis(1500)
                 {
-                    return Task::perform(async { std::thread::sleep(Duration::from_millis(30)) }, |_| Msg::IntroStart);
+                    return perform(async { std::thread::sleep(Duration::from_millis(30)) }, |_| Msg::IntroStart);
                 }
                 let size = Self::window_size();
                 let card = iced::Rectangle {
