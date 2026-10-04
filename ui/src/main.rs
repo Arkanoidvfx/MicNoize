@@ -66,6 +66,8 @@ const SOUND_VOLUME_AT_100: f32 = 0.04;
 const SOUND_BIND_BASE: usize = 100;
 /// Engine clip ids of the recordings list; above every soundpad clip id.
 const CLIP_ID_BASE: u32 = 900_000;
+/// The same recordings loaded backwards for the reverse buttons.
+const CLIP_REVERSE_ID_BASE: u32 = 910_000;
 /// How many recordings the microphone page keeps on disk.
 const CLIPS_KEPT: usize = 6;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -310,7 +312,6 @@ mod focus {
         pub const REFRESH: usize = 5;
         pub const DONE: usize = 6;
         pub const QUIT: usize = 7;
-        pub const AUTOSTART: usize = 8;
         pub const APP_AUTOSTART: usize = 79;
         pub const UPDATE: usize = 57;
         pub const DRIVER: usize = 72;
@@ -356,7 +357,7 @@ mod focus {
         /// Save menu of the recording opened in `App::clip_menu`.
         pub const CLIP_TO_SOUNDPAD: usize = 1990;
         pub const CLIP_TO_FOLDER: usize = 1991;
-        /// Recording `i`: `CLIP_BASE + 2 * i` play, `+ 1` save.
+        /// Recording `i`: `CLIP_BASE + 3 * i` play, `+ 1` reverse, `+ 2` save.
         pub const CLIP_BASE: usize = 2000;
         pub const DISCORD_VOLUME: usize = 22;
         pub const EFFECTS_MONITOR: usize = 31;
@@ -388,6 +389,7 @@ mod focus {
         pub const RENAME: usize = 45;
         pub const DELETE: usize = 46;
         pub const INSTALL: usize = 59;
+        pub const CATALOG_BASE: usize = 40000;
     }
     pub mod headphones {
         pub const OUTPUT: usize = 50;
@@ -502,10 +504,6 @@ fn set_app_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
-fn tag_autostart_default(settings: &Settings, current: bool) -> bool {
-    // A missing settings file is a new install. Existing installs keep their task setting.
-    settings.number("ui", "tag_autostart", if settings.path.exists() { current as i32 } else { 1 }, 0, 1) != 0
-}
 
 #[derive(Debug, Clone)]
 enum Msg {
@@ -541,7 +539,6 @@ enum Msg {
     Settings,
     Page(u8),
     Refresh,
-    Autostart(bool),
     AutostartUpdated(Result<bool, String>),
     AppAutostart(bool),
     /// Визуальные эффекты: the page-switch pixelation and the sliders' idle wave + warm-up.
@@ -572,6 +569,7 @@ enum Msg {
     RvcChunk(u32),
     RvcRefresh,
     RvcImport,
+    RvcCatalog(usize),
     RvcImported(Result<Option<(Vec<rvc::Model>, u32)>, String>),
     RvcName(String),
     RvcRename,
@@ -669,7 +667,8 @@ enum Msg {
     SoundLoaded(usize, u32, Result<f32, String>),
     /// A finished hold-effect recording was written to the recordings folder.
     ClipRecorded(Result<(), String>),
-    ClipPlay(usize),
+    /// Recording, backwards.
+    ClipPlay(usize, bool),
     ClipLoaded(usize, u32, Result<f32, String>),
     /// Open (or close) the "where to save" menu of recording `i`.
     ClipMenu(Option<usize>),
@@ -794,7 +793,7 @@ struct App {
     /// Always equal to `clip_loads` (see `bump_clips`), like `sound_live`.
     clip_live: Arc<AtomicU32>,
     clip_menu: Option<usize>,
-    clip_pending_play: Option<usize>,
+    clip_pending_play: Option<(usize, bool)>,
     clip_note: String,
     /// Decayed peak of the monitor's own output: shows that "hear sounds" really renders.
     monitor_peak: f32,
@@ -954,7 +953,6 @@ struct App {
     focus_visible: bool,
     dirty: Option<Instant>,
     hint_shown: bool,
-    autostart: bool,
     autostart_busy: bool,
     task_warning: String,
     app_autostart: bool,
@@ -1253,8 +1251,7 @@ impl App {
         let models_present = cfg!(test) || components::models_present(&runtime_root, arch.as_deref());
         let core_installing = !core_present || !models_present;
         let tag_task_enabled = !cfg!(test) && engine::tag_autostart(-1).unwrap_or(false);
-        let autostart = tag_autostart_default(&settings, tag_task_enabled);
-        let autostart_busy = !cfg!(test) && !core_installing && autostart != tag_task_enabled;
+        let autostart_busy = !cfg!(test) && !core_installing && app_autostart != tag_task_enabled;
         if !cfg!(test) {
             logs::note(
                 &runtime_root,
@@ -1475,7 +1472,6 @@ impl App {
                 focus_visible: false,
                 dirty: None,
                 hint_shown,
-                autostart,
                 autostart_busy,
                 task_warning: String::new(),
                 app_autostart,
@@ -1516,7 +1512,7 @@ impl App {
                     Task::none()
                 },
                 if autostart_busy {
-                    perform(async move { engine::tag_autostart(i32::from(autostart)) }, Msg::AutostartUpdated)
+                    perform(async move { engine::tag_autostart(i32::from(app_autostart)) }, Msg::AutostartUpdated)
                 } else {
                     Task::none()
                 },
@@ -1533,6 +1529,16 @@ impl App {
             graphs: self.graphs,
             intensity: self.controls.intensity,
         })
+    }
+    /// "Start with Windows" also starts the virtual microphone's host at logon, on its own, so
+    /// Discord or a game launched with Windows finds the device before the tray UI is up.
+    fn sync_host_login(&mut self) -> Task<Msg> {
+        if self.autostart_busy {
+            return Task::none();
+        }
+        self.autostart_busy = true;
+        let enabled = self.app_autostart;
+        perform(async move { if cfg!(test) { Ok(enabled) } else { engine::tag_autostart(i32::from(enabled)) } }, Msg::AutostartUpdated)
     }
     fn save(&mut self) {
         if let Some(d) = &self.headphone_output {
@@ -1637,7 +1643,6 @@ impl App {
         self.settings.set("ui", "page_pixelate", self.pixel_shift as i32);
         self.settings.set("ui", "effects_group", self.effects_group);
         self.settings.set("ui", "slider_idle", self.slider_idle as i32);
-        self.settings.set("ui", "tag_autostart", self.autostart as i32);
         if let Some(folder) = &self.sound_folder {
             self.settings
                 .set("soundpad", "folder", folder.to_string_lossy());
@@ -1977,8 +1982,8 @@ impl App {
             .collect();
         Task::batch(bound.into_iter().map(|i| self.load_sound(i)))
     }
-    fn clip_id(index: usize) -> u32 {
-        CLIP_ID_BASE + index as u32
+    fn clip_id(index: usize, reverse: bool) -> u32 {
+        (if reverse { CLIP_REVERSE_ID_BASE } else { CLIP_ID_BASE }) + index as u32
     }
     /// Re-read the recordings folder; older files beyond [`CLIPS_KEPT`] are deleted.
     fn bump_sounds(&mut self) {
@@ -2014,7 +2019,7 @@ impl App {
         let rendered = clip.name.contains(" (mix)");
         let (loader, id, generation) = (
             self.engine.sound_loader(),
-            Self::clip_id(index),
+            Self::clip_id(index, false),
             self.clip_loads,
         );
         perform(
@@ -2027,6 +2032,8 @@ impl App {
                     }
                 }
                 load_if_live(&loader, &live, generation, id, &pcm, 1.0)?;
+                let backwards: Vec<f32> = pcm.iter().rev().copied().collect();
+                load_if_live(&loader, &live, generation, id - CLIP_ID_BASE + CLIP_REVERSE_ID_BASE, &backwards, 1.0)?;
                 Ok(pcm.len() as f32 / soundpad::RATE as f32)
             },
             move |result| Msg::ClipLoaded(index, generation, result),
@@ -3111,6 +3118,7 @@ impl App {
                     Ok(()) => {
                         self.app_autostart = enabled;
                         self.save();
+                        return self.sync_host_login();
                     }
                     Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
                 }
@@ -3125,18 +3133,13 @@ impl App {
                 self.slider_idle = enabled;
                 self.save();
             }
-            Msg::Autostart(enabled) => {
-                self.focus = focus::settings::AUTOSTART;
-                if !self.autostart_busy {
-                    self.autostart_busy = true;
-                    return perform(async move { if cfg!(test) { Ok(enabled) } else { engine::tag_autostart(i32::from(enabled)) } }, Msg::AutostartUpdated);
-                }
-            }
             Msg::AutostartUpdated(result) => {
                 self.autostart_busy = false;
                 match result {
-                    Ok(enabled) => { self.autostart = enabled; self.save(); }
-                    Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
+                    // The switch moved again while the task was being written.
+                    Ok(enabled) if enabled != self.app_autostart => return self.sync_host_login(),
+                    Ok(_) => {}
+                    Err(e) => self.message = format!("Автозапуск микрофона не изменён: {e}"),
                 }
             }
             Msg::Input(d) => {
@@ -3337,10 +3340,8 @@ impl App {
                     if !components::driver_installed() {
                         self.driver_ready = false;
                     }
-                    if !self.autostart_busy && engine::tag_autostart(-1).ok() != Some(self.autostart) {
-                        self.autostart_busy = true;
-                        let enabled = self.autostart;
-                        return perform(async move { engine::tag_autostart(i32::from(enabled)) }, Msg::AutostartUpdated);
+                    if !self.autostart_busy && engine::tag_autostart(-1).ok() != Some(self.app_autostart) {
+                        return self.sync_host_login();
                     }
                 }
             }
@@ -3514,8 +3515,19 @@ impl App {
                 }
                 self.focus = focus::rvc::REFRESH;
             }
+            Msg::RvcCatalog(index) => {
+                let Some(&(name, _, url)) = rvc::MODEL_CATALOGS.get(index) else {
+                    return Task::none();
+                };
+                self.focus = focus::rvc::CATALOG_BASE + index;
+                if !self.benchmark
+                    && let Err(error) = std::process::Command::new("explorer.exe").arg(url).spawn()
+                {
+                    self.message = format!("Не удалось открыть {name}: {error}");
+                }
+            }
             Msg::RvcImport => {
-                if self.rvc_importing {
+                if !self.rvc_runtime_installed || self.rvc_importing {
                     return Task::none();
                 }
                 self.rvc_importing = true;
@@ -4235,16 +4247,16 @@ impl App {
                     )
                 }
             },
-            Msg::ClipPlay(i) => {
+            Msg::ClipPlay(i, reverse) => {
                 let Some(clip) = self.clips.get(i) else {
                     return Task::none();
                 };
-                self.focus = focus::effects::CLIP_BASE + 2 * i;
+                self.focus = focus::effects::CLIP_BASE + 3 * i + usize::from(reverse);
                 match clip.state {
-                    SoundState::Loaded(_) => self.engine.sound_play(Self::clip_id(i)),
-                    SoundState::Loading => self.clip_pending_play = Some(i),
+                    SoundState::Loaded(_) => self.engine.sound_play(Self::clip_id(i, reverse)),
+                    SoundState::Loading => self.clip_pending_play = Some((i, reverse)),
                     SoundState::Unloaded | SoundState::Failed(_) => {
-                        self.clip_pending_play = Some(i);
+                        self.clip_pending_play = Some((i, reverse));
                         return self.load_clip(i);
                     }
                 }
@@ -4263,10 +4275,12 @@ impl App {
                         SoundState::Failed(e)
                     }
                 };
-                if self.clip_pending_play == Some(i) {
+                if let Some((pending, reverse)) = self.clip_pending_play
+                    && pending == i
+                {
                     self.clip_pending_play = None;
                     if matches!(self.clips[i].state, SoundState::Loaded(_)) {
-                        self.engine.sound_play(Self::clip_id(i));
+                        self.engine.sound_play(Self::clip_id(i, reverse));
                     }
                 }
             }
@@ -4274,7 +4288,7 @@ impl App {
                 self.clip_note.clear();
                 self.clip_menu = if self.clip_menu == at { None } else { at };
                 if let Some(i) = at {
-                    self.focus = focus::effects::CLIP_BASE + 2 * i + 1;
+                    self.focus = focus::effects::CLIP_BASE + 3 * i + 2;
                 }
             }
             Msg::ClipSave(i, to_soundpad) => {
@@ -4282,7 +4296,7 @@ impl App {
                 if i >= self.clips.len() {
                     return Task::none();
                 }
-                self.focus = focus::effects::CLIP_BASE + 2 * i + 1;
+                self.focus = focus::effects::CLIP_BASE + 3 * i + 2;
                 match self.sound_folder.clone().filter(|_| to_soundpad) {
                     Some(folder) => {
                         self.copy_clip(i, &folder);
@@ -4694,31 +4708,36 @@ impl App {
             } else if self.details {
                 use focus::settings::*;
                 let mut items = if self.running() || self.busy {
-                    vec![APP_AUTOSTART, AUTOSTART]
+                    vec![]
                 } else {
-                    vec![INPUT, OUTPUT, VERSION, BUFFER, APP_AUTOSTART, AUTOSTART]
+                    vec![INPUT, OUTPUT, VERSION, BUFFER]
                 };
+                if !self.repair_confirm {
+                    items.extend([REPAIR, REFRESH]);
+                }
                 if !self.driver_ready {
                     items.push(DRIVER);
                 }
                 if self.repair_confirm {
                     items.extend([REPAIR_LINES, REPAIR_REINSTALL, REPAIR_CONFIRM, REPAIR_CANCEL]);
-                } else {
-                    items.extend([REPAIR, REFRESH]);
                 }
-                items.push(UPDATE);
-                items.extend([PIXEL_SHIFT, SLIDER_IDLE]);
-                items.extend([LOGS, QUIT, REHEARSE, READY_PREVIEW]);
+                items.extend([APP_AUTOSTART, PIXEL_SHIFT, SLIDER_IDLE]);
+                items.extend([UPDATE, REHEARSE, READY_PREVIEW]);
+                items.extend([LOGS, QUIT]);
                 items.extend(tabs);
                 items
             } else if self.rvc_page {
                 use focus::rvc::*;
                 let mut items = if self.rvc_runtime_installed {
-                    vec![ENABLE, MODEL]
+                    vec![ENABLE]
                 } else {
                     vec![INSTALL]
                 };
-                if !self.rvc_importing {
+                items.extend((0..rvc::MODEL_CATALOGS.len()).map(|i| CATALOG_BASE + i));
+                if self.rvc_runtime_installed {
+                    items.push(MODEL);
+                }
+                if self.rvc_runtime_installed && !self.rvc_importing {
                     items.push(IMPORT);
                 }
                 if self.rvc_can_manage() {
@@ -4758,7 +4777,7 @@ impl App {
                 }
                 items.extend([MONITOR, MONITOR_BIND, EFFECTS_MONITOR, BOOST_MONITOR, DISCORD_VOLUME, REPLAY_BIND]);
                 for i in 0..self.clips.len() {
-                    items.extend([CLIP_BASE + 2 * i, CLIP_BASE + 2 * i + 1]);
+                    items.extend([CLIP_BASE + 3 * i, CLIP_BASE + 3 * i + 1, CLIP_BASE + 3 * i + 2]);
                     if self.clip_menu == Some(i) {
                         items.extend([CLIP_TO_SOUNDPAD, CLIP_TO_FOLDER]);
                     }
@@ -5060,7 +5079,6 @@ impl App {
                 REPAIR_CANCEL if activate => Msg::RepairCancel,
                 DONE if activate => Msg::Settings,
                 QUIT if activate => Msg::Quit,
-                AUTOSTART if activate => Msg::Autostart(!self.autostart),
                 APP_AUTOSTART if activate => Msg::AppAutostart(!self.app_autostart),
                 PIXEL_SHIFT if activate => Msg::PixelShift(!self.pixel_shift),
                 SLIDER_IDLE if activate => Msg::SliderIdle(!self.slider_idle),
@@ -5135,6 +5153,9 @@ impl App {
                 }
                 focus::rvc::REFRESH if activate => Msg::RvcRefresh,
                 focus::rvc::IMPORT if activate => Msg::RvcImport,
+                id if activate && (focus::rvc::CATALOG_BASE..focus::rvc::CATALOG_BASE + rvc::MODEL_CATALOGS.len()).contains(&id) => {
+                    Msg::RvcCatalog(id - focus::rvc::CATALOG_BASE)
+                }
                 focus::rvc::RENAME if activate => Msg::RvcRename,
                 focus::rvc::DELETE if activate => Msg::RvcDelete,
                 focus::rvc::ADVANCED if activate => Msg::RvcAdvanced,
@@ -5190,11 +5211,12 @@ impl App {
                     Some(i) => Msg::ClipSave(i, false),
                     None => Msg::Noop,
                 },
-                f if activate && f >= CLIP_BASE && (f - CLIP_BASE) / 2 < self.clips.len() => {
-                    if (f - CLIP_BASE).is_multiple_of(2) {
-                        Msg::ClipPlay((f - CLIP_BASE) / 2)
+                f if activate && f >= CLIP_BASE && (f - CLIP_BASE) / 3 < self.clips.len() => {
+                    let (i, part) = ((f - CLIP_BASE) / 3, (f - CLIP_BASE) % 3);
+                    if part < 2 {
+                        Msg::ClipPlay(i, part == 1)
                     } else {
-                        Msg::ClipMenu(Some((f - CLIP_BASE) / 2))
+                        Msg::ClipMenu(Some(i))
                     }
                 }
                 _ => Msg::Noop,
@@ -5409,14 +5431,17 @@ mod controller_tests {
         assert_eq!(app.focus,focus::effects::OPTION_BASE);
     }
     #[test]
-    fn tag_autostart_defaults_on_only_for_new_installs() {
-        let mut settings = Settings::for_test("");
-        assert!(tag_autostart_default(&settings, false));
-        settings.path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        assert!(!tag_autostart_default(&settings, false));
-        assert!(tag_autostart_default(&settings, true));
-        settings.set("ui", "tag_autostart", 0);
-        assert!(!tag_autostart_default(&settings, true));
+    fn host_login_follows_start_with_windows() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        assert!(app.app_autostart && !app.autostart_busy);
+        let _ = app.update(Msg::AppAutostart(false));
+        assert!(!app.app_autostart && app.autostart_busy);
+        // Flipped back while the task was written: the stale result re-syncs to the switch.
+        let _ = app.update(Msg::AppAutostart(true));
+        let _ = app.update(Msg::AutostartUpdated(Ok(false)));
+        assert!(app.autostart_busy);
+        let _ = app.update(Msg::AutostartUpdated(Ok(true)));
+        assert!(!app.autostart_busy);
     }
     #[test]
     fn update_shrink_and_grow_walk_their_steps() {
@@ -6214,9 +6239,10 @@ page_pixelate=0")).unwrap().unwrap();
         assert!(!folder.join("Запись 2026-09-20 14-05-10.wav").exists());
         assert_eq!(soundpad::decode(&app.clips[0].path).unwrap().len(), 480);
         app.window = Some(App::open(1.0, None).0);
-        let _ = app.update(Msg::ClipPlay(0));
+        let _ = app.update(Msg::ClipPlay(0, true));
         assert_eq!(app.clips[0].state, SoundState::Loading);
-        assert_eq!(app.clip_pending_play, Some(0));
+        assert_eq!(app.clip_pending_play, Some((0, true)));
+        assert_eq!(app.focus, focus::effects::CLIP_BASE + 1);
         let _ = app.update(Msg::ClipLoaded(0, app.clip_loads, Ok(0.01)));
         assert_eq!(app.clips[0].state, SoundState::Loaded(0.01));
         assert_eq!(app.clip_pending_play, None);
@@ -6229,7 +6255,7 @@ page_pixelate=0")).unwrap().unwrap();
         // Save through the row menu: the two targets are reachable only while it is open.
         app.sound_folder = Some(library.clone());
         let _ = app.update(Msg::Page(6));
-        app.focus = focus::effects::CLIP_BASE + 1;
+        app.focus = focus::effects::CLIP_BASE + 2;
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
         assert_eq!(app.clip_menu, Some(0));
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
@@ -6604,8 +6630,25 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 32);
         let _ = app.update(Msg::Page(1));
+        app.rvc_runtime_installed = false;
+        for expected in [focus::rvc::INSTALL, focus::rvc::CATALOG_BASE, focus::rvc::CATALOG_BASE + 1, focus::rvc::PITCH] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected, "catalogs stay available without the runtime; disabled import is skipped");
+        }
+        let _ = app.update(Msg::RvcImport);
+        assert!(!app.rvc_importing, "import needs the runtime even with a stale focus target");
+        app.rvc_runtime_installed = true;
+        app.focus = focus::NONE;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 24);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::rvc::CATALOG_BASE);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::rvc::CATALOG_BASE);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::rvc::CATALOG_BASE + 1);
+        let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::rvc::CATALOG_BASE + 1);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 25);
         app.rvc_models = vec![

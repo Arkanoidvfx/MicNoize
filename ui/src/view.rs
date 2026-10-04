@@ -136,11 +136,11 @@ mod glyph {
     pub const MINIMIZE: &str = "\u{E921}";
     pub const WARNING: &str = "\u{E7BA}";
     pub const FOLDER: &str = "\u{E838}";
+    pub const EXTERNAL: &str = "\u{E774}";
     pub const REFRESH: &str = "\u{E72C}";
     pub const CHECK: &str = "\u{E73E}";
     pub const LOGS: &str = "\u{E9D9}";
     pub const BACK: &str = "\u{E72B}";
-    pub const PALETTE: &str = "\u{E790}";
 }
 fn icon<'a>(glyph: &'a str, size: u32, color: Color) -> widget::Text<'a> {
     text(glyph).size(size).color(color).font(Font::with_name("Segoe MDL2 Assets"))
@@ -448,15 +448,17 @@ fn meter<'a>(level: f32, color: Color) -> Element<'a, Msg> {
 }
 /// The hero recording's bars, as in the mockup: a stable pseudo-waveform per clip (the real
 /// samples are not decoded for the UI), filled with the slider gradient as it plays.
-fn waveform<'a>(name: &str, progress: Option<f32>) -> Element<'a, Msg> {
+/// `progress` is (fraction, backwards): a reversed recording fills from the right.
+fn waveform<'a>(name: &str, progress: Option<(f32, bool)>) -> Element<'a, Msg> {
     const BARS: usize = 30;
     let seed = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 997;
     let seed = seed as f32 / 97.0;
-    let done = progress.map_or(0, |p| (p * BARS as f32).round() as usize);
+    let done = progress.map_or(0, |(p, _)| (p * BARS as f32).round() as usize);
+    let backwards = progress.is_some_and(|(_, reverse)| reverse);
     widget::Row::with_children((0..BARS).map(|i| {
         let t = i as f32;
         let h = 5.0 + 24.0 * ((t * 0.55 + seed).sin() * (t * 0.21 + seed * 1.7).cos()).abs();
-        let fill = if i < done {
+        let fill = if (if backwards { BARS - 1 - i } else { i }) < done {
             tacho::lerp(t / BARS as f32)
         } else if progress.is_some() {
             Color::from_rgb8(0x5A, 0x5B, 0x61)
@@ -1958,83 +1960,96 @@ impl App {
             return label("Появятся после удержания голосового эффекта.", 12, FAINT).into();
         }
         let (playing, position, length) = self.sound_playing;
-        let progress = |i: usize| -> Option<f32> {
-            (playing == Self::clip_id(i)).then(|| if length > 0.0 { (position / length).clamp(0.0, 1.0) } else { 0.0 })
+        // Which way recording `i` is playing, and how far.
+        let progress = |i: usize| -> Option<(f32, bool)> {
+            let fraction = if length > 0.0 { (position / length).clamp(0.0, 1.0) } else { 0.0 };
+            [false, true].into_iter().find(|&reverse| playing == Self::clip_id(i, reverse)).map(|reverse| (fraction, reverse))
         };
-        let save_button = |i: usize| {
-            let focused = self.focus == CLIP_BASE + 2 * i + 1;
-            let chosen = self.clip_menu == Some(i);
-            button(focus_target(container(icon(glyph::SAVE, 12, if chosen { ORANGE_DARK } else { DIM })).center(Length::Fill), focused))
-                .width(30)
+        // Square icon buttons at a recording's end: reverse play and the save menu.
+        let tool = |glyph: &'static str, focused: bool, lit: bool, size: f32, message: Msg| {
+            button(focus_target(container(icon(glyph, 12, if lit { ORANGE_DARK } else { DIM })).center(Length::Fill), focused))
+                .width(size)
                 .height(Length::Fill)
                 .padding(0)
-                .on_press(Msg::ClipMenu(Some(i)))
+                .on_press(message)
                 .style(move |_, status| {
                     let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
                     button::Style {
-                        background: Some((if chosen || hover { ORANGE } else { Color::TRANSPARENT }).into()),
+                        background: Some((if lit { ORANGE } else if hover { HOVER } else { Color::TRANSPARENT }).into()),
                         text_color: INK,
                         border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
                         ..Default::default()
                     }
                 })
         };
+        let reverse_button = |i: usize, size: f32| {
+            let lit = progress(i).is_some_and(|(_, reverse)| reverse);
+            tool(glyph::REVERSE, self.focus == CLIP_BASE + 3 * i + 1, lit, size, Msg::ClipPlay(i, true))
+        };
+        let save_button = |i: usize, size: f32| tool(glyph::SAVE, self.focus == CLIP_BASE + 3 * i + 2, self.clip_menu == Some(i), size, Msg::ClipMenu(Some(i)));
+        let seconds = |i: usize| match self.clips[i].state {
+            SoundState::Loaded(s) => format!("{s:.1} с").replace('.', ","),
+            _ => String::new(),
+        };
+        let live_style = |live: bool, radius: f32| {
+            move |_: &Theme| container::Style {
+                background: Some((if live { LIVE_BG } else { CARD2 }).into()),
+                border: Border { color: if live { Color { a: 0.6, ..ORANGE } } else { Color::from_rgb8(0x2E, 0x2F, 0x34) }, width: 1.0, radius: radius.into() },
+                ..Default::default()
+            }
+        };
         let hero = {
             let clip = &self.clips[0];
             let p = progress(0);
+            let forward = p.is_some_and(|(_, reverse)| !reverse);
             let failed = matches!(clip.state, SoundState::Failed(_));
             let focused = self.focus == CLIP_BASE;
             let play = button(focus_target(
-                container(icon(if p.is_some() { glyph::STOP } else { glyph::PLAY }, 14, ORANGE_DARK)).center(Length::Fill),
+                container(icon(if forward { glyph::STOP } else { glyph::PLAY }, 14, ORANGE_DARK)).center(Length::Fill),
                 focused,
             ))
             .width(40)
             .height(40)
             .padding(0)
-            .on_press(Msg::ClipPlay(0))
+            .on_press(Msg::ClipPlay(0, false))
             .style(move |_, status| button::Style {
                 background: Some((if matches!(status, button::Status::Hovered | button::Status::Pressed) { Color::from_rgb8(0xFF, 0xB0, 0x70) } else { ORANGE }).into()),
                 text_color: ORANGE_DARK,
                 border: Border { color: if focused { INK } else { Color::TRANSPARENT }, width: 2.0, radius: 8.0.into() },
                 ..Default::default()
             });
-            let seconds = match clip.state {
-                SoundState::Loaded(s) => format!("{s:.1} с").replace('.', ","),
-                _ => String::new(),
-            };
-            let bar = waveform(&clip.name, p);
+            let seconds = seconds(0);
             container(
                 row![
                     play,
+                    container(reverse_button(0, 40.0)).height(40),
                     column![
                         numbers(super::clip_label(&clip.name), 14, if failed { RED } else { INK }),
                         label(if seconds.is_empty() { "последняя запись".to_owned() } else { format!("последняя · {seconds}") }, 11, FAINT),
                     ]
                     .spacing(2)
                     .width(118),
-                    container(bar).width(Length::Fill).center_y(40),
-                    save_button(0),
+                    container(waveform(&clip.name, p)).width(Length::Fill).center_y(40),
+                    container(save_button(0, 32.0)).height(40),
                 ]
-                .spacing(12)
+                .spacing(10)
                 .height(40)
                 .align_y(iced::Center),
             )
             .padding([8, 10])
-            .style(move |_| container::Style {
-                background: Some((if p.is_some() { LIVE_BG } else { CARD2 }).into()),
-                border: Border { color: if p.is_some() { Color { a: 0.6, ..ORANGE } } else { Color::from_rgb8(0x2E, 0x2F, 0x34) }, width: 1.0, radius: 10.0.into() },
-                ..Default::default()
-            })
+            .style(live_style(p.is_some(), 10.0))
         };
         let chip = |i: usize| -> Element<'_, Msg> {
             let clip = &self.clips[i];
             let p = progress(i);
-            let focused = self.focus == CLIP_BASE + 2 * i;
+            let forward = p.is_some_and(|(_, reverse)| !reverse);
+            let focused = self.focus == CLIP_BASE + 3 * i;
             let failed = matches!(clip.state, SoundState::Failed(_));
             let play = button(focus_target(
                 row![
-                    icon(if p.is_some() { glyph::STOP } else { glyph::PLAY }, 9, if p.is_some() { ORANGE } else { DIM }),
+                    icon(if forward { glyph::STOP } else { glyph::PLAY }, 9, if forward { ORANGE } else { DIM }),
                     numbers(super::clip_label(&clip.name), 13, if failed { RED } else if p.is_some() { ORANGE } else { INK }),
+                    label(seconds(i), 11, FAINT),
                 ]
                 .spacing(8)
                 .align_y(iced::Center),
@@ -2043,49 +2058,42 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding([0, 10])
-            .on_press(Msg::ClipPlay(i))
+            .on_press(Msg::ClipPlay(i, false))
             .style(move |_, status| button::Style {
                 background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
                 text_color: INK,
                 border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
                 ..Default::default()
             });
-            container(row![play, save_button(i)].height(34))
-                .style(move |_| container::Style {
-                    background: Some((if p.is_some() { LIVE_BG } else { CARD2 }).into()),
-                    border: Border { color: if p.is_some() { Color { a: 0.6, ..ORANGE } } else { Color::from_rgb8(0x2E, 0x2F, 0x34) }, width: 1.0, radius: 7.0.into() },
-                    ..Default::default()
-                })
+            container(row![play, reverse_button(i, 30.0), save_button(i, 30.0)].height(34))
+                .style(live_style(p.is_some(), 7.0))
                 .width(Length::Fill)
                 .into()
         };
+        // The save menu opens right under the recording it belongs to.
+        let opened = self.clip_menu.filter(|i| *i < self.clips.len());
+        let menu = |i: usize| {
+            row![
+                label(format!("Сохранить «{}»", super::clip_label(&self.clips[i].name)), 12, DIM),
+                action(label("В саундпад", 12, INK), Msg::ClipSave(i, true), self.focus == CLIP_TO_SOUNDPAD, false),
+                action(label("В папку…", 12, INK), Msg::ClipSave(i, false), self.focus == CLIP_TO_FOLDER, false),
+                caption_button(glyph::CLOSE, Msg::ClipMenu(None), false).width(30).height(30),
+            ]
+            .spacing(6)
+            .align_y(iced::Center)
+        };
         let mut list = column![hero].spacing(6);
-        match self.clip_menu.filter(|i| *i < self.clips.len()) {
-            Some(i) => {
-                list = list.push(
-                    row![
-                        label(format!("Сохранить «{}»", super::clip_label(&self.clips[i].name)), 12, DIM),
-                        action(label("В саундпад", 12, INK), Msg::ClipSave(i, true), self.focus == CLIP_TO_SOUNDPAD, false),
-                        action(label("В папку…", 12, INK), Msg::ClipSave(i, false), self.focus == CLIP_TO_FOLDER, false),
-                        caption_button(glyph::CLOSE, Msg::ClipMenu(None), false).width(30).height(30),
-                    ]
-                    .spacing(6)
-                    .align_y(iced::Center),
-                );
-            }
-            None if !self.clip_note.is_empty() => {
-                let saved = self.clip_note.starts_with("Сохранено");
-                let hint = self.clip_note.starts_with("Выберите");
-                list = list.push(
-                    row![
-                        icon(if saved { glyph::CHECK } else { glyph::WARNING }, 12, if saved { GREEN } else if hint { DIM } else { RED }),
-                        label(&self.clip_note, 12, if saved { GREEN } else if hint { DIM } else { RED }),
-                    ]
+        if opened == Some(0) {
+            list = list.push(menu(0));
+        } else if opened.is_none() && !self.clip_note.is_empty() {
+            let saved = self.clip_note.starts_with("Сохранено");
+            let hint = self.clip_note.starts_with("Выберите");
+            let tone = if saved { GREEN } else if hint { DIM } else { RED };
+            list = list.push(
+                row![icon(if saved { glyph::CHECK } else { glyph::WARNING }, 12, tone), label(&self.clip_note, 12, tone)]
                     .spacing(8)
                     .align_y(iced::Center),
-                );
-            }
-            None => {}
+            );
         }
         let others: Vec<usize> = (1..self.clips.len()).collect();
         for line in others.chunks(3) {
@@ -2097,6 +2105,9 @@ impl App {
                 cells = cells.push(Space::new().width(Length::Fill));
             }
             list = list.push(cells);
+            if let Some(i) = opened.filter(|i| line.contains(i)) {
+                list = list.push(menu(i));
+            }
         }
         list.into()
     }
@@ -2131,8 +2142,7 @@ impl App {
         ]
         .spacing(12);
         if !self.rvc_runtime_installed {
-            // Without the runtime this is the only thing on the page that does anything, so it
-            // is the page's one orange button.
+            // Installing the runtime remains the page's primary action.
             top = top.push(
                 action(
                     label(if self.rvc_runtime_installing { "Установка RVC…" } else { "Установить RVC runtime" }, 13, ORANGE_DARK),
@@ -2143,8 +2153,33 @@ impl App {
                 .on_press_maybe((!self.rvc_runtime_installing).then_some(Msg::RvcInstall)),
             );
         }
+        let mut catalogs = row![].spacing(10);
+        for (i, &(name, description, _)) in rvc::MODEL_CATALOGS.iter().enumerate() {
+            catalogs = catalogs.push(
+                action(
+                    row![
+                        column![bold(name, 14, INK), label(description, 11, DIM)].spacing(3).width(Length::Fill),
+                        icon(glyph::EXTERNAL, 14, ORANGE),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                    Msg::RvcCatalog(i),
+                    self.focus == CATALOG_BASE + i,
+                    false,
+                )
+                .width(Length::Fill),
+            );
+        }
         let model = card(
             column![
+                row![
+                    bold("Где скачать голос", 14, INK),
+                    Space::new().width(Length::Fill),
+                    label("RVC v1/v2", 11, DIM),
+                ]
+                .align_y(iced::Center),
+                catalogs,
+                label("Скачайте .pth и необязательный .index. ZIP сначала распакуйте, затем нажмите «Импорт модели».", 12, DIM),
                 row![
                     container(frame(
                         repaint(self.controls.rvc_options.slot, pick_list(
@@ -2152,7 +2187,7 @@ impl App {
                             self.rvc_models.iter().find(|m| m.slot == self.controls.rvc_options.slot).cloned(),
                             Msg::RvcModel,
                         )
-                        .placeholder("Выберите модель")
+                        .placeholder("Выберите голос")
                         .text_size(13)
                         .padding([6, 10])
                         .width(Length::Fill)
@@ -2213,8 +2248,7 @@ impl App {
             .spacing(6),
         )
         .height(Length::Fill);
-        // The advanced settings open beside the pitch card, not below it, so the page never
-        // needs scrolling at the default window size.
+        // The advanced settings open beside the pitch card to keep the page compact.
         let mut tuning = column![row![
             heading_row(glyph::CHIP, "Тонкая настройка", Space::new().into()),
             action(label(if self.rvc_advanced { "Скрыть" } else { "Показать" }, 12, INK), Msg::RvcAdvanced, self.focus == ADVANCED, false),
@@ -2974,25 +3008,35 @@ impl App {
             .spacing(8)
             .into()
         };
-        let startup = column![
+        // Every on/off preference of the app itself, in one place.
+        let app_settings = column![
             row![frame(switch(self.app_autostart, Msg::AppAutostart, true), self.focus == APP_AUTOSTART), label("Запускать Mic Noize вместе с Windows (в трее)", 13, INK)].spacing(8).align_y(iced::Center),
-            row![frame(switch(self.autostart, Msg::Autostart, true), self.focus == AUTOSTART), label("Держать виртуальный микрофон доступным после входа в Windows", 13, INK)].spacing(8).align_y(iced::Center),
-        ]
-        .spacing(6);
-        // Only while the virtual microphone is missing: a button that can do nothing is noise.
-        let mut device = column![
-            row![
-                label("Устройство Mic Noize", 13, DIM),
-                label(self.device_state.label(), 13, match self.device_state {
-                    engine::DeviceState::Ready => GREEN,
-                    engine::DeviceState::UserAction => RED,
-                    _ => DIM,
-                }),
-            ]
-            .spacing(8),
-            label(&self.device_detail, 12, FAINT),
+            row![frame(switch(self.pixel_shift, Msg::PixelShift, true), self.focus == PIXEL_SHIFT), label("Пиксельный переход между разделами", 13, INK)].spacing(8).align_y(iced::Center),
+            row![frame(switch(self.slider_idle, Msg::SliderIdle, true), self.focus == SLIDER_IDLE), label("Волна и прогрев ползунков", 13, INK)].spacing(8).align_y(iced::Center),
         ]
         .spacing(8);
+        // The virtual microphone is where the voice goes: it reads as one more row of the route,
+        // aligned with «Передать голос в», with its own actions at the row's end.
+        let state = label(self.device_state.label(), 13, match self.device_state {
+            engine::DeviceState::Ready => GREEN,
+            engine::DeviceState::UserAction => RED,
+            _ => DIM,
+        });
+        let mut status = row![label("Виртуальный микрофон", 12, FAINT).width(150), state, Space::new().width(Length::Fill)]
+            .spacing(8)
+            .align_y(iced::Center);
+        if !self.repair_confirm {
+            status = status
+                .push(
+                    action(label(if self.repair_resume.is_some() { "Восстанавливаем…" } else { "Восстановить устройство" }, 13, INK), Msg::Repair, self.focus == REPAIR, false)
+                        .on_press_maybe((!self.driver_installing && !self.core_installing && !self.quitting && !self.apply_pending).then_some(Msg::Repair)),
+                )
+                .push(action(label("Обновить устройства", 13, INK), Msg::Refresh, self.focus == REFRESH, false));
+        }
+        let mut device = column![status].spacing(8);
+        if !self.device_detail.is_empty() {
+            device = device.push(row![Space::new().width(150), label(&self.device_detail, 12, FAINT)].spacing(8));
+        }
         if !self.driver_ready {
             device = device.push(label("Виртуальный микрофон не установлен: Windows запросит права администратора.", 12, DIM)).push(
                 action(label(if self.driver_installing { "Устанавливаем…" } else { "Установить виртуальный микрофон" }, 13, INK), Msg::InstallDriver, self.focus == DRIVER, false)
@@ -3020,48 +3064,16 @@ impl App {
                 .spacing(8),
             )
         } else {
-            device.push(
-                row![
-                    action(label(if self.repair_resume.is_some() { "Восстанавливаем…" } else { "Восстановить устройство" }, 13, INK), Msg::Repair, self.focus == REPAIR, false)
-                        .on_press_maybe((!self.driver_installing && !self.core_installing && !self.quitting && !self.apply_pending).then_some(Msg::Repair)),
-                    action(label("Обновить устройства", 13, INK), Msg::Refresh, self.focus == REFRESH, false),
-                ]
-                .spacing(8),
-            )
+            device
         };
         // The version stands in the title bar; a ready update restarts from the rail's card, so
         // this block only says where the check stands.
+        // «Анимация обновления» plays «Перезапустить» → update window → restart for real,
+        // without installing; «Карточка обновления» shows the ready card's celebration.
         let updates = column![
             label(&self.update_status, 12, if self.update_ready { GREEN } else { FAINT }),
             action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" }, 13, if self.update_checking { FAINT } else { INK }), Msg::UpdateCheck, self.focus == UPDATE, false)
                 .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
-        ]
-        .spacing(8);
-        let visuals = column![
-            row![frame(switch(self.pixel_shift, Msg::PixelShift, true), self.focus == PIXEL_SHIFT), label("Пиксельный переход между разделами", 13, INK)].spacing(8).align_y(iced::Center),
-            row![frame(switch(self.slider_idle, Msg::SliderIdle, true), self.focus == SLIDER_IDLE), label("Волна и прогрев ползунков", 13, INK)].spacing(8).align_y(iced::Center),
-        ]
-        .spacing(6);
-        let diagnostics = column![
-            numbers(format!("NVIDIA {:.2} мс   очередь {:.1} мс", self.snapshot.process_ms, self.snapshot.queue_ms), 13, DIM),
-            numbers(
-                format!(
-                    "пропуски {} / {}   pitch {:.1} мс (макс {:.2} мс)",
-                    self.snapshot.underruns, self.snapshot.drops, self.snapshot.pitch_delay_ms, self.snapshot.pitch_max_ms
-                ),
-                13,
-                DIM,
-            ),
-            label("Буфер — запас от обрывов, не полная задержка. Pitch добавляет задержку только при удержании.", 12, FAINT),
-            row![
-                action(row![icon(glyph::LOGS, 12, INK), label("Логи и отчёт", 13, INK)].spacing(8).align_y(iced::Center), Msg::Page(5), self.focus == LOGS, false),
-                Space::new().width(Length::Fill),
-                action(label("Выход из Mic Noize", 13, INK), Msg::Quit, self.focus == QUIT, false),
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
-            // «Анимация обновления» plays «Перезапустить» → update window → restart for real,
-            // without installing; «Карточка обновления» shows the ready card's celebration.
             row![
                 action(label("Анимация обновления", 13, INK), Msg::RehearseUpdate, self.focus == REHEARSE, false),
                 action(label("Карточка обновления", 13, INK), Msg::ReadyPreview, self.focus == READY_PREVIEW, false),
@@ -3069,26 +3081,38 @@ impl App {
             .spacing(8),
         ]
         .spacing(8);
-        // Two columns under the device card, so the page fits the default window unscrolled.
+        // Numbers on the left; the support report and quitting close the page at bottom right.
+        let diagnostics = row![
+            column![
+                numbers(format!("NVIDIA {:.2} мс   очередь {:.1} мс", self.snapshot.process_ms, self.snapshot.queue_ms), 13, DIM),
+                numbers(
+                    format!(
+                        "пропуски {} / {}   pitch {:.1} мс (макс {:.2} мс)",
+                        self.snapshot.underruns, self.snapshot.drops, self.snapshot.pitch_delay_ms, self.snapshot.pitch_max_ms
+                    ),
+                    13,
+                    DIM,
+                ),
+                label("Буфер — запас от обрывов, не полная задержка. Pitch добавляет задержку только при удержании.", 12, FAINT),
+            ]
+            .spacing(6)
+            .width(Length::Fill),
+            action(row![icon(glyph::LOGS, 12, INK), label("Логи и отчёт", 13, INK)].spacing(8).align_y(iced::Center), Msg::Page(5), self.focus == LOGS, false),
+            action(label("Выход из Mic Noize", 13, INK), Msg::Quit, self.focus == QUIT, false),
+        ]
+        .spacing(8)
+        .align_y(iced::Bottom);
+        // Route and device in one card, preferences beside updates, diagnostics last: the page
+        // fits the default window unscrolled.
         column![
             title("Настройки"),
-            card(column![heading_row(glyph::MIC, "Микрофон и выход", Space::new().into()), route].spacing(10)),
+            card(column![heading_row(glyph::MIC, "Микрофон и выход", Space::new().into()), route, device].spacing(10)),
             row![
-                column![
-                    card(column![heading_row(glyph::REFRESH, "Запуск", Space::new().into()), startup].spacing(10)),
-                    card(column![heading_row(glyph::SAVE, "Обновления", Space::new().into()), updates].spacing(10)),
-                    card(column![heading_row(glyph::PALETTE, "Визуальные эффекты", Space::new().into()), visuals].spacing(10)),
-                ]
-                .spacing(14)
-                .width(Length::FillPortion(1)),
-                column![
-                    card(column![heading_row(glyph::OUTPUT, "Виртуальный микрофон", Space::new().into()), device].spacing(10)),
-                    card(column![heading_row(glyph::CHIP, "Диагностика", Space::new().into()), diagnostics].spacing(10)),
-                ]
-                .spacing(14)
-                .width(Length::FillPortion(1)),
+                card(column![heading_row(glyph::SETTINGS, "Приложение", Space::new().into()), app_settings].spacing(10)).width(Length::FillPortion(1)),
+                card(column![heading_row(glyph::SAVE, "Обновления", Space::new().into()), updates].spacing(10)).width(Length::FillPortion(1)),
             ]
             .spacing(14),
+            card(column![heading_row(glyph::CHIP, "Диагностика", Space::new().into()), diagnostics].spacing(10)),
         ]
         .spacing(14)
         .into()
@@ -3823,6 +3847,23 @@ mod tests {
         app.in_peak = 0.2;
         app.peak = 0.08;
         app.noise_peak = 0.08;
+        if std::env::var_os("MNR_RVC_ONLY").is_some() {
+            app.rvc_page = true;
+            app.rvc_runtime_installed = false;
+            render(&app, "rvc-catalogs");
+            app.rvc_advanced = true;
+            render(&app, "rvc-catalogs-advanced");
+            app.rvc_runtime_installed = true;
+            render(&app, "rvc-catalogs-installed");
+            app.rvc_advanced = false;
+            app.focus = focus::rvc::CATALOG_BASE;
+            app.focus_visible = true;
+            scale.set(2.0);
+            render(&app, "rvc-catalogs-200pct");
+            window.set((620.0, 440.0));
+            render(&app, "rvc-catalogs-small-200pct");
+            return;
+        }
         if std::env::var_os("MNR_GATE_ONLY").is_some() {
             render(&app, "gate-off");
             app.controls.noise_gate_db = -42.0;

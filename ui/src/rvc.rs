@@ -3,6 +3,10 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 
 pub const CHUNKS: [u32; 5] = [100, 150, 200, 300, 500];
+pub const MODEL_CATALOGS: [(&str, &str, &str); 2] = [
+    ("Voice Models", "Каталог голосов и персонажей", "https://voice-models.com/"),
+    ("Hugging Face", "Файлы моделей · фильтр RVC", "https://huggingface.co/models?other=rvc"),
+];
 const DISPLAY_NAME_FILE: &str = "display-name.txt";
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Options {
