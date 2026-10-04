@@ -1856,10 +1856,12 @@ impl App {
     /// 2–10 ms for one full pass. A changed background is its only switch to a full pass, so
     /// `repaint_all` flips the lowest mantissa bit: a different colour, the same pixels.
     fn backdrop(&self) -> iced::Color {
-        // Animated overlays overlap many damage regions. One full pass is cheaper than
-        // repainting the same pixels several times; the mantissa changes remain invisible.
+        // Live meters plus a moving control can produce 50–70 damage regions and repeat
+        // rasterization of the same layers. Use one pass during edits, as for overlays.
+        // Use the epoch (not the latest edit) so each frame gets a different invisible stamp.
+        let editing = self.dirty.filter(|at| at.elapsed() < Duration::from_millis(600)).map(|_| self.epoch);
         let motion=self.morph.as_ref().and_then(|m|m.anim.as_ref()).map(|m|m.start)
-            .or(self.restart.map(|r|r.start)).or(self.ready_fx);
+            .or(self.restart.map(|r|r.start)).or(self.ready_fx).or(editing);
         let stamp=motion.map_or(0,|start|((start.elapsed().as_millis() as u32)&255)<<1);
         iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ stamp ^ self.repaint_all as u32), ..view::BG }
     }

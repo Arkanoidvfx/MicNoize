@@ -32,9 +32,10 @@ const FRAME: Duration = Duration::from_millis(16);
 fn frame_after(now: Instant) -> RedrawRequest {
     RedrawRequest::At(now + FRAME)
 }
-fn pointer_frame<Message>(due: &mut Option<Instant>, shell: &mut Shell<'_, Message>) {
-    // Keep the first deadline: resetting it on every packet starves a high-Hz drag.
-    shell.request_redraw_at(*due.get_or_insert_with(|| Instant::now() + FRAME));
+fn pointer_frame<Message>(pending: &mut bool, shell: &mut Shell<'_, Message>) {
+    // Coalesce until the native frame, without putting input behind a timer.
+    *pending = true;
+    shell.request_redraw();
 }
 const OFF: Color = Color::from_rgb8(0x1E, 0x1F, 0x22);
 const OFF_RED: Color = Color::from_rgb8(0x2C, 0x1A, 0x1A);
@@ -250,7 +251,7 @@ struct State {
     anchor: (f32, f32),
     /// Last model and proposed value; several input events can arrive before a rebuild.
     input: Option<(f32, f32)>,
-    frame_due: Option<Instant>,
+    pointer_pending: bool,
     /// Wheel notches not applied yet (touchpads send fractions).
     wheel: f32,
     painted: Painted,
@@ -278,7 +279,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         _: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
-        if !self.enabled { state.drag = false; state.frame_due = None; }
+        if !self.enabled { state.drag = false; state.pointer_pending = false; }
         let bounds = layout.bounds();
         let track = self.track(bounds);
         let scale = self.scale(track);
@@ -294,7 +295,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if self.enabled => {
                 if let Some(p) = cursor.position_over(hit) {
-                    state.frame_due = None;
+                    state.pointer_pending = false;
                     if state.mods.command() {
                         publish(self.default, &mut current, shell);
                     } else {
@@ -314,7 +315,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                     current = scale.dragged(&mut state.anchor, p.x, state.mods.shift());
                 }
                 if current != self.value { shell.publish((self.on_change)(current)); }
-                state.frame_due = None;
+                state.pointer_pending = false;
                 state.drag = false;
                 state.touched = Some(Instant::now());
                 shell.capture_event();
@@ -324,10 +325,10 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 current = scale.dragged(&mut state.anchor, position.x, state.mods.shift());
                 state.touched = Some(Instant::now());
                 shell.capture_event();
-                pointer_frame(&mut state.frame_due, shell);
+                pointer_frame(&mut state.pointer_pending, shell);
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if self.enabled && self.wheel && cursor.is_over(hit) => {
-                if state.frame_due.take().is_some() && current != self.value { shell.publish((self.on_change)(current)); }
+                if std::mem::take(&mut state.pointer_pending) && current != self.value { shell.publish((self.on_change)(current)); }
                 let whole = wheel_steps(&mut state.wheel, *delta);
                 if whole != 0.0 {
                     publish(self.snap(current + whole * self.step), &mut current, shell);
@@ -340,7 +341,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.mods = *m,
             Event::Window(window::Event::Unfocused) => {
-                if state.frame_due.take().is_some() && current != self.value { shell.publish((self.on_change)(current)); }
+                if std::mem::take(&mut state.pointer_pending) && current != self.value { shell.publish((self.on_change)(current)); }
                 state.drag = false;
                 state.mods = keyboard::Modifiers::default();
                 state.wheel = 0.0;
@@ -348,7 +349,9 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let now = *now;
-                if state.frame_due.take().is_some() && current != self.value { shell.publish((self.on_change)(current)); }
+                // Sub-step motion still moves the head: keep the controller's edit repaint
+                // active even when the rounded audio value has not crossed its next step.
+                if std::mem::take(&mut state.pointer_pending) { shell.publish((self.on_change)(current)); }
                 let v = current;
                 if !state.ready {
                     state.ready = true;
@@ -1178,7 +1181,7 @@ struct MeterState {
     mods: keyboard::Modifiers,
     wheel: f32,
     input: Option<(f32, f32)>,
-    frame_due: Option<Instant>,
+    pointer_pending: bool,
 }
 /// Stable pseudo-random 0..1 for bar `i` in flicker frame `t`.
 fn grain(i: u32, t: u32) -> f32 {
@@ -1208,11 +1211,12 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
             && state.drag {
             state.input = Some((self.gate_db, scale.dragged(&mut state.anchor, position.x, state.mods.shift())));
             shell.capture_event();
-            pointer_frame(&mut state.frame_due, shell);
+            pointer_frame(&mut state.pointer_pending, shell);
             return;
         }
         if matches!(event, Event::Window(window::Event::RedrawRequested(_) | window::Event::Unfocused))
-            && state.frame_due.take().is_some() && current != self.gate_db { shell.publish(on_change(current)); }
+            && std::mem::take(&mut state.pointer_pending)
+            && (current != self.gate_db || matches!(event, Event::Window(window::Event::RedrawRequested(_)))) { shell.publish(on_change(current)); }
         let value = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(bounds) => {
                 state.drag = true;
@@ -1248,11 +1252,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
             _ => None,
         };
         if let Some(value) = value {
-            if value != current || state.frame_due.is_some() && value != self.gate_db
+            if value != current || state.pointer_pending && value != self.gate_db
                 || matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) {
                 shell.publish(on_change(value));
             }
-            state.frame_due = None;
+            state.pointer_pending = false;
             shell.capture_event();
             shell.request_redraw();
         }
@@ -1388,12 +1392,13 @@ mod gate_tests {
             (messages, due)
         };
         assert_eq!(send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), 366.0).0, [-36.0]);
-        let mut deadline = None;
+        assert!(send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(366.01, 12.0) }), 366.01).0.is_empty());
+        assert_eq!(send(Event::Window(window::Event::RedrawRequested(Instant::now())), 366.01).0, [-36.0], "fractional marker motion keeps the edit repaint active");
         for i in 1..=1000 {
             let x = 366.0 + i as f32 / 10.0;
             let (messages, due) = send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(x, 12.0) }), x);
             assert!(messages.is_empty());
-            assert_eq!(*deadline.get_or_insert(due), due);
+            assert_eq!(due, RedrawRequest::NextFrame);
         }
         assert_eq!(send(Event::Window(window::Event::RedrawRequested(Instant::now())), 466.0).0, [-26.0]);
         assert!(send(Event::Window(window::Event::RedrawRequested(Instant::now())), 466.0).0.is_empty());
@@ -3117,7 +3122,7 @@ mod tests {
         assert!(!state.drag && !state.mods.shift());
     }
     #[test]
-    fn high_hz_drag_keeps_one_deadline_and_commits_once_per_frame() {
+    fn high_hz_drag_requests_immediate_frame_and_commits_once_per_frame() {
         let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
         let mut slider: Element<'_, f32> = tacho(100.0..=2000.0, 300.0, |v| v,
             Clock { epoch: Instant::now(), opened: None, animate: true, idle: false }).into();
@@ -3133,12 +3138,13 @@ mod tests {
             (messages, due)
         };
         assert_eq!(send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), 28.0).0, [300.0]);
-        let mut deadline = None;
+        assert!(send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(28.01, 45.0) }), 28.01).0.is_empty());
+        assert_eq!(send(Event::Window(window::Event::RedrawRequested(Instant::now())), 28.01).0, [300.0], "fractional head motion keeps the edit repaint active");
         for i in 1..=1000 {
             let x = 28.0 + i as f32 / 10.0;
             let (messages, due) = send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(x, 45.0) }), x);
             assert!(messages.is_empty(), "pointer packets must not rebuild the app");
-            assert_eq!(*deadline.get_or_insert(due), due, "a stream cannot push the first deadline back");
+            assert_eq!(due, RedrawRequest::NextFrame, "input must not wait behind an animation timer");
         }
         let frame = Event::Window(window::Event::RedrawRequested(Instant::now()));
         assert_eq!(send(frame.clone(), 128.0).0, [1300.0]);

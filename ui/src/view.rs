@@ -3357,6 +3357,17 @@ mod tests {
         let _ = app.update(Msg::SoundpadFilter("a".into()));
         assert_ne!(app.backdrop(), swapped, "a rebuilt clip list forces one full pass");
     }
+    #[test]
+    fn control_edit_repaints_one_pass_with_the_same_pixels() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.epoch = Instant::now() - Duration::from_millis(13);
+        let idle = app.backdrop();
+        let _ = app.update(Msg::Intensity(55.0));
+        assert_ne!(app.backdrop(), idle, "an edit requests one full pass");
+        assert_eq!(app.backdrop().into_rgba8(), idle.into_rgba8(), "the stamp cannot change visible pixels");
+        app.dirty = Some(Instant::now() - Duration::from_millis(700));
+        assert_eq!(app.backdrop(), idle, "idle returns to region repaints");
+    }
     /// Whole-window cost of each tab switch as the window pays it: update, view/diff/layout on
     /// the persistent tree, then a damaged-region raster. `MNR_TAB_BENCH_FOLDER` = real clips.
     #[test]
@@ -3631,6 +3642,8 @@ mod tests {
             let id = window::Id::unique();
             app.window = Some(id);
             app.window_focused = true;
+            app.opened_at = None;
+            app.epoch = Instant::now() - Duration::from_secs(8);
             let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
             let mut tree = iced::advanced::widget::Tree::empty();
             let size = Size::new((1040.0 * scale) as u32, (740.0 * scale) as u32);
@@ -3638,9 +3651,14 @@ mod tests {
             let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
             let mut clipboard = iced::advanced::clipboard::Null;
             let mut previous = Vec::new();
+            let mut previous_backdrop = BG;
             let mut times = Vec::new();
             let mut total = 0;
+            let mut regions = Vec::new();
             for frame in 0..120 {
+                app.in_peak = 0.06 + 0.04 * (frame as f32 * 0.2).sin();
+                app.noise_peak = 0.03 + 0.02 * (frame as f32 * 0.2).sin();
+                app.peak = app.noise_peak;
                 let started = Instant::now();
                 let mut messages = Vec::new();
                 {
@@ -3665,16 +3683,20 @@ mod tests {
                 let node = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, full.size()));
                 renderer.reset(full);
                 element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&node), iced::mouse::Cursor::Unavailable, &full);
-                let patches = damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full);
+                let backdrop = app.backdrop();
+                let patches = if backdrop != previous_backdrop { vec![full] } else { damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full) };
+                previous_backdrop = backdrop;
+                regions.push(patches.len());
                 previous = renderer.layers().to_vec();
-                renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, scale), &patches, BG);
+                renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, scale), &patches, backdrop);
                 if frame > 1 { times.push(started.elapsed().as_secs_f64() * 1000.0); }
+                std::thread::sleep(Duration::from_millis(16));
             }
             assert!(total > 50 && app.controls.intensity != 0.4, "the drag must reach the real controller");
             let mean = times.iter().sum::<f64>() / times.len() as f64;
             times.sort_by(f64::total_cmp);
             let p95 = times[times.len() * 95 / 100];
-            eprintln!("1000 Hz input, {}%: {total} messages / 1920 packets, mean {mean:.1} ms, p95 {p95:.1} ms", scale * 100.0);
+            eprintln!("1000 Hz input, live meters, {}%: {total} messages / 1920 packets, mean {mean:.1} ms, p95 {p95:.1} ms, max {} regions", scale * 100.0, regions.iter().max().unwrap());
             assert!(mean < 16.0 && p95 < 24.0, "pointer input exceeds the frame budget");
             if let Ok(dir) = std::env::var("MNR_DESIGN_DIR") {
                 let mut data = pixels.data().to_vec();
