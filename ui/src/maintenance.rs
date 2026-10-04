@@ -112,6 +112,54 @@ pub fn package(path: &Path, version: &str) -> Result<Bundle, String> {
     }
     Ok(bundle)
 }
+fn signature_path(runtime:&Path,package:&str)->PathBuf {runtime.join(".update").join(format!("{package}.sig.json"))}
+fn check_update_name(version:&str,package:&str)->Result<(),String> {
+    let semver=version.split('.').count()==3 && version.split('.').all(|part|!part.is_empty() && part.len()<=9 && part.bytes().all(|b|b.is_ascii_digit()));
+    if !semver || package!=format!("MicNoize-{version}-win-x64-stable-v2-full.nupkg") {return Err("Неверное имя пакета обновления".into());}
+    Ok(())
+}
+/// Every file Velopack installs from the full package (all of `lib/`, its launcher and updater
+/// included) must match the payload the release key signed, and no signed file may be missing.
+fn check_signed_files(package:&Path,version:&str,payload:&str)->Result<(),String> {
+    let mut lines=payload.lines();
+    if lines.next()!=Some(format!("MicNoize {version}").as_str()) {return Err("Подпись относится к другой версии обновления".into());}
+    let mut signed=std::collections::HashMap::new();
+    for line in lines {
+        let (sha,name)=line.split_once("  ").ok_or("Неверная строка подписи обновления")?;
+        if sha.len()!=64 || !sha.bytes().all(|b|b.is_ascii_hexdigit()) || signed.insert(name,sha).is_some() {return Err("Неверная строка подписи обновления".into());}
+    }
+    let mut archive=zip::ZipArchive::new(File::open(package).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    if archive.len()>4096 {return Err("Слишком много файлов в пакете приложения".into());}
+    for index in 0..archive.len() {
+        let mut file=archive.by_index(index).map_err(|e|e.to_string())?;
+        let name=file.name().replace('\\',"/");
+        if name.starts_with('/') || name.contains(':') || name.split('/').any(|part|part=="..") {return Err(format!("Недопустимый путь в пакете обновления: {name}"));}
+        if name.ends_with('/') || !name.get(..4).is_some_and(|prefix|prefix.eq_ignore_ascii_case("lib/")) {continue;}
+        let expected=signed.remove(name.as_str()).ok_or_else(||format!("Файл обновления не подписан: {name}"))?;
+        if file.size()>512*1024*1024 || !hash(&mut file)?.eq_ignore_ascii_case(expected) {return Err(format!("Файл обновления не совпал с подписью: {name}"));}
+    }
+    if let Some(name)=signed.keys().next() {return Err(format!("В обновлении нет подписанного файла: {name}"));}
+    Ok(())
+}
+/// Fails closed: an update applies only with a valid release signature over all installed files.
+fn verify_update(package:&Path,version:&str,envelope:&str,key:[u8;32])->Result<(),String> {
+    check_update_name(version,package.file_name().and_then(|n|n.to_str()).unwrap_or_default())?;
+    if envelope.len()>1<<20 {return Err("Подпись обновления слишком велика".into());}
+    let payload=crate::components::signed_payload(envelope,key).map_err(|_|String::from("Подпись обновления не прошла проверку"))?;
+    check_signed_files(package,version,&payload)
+}
+/// After a download: fetches the update's signature from its release and checks the package. The
+/// checked signature stays in `.update`, so an offline apply can check the same package again.
+pub fn verify_download(candidate:&velopack::VelopackAsset)->Result<(),String> {
+    use velopack::locator::{auto_locate_app_manifest,LocationContext};
+    check_update_name(&candidate.Version,&candidate.FileName)?;
+    let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|e.to_string())?;
+    let runtime=crate::paths::Paths::resolve()?.runtime_root().to_path_buf();
+    let envelope=crate::components::update_signature(&candidate.Version,&candidate.FileName)?;
+    verify_update(&location.get_packages_dir().join(&candidate.FileName),&candidate.Version,&envelope,crate::components::release_key()?)?;
+    fs::create_dir_all(runtime.join(".update")).map_err(|e|e.to_string())?;
+    atomic(&signature_path(&runtime,&candidate.FileName),envelope.as_bytes())
+}
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyBackup {
@@ -571,6 +619,13 @@ pub fn prepare(candidate: &velopack::VelopackAsset) -> Result<(), String> {
     }
     if Path::new(&candidate.FileName).file_name().and_then(|n|n.to_str()) != Some(candidate.FileName.as_str()) { return Err("Invalid package filename".into()); }
     let next = location.get_packages_dir().join(&candidate.FileName);
+    // Fail closed: nothing applies without a valid release signature over its installed files.
+    check_update_name(&candidate.Version,&candidate.FileName)?;
+    let envelope = match fs::read_to_string(signature_path(&runtime,&candidate.FileName)) {
+        Ok(text) => text,
+        Err(_) => crate::components::update_signature(&candidate.Version,&candidate.FileName)?,
+    };
+    verify_update(&next,&candidate.Version,&envelope,crate::components::release_key()?)?;
     let after = package(&next,&candidate.Version)?;
     let previous = current_package(&location.get_packages_dir(),&runtime,&location.get_manifest_version().to_string())?;
     let before = package(&previous,&location.get_manifest_version().to_string())?;
@@ -767,6 +822,47 @@ mod tests {
         preserve_current_package(root,&packages,&runtime,"0.2.7").unwrap();
         fs::write(&retained,b"corrupt").unwrap();
         assert!(preserve_current_package(root,&packages,&runtime,"0.2.7").is_err());
+    }
+    #[test]
+    fn update_applies_only_when_every_installed_file_is_signed() {
+        use base64::Engine as _;use ed25519_dalek::{Signer,SigningKey};
+        let t=temp();let path=t.0.join("MicNoize-1.2.3-win-x64-stable-v2-full.nupkg");
+        let pack=|entries:&[(&str,&str)]| {
+            let mut zip=zip::ZipWriter::new(File::create(&path).unwrap());
+            for (name,data) in entries {zip.start_file(*name,zip::write::SimpleFileOptions::default()).unwrap();zip.write_all(data.as_bytes()).unwrap();}
+            zip.finish().unwrap();
+        };
+        let key=SigningKey::from_bytes(&[9;32]);let public=key.verifying_key().to_bytes();
+        let sign=|payload:&str|serde_json::json!({"payload":payload,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(payload.as_bytes()).to_bytes())}).to_string();
+        let sha=|data:&str|hash(&mut data.as_bytes()).unwrap();
+        let payload=format!("MicNoize 1.2.3\n{}  lib/app/MicNoize.exe\n{}  lib/app/Squirrel.exe\n",sha("UI"),sha("updater"));
+        let envelope=sign(&payload);
+        pack(&[("MicNoize.nuspec","metadata is not installed"),("lib/app/MicNoize.exe","UI"),("lib/app/Squirrel.exe","updater")]);
+        verify_update(&path,"1.2.3",&envelope,public).unwrap();
+        assert!(verify_update(&path,"1.2.3",&sign(&payload.replace("1.2.3","1.2.4")),public).is_err(),"another version");
+        assert!(verify_update(&path,"1.2.3",&envelope.replace("MicNoize 1.2.3","MicNoize 1.2.3 "),public).is_err(),"tampered payload");
+        assert!(verify_update(&path,"1.2.3",&envelope,SigningKey::from_bytes(&[8;32]).verifying_key().to_bytes()).is_err(),"another key");
+        assert!(verify_update(&t.0.join("other.nupkg"),"1.2.3",&envelope,public).is_err(),"unexpected package name");
+        pack(&[("lib/app/MicNoize.exe","UI"),("lib/app/Squirrel.exe","evil")]);
+        assert!(verify_update(&path,"1.2.3",&envelope,public).is_err(),"changed updater");
+        pack(&[("lib/app/MicNoize.exe","UI"),("lib/app/Squirrel.exe","updater"),("lib/app/evil.dll","x")]);
+        assert!(verify_update(&path,"1.2.3",&envelope,public).is_err(),"unsigned file");
+        pack(&[("lib/app/MicNoize.exe","UI")]);
+        assert!(verify_update(&path,"1.2.3",&envelope,public).is_err(),"missing signed file");
+    }
+    /// Release gate run by package-release.ps1: what is about to be published passes the client's
+    /// own check. MNR_SIGNED_PUBLIC_KEY (base64) replaces the release key only to test the script.
+    #[test]
+    #[ignore = "package-release.ps1 runs it on the signed package"]
+    fn signed_release_package() {
+        use base64::Engine as _;
+        let var=|name:&str|std::env::var(name).unwrap_or_else(|_|panic!("{name} is required"));
+        let key=match std::env::var("MNR_SIGNED_PUBLIC_KEY") {
+            Ok(key)=>base64::engine::general_purpose::STANDARD.decode(key).unwrap().try_into().unwrap(),
+            Err(_)=>crate::components::release_key().unwrap(),
+        };
+        let envelope=fs::read_to_string(var("MNR_SIGNED_ENVELOPE")).unwrap();
+        verify_update(Path::new(&var("MNR_SIGNED_PACKAGE")),&var("MNR_SIGNED_VERSION"),&envelope,key).unwrap();
     }
     #[test]
     fn migrated_package_is_cached_for_the_next_safe_update() {

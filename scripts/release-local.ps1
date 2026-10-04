@@ -29,7 +29,7 @@ if (-not $Publish) {
     if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed.' }
 } elseif (-not (Test-Path -LiteralPath $recordPath)) { throw 'Prepare and inspect the local release before publishing.' }
 $assets = @(Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne '.release-source.json')
-$required = @("MicNoize-$Version-win-x64-stable-v2-full.nupkg", "MicNoize-Upgrade-$Version.zip", 'Setup.exe', 'checksums.sha256')
+$required = @("MicNoize-$Version-win-x64-stable-v2-full.nupkg", "MicNoize-$Version-win-x64-stable-v2-full.nupkg.sig.json", "MicNoize-Upgrade-$Version.zip", 'Setup.exe', 'checksums.sha256')
 if ($Version -eq '0.2.9') { $required += 'Repair-0.2.8-to-0.2.9.ps1' }
 if ([version]$Version -ge [version]'0.2.10') { $required += 'Repair-0.2.8-update.ps1' }
 foreach ($name in $required) {

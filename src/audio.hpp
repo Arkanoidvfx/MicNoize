@@ -33,6 +33,9 @@ Device tagMicrophone();
 std::filesystem::path projectRoot();
 std::string utf8(const std::wstring& s);
 std::wstring wide(const std::string& s);
+// Live process environment. The CRT's _wgetenv keeps a snapshot from its first call and misses
+// later std::env::set_var changes made by the Rust UI.
+std::wstring environment(const wchar_t* name);
 // CPU denoiser supplied by the host program (DeepFilterNet in the Rust UI), used when NVIDIA
 // cannot run. 480-sample 48 kHz mono frames; `process` returns 0 on failure. The native checks
 // link without it and fall back to no denoiser.
@@ -280,6 +283,9 @@ class Engine {
     void preview(const float* audio,const float* echo,const RoutedSample* routed,const uint8_t* modified,unsigned count);
     std::mutex soundMutex_,soundRequestMutex_;
     std::unordered_map<unsigned,std::shared_ptr<SoundClip>> sounds_;
+    // Replaced or cleared clips a player may still hold. Only library calls free them, so the
+    // DSP thread never drops the last reference to a sample buffer (5 minutes = 57.6 MB).
+    std::vector<std::shared_ptr<const SoundClip>> retiredSounds_;
     // Newest finished hold-effect recording, for the UI to save as a file. The DSP thread
     // only try-locks this slot: a contended block publishes on the next one.
     std::mutex clipMutex_;

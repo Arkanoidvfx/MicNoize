@@ -357,13 +357,31 @@ fn install(
     Ok(manifest.version)
 }
 
-fn verify(envelope: &Envelope) -> Result<(), String> {
-    let key: [u8; 32] = STANDARD
+/// The Ed25519 key that signs component manifests and application updates.
+pub fn release_key() -> Result<[u8; 32], String> {
+    STANDARD
         .decode(PUBLIC_KEY)
         .map_err(|e| e.to_string())?
         .try_into()
-        .map_err(|_| "Неверный публичный ключ")?;
-    verify_with_key(envelope, key)
+        .map_err(|_| String::from("Неверный публичный ключ"))
+}
+
+fn verify(envelope: &Envelope) -> Result<(), String> {
+    verify_with_key(envelope, release_key()?)
+}
+
+/// The payload of a signed envelope (`{payload, signature}` JSON), checked against `key`.
+pub fn signed_payload(envelope: &str, key: [u8; 32]) -> Result<String, String> {
+    let envelope: Envelope = serde_json::from_str(envelope).map_err(|e| e.to_string())?;
+    verify_with_key(&envelope, key)?;
+    Ok(envelope.payload)
+}
+
+/// The signature `package-release.ps1` publishes next to an update's full package.
+pub fn update_signature(version: &str, package: &str) -> Result<String, String> {
+    let url = format!("https://github.com/Arkanoidvfx/MicNoize/releases/download/v{version}/{package}.sig.json");
+    let mut response = agent().get(&url).call().map_err(|e| e.to_string())?;
+    response.body_mut().read_to_string().map_err(|e| e.to_string())
 }
 
 fn verify_with_key(envelope: &Envelope, key: [u8; 32]) -> Result<(), String> {

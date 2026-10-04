@@ -84,19 +84,20 @@ int main(){try{
     require(mnr_noise_gate(nullptr,-40)==0 && mnr_noise_peak(p)==0 && mnr_noise_peak(nullptr)==0,"Gate ABI idle/null handling");
     {
         std::vector<float> tone(48000),shifted(tone.size());
-        for(size_t i=0;i<tone.size();++i)tone[i]=0.3f*std::sin(2*std::numbers::pi*440.0*i/48000.0);
-        require(!mnr_studio_pitch(tone.data(),tone.size(),0,shifted.data())
-            && mnr_studio_pitch(tone.data(),tone.size(),2,shifted.data()),"Studio pitch shift failed");
+        for(size_t i=0;i<tone.size();++i)tone[i]=static_cast<float>(0.3f*std::sin(2*std::numbers::pi*440.0*i/48000.0));
+        const auto toneCount=static_cast<uint32_t>(tone.size());
+        require(!mnr_studio_pitch(tone.data(),toneCount,0,shifted.data())
+            && mnr_studio_pitch(tone.data(),toneCount,2,shifted.data()),"Studio pitch shift failed");
         int crossings=0;double energy=0;
         for(size_t i=24001;i<28800;++i)if(shifted[i-1]<=0 && shifted[i]>0)++crossings;
         for(size_t i=38400;i<43200;++i)energy+=shifted[i]*shifted[i];
         require(crossings>75 && crossings<100 && energy>20,"Studio pitch changed duration or missed the octave");
         std::array<float,480> shortInput{},shortOutput{};
         shortInput.fill(0.3f);
-        require(mnr_studio_pitch(shortInput.data(),shortInput.size(),2,shortOutput.data()),"Short studio pitch shift failed");
+        require(mnr_studio_pitch(shortInput.data(),static_cast<uint32_t>(shortInput.size()),2,shortOutput.data()),"Short studio pitch shift failed");
         require(std::abs(shortOutput[240])>0.05f,"Short studio sample became silent");
         std::vector<float> nearPad(8191,0.2f),nearPadOut(nearPad.size());
-        require(mnr_studio_pitch(nearPad.data(),nearPad.size(),0.5f,nearPadOut.data())
+        require(mnr_studio_pitch(nearPad.data(),static_cast<uint32_t>(nearPad.size()),0.5f,nearPadOut.data())
             && std::isfinite(nearPadOut.back()),"Studio pitch padding overran the output");
     }
     {

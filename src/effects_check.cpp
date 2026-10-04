@@ -154,7 +154,7 @@ int main() {try {
             for(int i=0;i<480;++i){
                 float expected=0;
                 for(int start:{0,1600})for(int tap=1;tap<=8;++tap)
-                    if(frame==start+tap*200&&i==0)expected+=0.5f*std::pow(0.9f,tap-1);
+                    if(frame==start+tap*200&&i==0)expected=static_cast<float>(expected+0.5f*std::pow(0.9f,tap-1));
                 require(std::abs(wet[i]-expected)<1e-6f,"Long echo interval/tail or ring wrap failed");
             }
         }
@@ -355,10 +355,10 @@ int main() {try {
         mic::RoutedSample routed{0.1f,0,0,7,0,0.3f};
         require(mic::previewSample(routed,mic::ModifiedSound,7,true)==0,"ModifiedSound is a monitor mask bit, never a sample category");
         // Producer + consumer of the effects-only monitor: "hear sounds" must survive the second filter.
-        for(uint8_t mask:{4,5,6,7}){
-            const auto queued=mic::previewQueued(0.1f,0,7,0.3f,false,mask,7,true);
-            require(mic::previewSample(queued,mask,7,true)==0.3f,"Clip sample dropped by the monitor consumer");
-            require(mic::previewSample(queued,static_cast<uint8_t>(mask&3),7,true)==0,"Clip audible without the sound mask");
+        for(uint8_t mask=4;mask<=7;++mask){
+            const auto preview=mic::previewQueued(0.1f,0,7,0.3f,false,mask,7,true);
+            require(mic::previewSample(preview,mask,7,true)==0.3f,"Clip sample dropped by the monitor consumer");
+            require(mic::previewSample(preview,static_cast<uint8_t>(mask&3),7,true)==0,"Clip audible without the sound mask");
         }
         const auto effect=mic::previewQueued(0.1f,1,7,0.3f,false,5,7,true);
         require(std::abs(mic::previewSample(effect,5,7,true)-0.4f)<1e-6,"Effect + clip preview mix");
@@ -366,10 +366,27 @@ int main() {try {
         require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,false,1,7,true),1,7,true)==0,"Clip leaked into effects-only preview");
         std::cout<<"soundpad=passed double_press_restart=passed fade_samples=240\n";
     }
+    {
+        // A clip replaced or cleared while a player still holds it: the player's release (on the
+        // DSP thread) must not free the samples; the next library call does.
+        auto engine=std::make_unique<mic::Engine>();auto& e=*engine;
+        e.soundLoad(1,std::vector<float>(480,0.5f),1);
+        auto playing=e.soundClip(1);const std::weak_ptr<const mic::SoundClip> cleared=playing;
+        e.soundClear();playing.reset();
+        require(!cleared.expired(),"Player freed a cleared soundpad clip");
+        e.soundLoad(2,std::vector<float>(480,0.5f),1);
+        require(cleared.expired(),"Cleared soundpad clip was never freed");
+        playing=e.soundClip(2);const std::weak_ptr<const mic::SoundClip> replaced=playing;
+        e.soundLoad(2,std::vector<float>(480,0.25f),1);playing.reset();
+        require(!replaced.expired(),"Player freed a replaced soundpad clip");
+        e.soundClear();
+        require(replaced.expired(),"Replaced soundpad clip was never freed");
+        std::cout<<"soundpad_release=library_thread\n";
+    }
     for(unsigned i=0;i<480;++i) original[i]=std::sin(i*0.17f)*0.9f;
     {
         // Same final preview gate is used by TAG, WASAPI and the monitor consumer.
-        for(uint8_t source:{0,1})for(uint8_t flags:{0,1,2,3})for(uint8_t mask:{0,1,2,3}){
+        for(uint8_t source=0;source<2;++source)for(uint8_t flags=0;flags<4;++flags)for(uint8_t mask=0;mask<4;++mask){
             mic::RoutedSample sample{0.25f,source,flags,7};
             require(mic::previewSample(sample,mask,7,true)==((flags&mask)?0.25f:0),"Independent monitor filter failed");
             require(mic::previewSample(sample,mask,8,true)==0,"Old epoch leaked into preview");
@@ -441,7 +458,7 @@ int main() {try {
     for(int semitones:{-12,-5,7,12}) {
         mic::PitchEffect p;unsigned crossings=0;float previous=0;double maxMs=0;
         for(unsigned frame=0;frame<300;++frame) {
-            for(unsigned i=0;i<480;++i) data[i]=0.2f*std::sin(2*3.141592653589793*440*(frame*480+i)/48000);
+            for(unsigned i=0;i<480;++i) data[i]=static_cast<float>(0.2f*std::sin(2*3.141592653589793*440*(frame*480+i)/48000));
             auto begin=std::chrono::steady_clock::now();p.process(data.data(),480,semitones,true);
             maxMs=std::max(maxMs,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());
             for(float v:data) {require(std::isfinite(v)&&std::abs(v)<=1,"Pitch bounds");if(frame>=100 && previous<=0&&v>0)++crossings;previous=v;}
@@ -511,7 +528,7 @@ int main() {try {
         mic::PhraseEffect phrase;const unsigned key=speed<1?4:8;
         data=original;phrase.process(data.data(),480,0,speed,speed,true,1,0);require(data==original,"Phrase dry bypass changed audio");
         for(unsigned frame=0;frame<120;++frame){
-            for(unsigned i=0;i<480;++i)data[i]=0.2f*std::sin(2*3.141592653589793*440*(frame*480+i)/48000);
+            for(unsigned i=0;i<480;++i)data[i]=static_cast<float>(0.2f*std::sin(2*3.141592653589793*440*(frame*480+i)/48000));
             const auto dry=data;
             phrase.process(data.data(),480,frame<100?key:0,speed,speed,true,1,0);
             require(data==dry,"Speed recording muted the microphone");
@@ -620,7 +637,7 @@ int main() {try {
     {
         mic::PhraseEffect phrase;data.fill(0);phrase.process(data.data(),480,0,0.7f,2,true,1,0);
         for(unsigned frame=0;frame<120;++frame){
-            for(unsigned i=0;i<480;++i)data[i]=0.2f*std::sin(2*3.141592653589793*18000*(frame*480+i)/48000);
+            for(unsigned i=0;i<480;++i)data[i]=static_cast<float>(0.2f*std::sin(2*3.141592653589793*18000*(frame*480+i)/48000));
             phrase.process(data.data(),480,frame<100?8:0,0.7f,2,true,1,0);
         }
         float aliasPeak=0;
@@ -634,7 +651,7 @@ int main() {try {
                 mic::PhraseEffect phrase;auto replay=std::make_unique<mic::LastEffect>();
                 std::vector<float> output;std::array<float,997> buffer{};std::array<uint8_t,997> marks{};
                 const auto process=[&](size_t n,unsigned held,unsigned request=0) {
-                    std::fill(marks.begin(),marks.end(),0);
+                    std::fill(marks.begin(),marks.end(),uint8_t{0});
                     const bool active=phrase.state()!=0;bool discord=!live;
                     phrase.process(buffer.data(),n,held,0.7f,1.5f,true,1,0,live,marks.data());
                     replay->process(buffer.data(),n,marks.data(),discord,held,active||phrase.state()!=0,true,1,0,request);
@@ -695,7 +712,7 @@ int main() {try {
         v=clip(14400,9600,14400);for(auto& x:v)x*=0.005f;checkTrim(v,0,v.size());
         v=clip(9600,100,4000);checkTrim(v,0,v.size());
         v=clip(14400,9600,14400);v[0]=v.back()=0.00011f;checkTrim(v,0,v.size());
-        v=clip(14400,19200,14400);std::fill(v.begin()+19200,v.begin()+28800,0);checkTrim(v,9600,38400);
+        v=clip(14400,19200,14400);std::fill(v.begin()+19200,v.begin()+28800,0.0f);checkTrim(v,9600,38400);
         v=clip(14400,9600,14400);
         for(size_t i=24000;i<28800;++i)v[i]=0.00011f+0.001f*(28800-i)/4800;
         checkTrim(v,9600,33600); // Quiet ending stays outside the fade.

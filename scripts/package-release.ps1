@@ -42,6 +42,7 @@ dotnet tool run vpk -- pack `
 if ($LASTEXITCODE -ne 0) { throw 'Velopack packaging failed.' }
 $package = Join-Path $releases "MicNoize-$Version-win-x64-stable-v2-full.nupkg"
 if (!(Test-Path -LiteralPath $package)) { throw 'Paired full package missing.' }
+& (Join-Path $PSScriptRoot 'sign-update.ps1') -Package $package -Version $Version
 $upgrade = Join-Path $root '.tmp\release-upgrade'
 if ([IO.Path]::GetFullPath($upgrade) -ne [IO.Path]::GetFullPath((Join-Path $root '.tmp\release-upgrade'))) { throw 'Unsafe upgrade staging path.' }
 if (Test-Path -LiteralPath $upgrade) { Remove-Item -LiteralPath $upgrade -Recurse -Force }

@@ -211,14 +211,20 @@ std::wstring wide(const std::string& s) {
     int n=MultiByteToWideChar(CP_UTF8,0,s.data(),static_cast<int>(s.size()),nullptr,0);
     std::wstring out(n,0); MultiByteToWideChar(CP_UTF8,0,s.data(),static_cast<int>(s.size()),out.data(),n); return out;
 }
+std::wstring environment(const wchar_t* name) {
+    std::wstring value(32767,0); // Windows' maximum variable length
+    const auto n=GetEnvironmentVariableW(name,value.data(),static_cast<DWORD>(value.size()));
+    value.resize(n<value.size()?n:0);
+    return value;
+}
 std::filesystem::path projectRoot() {
-    if(const auto* configured=_wgetenv(L"MNR_RUNTIME_ROOT"); configured && *configured)
+    if(const auto configured=environment(L"MNR_RUNTIME_ROOT"); !configured.empty())
         return std::filesystem::path(configured);
     std::wstring path(32768,0); auto n=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
     if(!n || n==path.size()) throw std::runtime_error("Cannot resolve executable path");
     path.resize(n);const auto app=std::filesystem::path(path).parent_path(),project=app.parent_path();
     if(app.filename()==L"bin" && std::filesystem::is_directory(project/L"vendor/nvidia-afx-3.0.0")) return project;
-    if(const auto* roaming=_wgetenv(L"APPDATA"); roaming && *roaming) {
+    if(const auto roaming=environment(L"APPDATA"); !roaming.empty()) {
         auto components=std::filesystem::path(roaming)/L"Mic Noize/Components";
         if(std::filesystem::is_directory(components/L"vendor")) return components;
     }
@@ -619,8 +625,8 @@ void Engine::desktopLoop() {
             params.ProcessLoopbackParams.TargetProcessId=pid;
             params.ProcessLoopbackParams.ProcessLoopbackMode=PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
             PROPVARIANT prop{};prop.vt=VT_BLOB;prop.blob.cbSize=sizeof(params);prop.blob.pBlobData=reinterpret_cast<BYTE*>(&params);
-            ComPtr<IActivateAudioInterfaceAsyncOperation> operation;
-            check(ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,__uuidof(IAudioClient),&prop,completion.Get(),&operation),"Activate Discord capture");
+            ComPtr<IActivateAudioInterfaceAsyncOperation> activation;
+            check(ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,__uuidof(IAudioClient),&prop,completion.Get(),&activation),"Activate Discord capture");
             HANDLE activationEvents[]={stop_,completion->done.h};
             const auto activated=WaitForMultipleObjects(2,activationEvents,FALSE,5000);
             if(activated==WAIT_OBJECT_0)break;
@@ -947,7 +953,7 @@ void Engine::dspLoop(Config c) {
         if(!cleanedBy.empty()) {{std::lock_guard lock(statusMutex_);denoiserMessage_=cleanedBy;}stats.denoiser=4;}
         else try {
             // MNR_DENOISER=cpu tests the CPU path on an RTX machine (and frees the GPU for games).
-            if(const auto* forced=_wgetenv(L"MNR_DENOISER"); forced && _wcsicmp(forced,L"cpu")==0)
+            if(_wcsicmp(environment(L"MNR_DENOISER").c_str(),L"cpu")==0)
                 throw std::runtime_error("выбран процессор (MNR_DENOISER=cpu)");
             fx=std::make_unique<Afx>(c);stats.denoiser=1;
         }
@@ -1075,7 +1081,7 @@ void Engine::dspLoop(Config c) {
                 const int manual=pitchHeld?pitch.load():0;
                 const float correction=autoTune.process(out.data(),block,tuneHeld,manual,tuneRoot.load(),tuneScale.load(),tuneSpeedMs.load(),tuneStrength.load());
                 const int formants=pitchHeld?formant.load():0;
-                pitchEffect.processAdvanced(out.data(),block,static_cast<float>(manual)+correction,formants,(pitchHeld&&(manual||formants))||tuneHeld,modified.data());
+                pitchEffect.processAdvanced(out.data(),block,static_cast<float>(manual)+correction,static_cast<float>(formants),(pitchHeld&&(manual||formants))||tuneHeld,modified.data());
                 for(auto& v:out)v*=sourceFade.next(1);
                 stats.pitchActive=pitchEffect.active(); stats.pitchDelayMs=pitchEffect.delayMs();
                 stats.pitchMaxMs=std::max(stats.pitchMaxMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-pitchBegin).count());
@@ -1164,16 +1170,27 @@ void Engine::preview(const float* audio,const float* echo,const RoutedSample* ro
         if(!preview_.push(samples.data(),n))break;
     }
 }
+// Under soundMutex_: frees retired clips no player holds. Removed from the library, a clip
+// cannot gain a new holder, so a count of one is final.
+static void releaseSounds(std::vector<std::shared_ptr<const SoundClip>>& retired) {
+    std::erase_if(retired,[](const auto& clip){return clip.use_count()==1;});
+}
 void Engine::soundLoad(unsigned id,std::vector<float> samples,float gain,unsigned loopStart,unsigned loopEnd,bool independentVolume) {
     auto clip=std::make_shared<SoundClip>();clip->samples=std::move(samples);clip->gain=gain;
     clip->loopRange=(uint64_t(loopStart)<<32)|loopEnd;clip->independentVolume=independentVolume;
-    std::lock_guard lock(soundMutex_);sounds_[id]=std::move(clip);
+    std::lock_guard lock(soundMutex_);auto& slot=sounds_[id];
+    if(slot)retiredSounds_.push_back(std::move(slot));
+    slot=std::move(clip);releaseSounds(retiredSounds_);
 }
 bool Engine::soundGain(unsigned id,float gain) {
     std::lock_guard lock(soundMutex_);const auto found=sounds_.find(id);
     if(found==sounds_.end())return false;found->second->gain=gain;return true;
 }
-void Engine::soundClear() {std::lock_guard lock(soundMutex_);sounds_.clear();soundPlay(0);}
+void Engine::soundClear() {
+    std::lock_guard lock(soundMutex_);
+    for(auto& entry:sounds_)retiredSounds_.push_back(std::move(entry.second));
+    sounds_.clear();releaseSounds(retiredSounds_);soundPlay(0);
+}
 std::shared_ptr<const SoundClip> Engine::soundClip(unsigned id) {
     std::lock_guard lock(soundMutex_);const auto found=sounds_.find(id);return found==sounds_.end()?nullptr:found->second;
 }
@@ -1411,7 +1428,7 @@ void Engine::ioLoop(Config c) {
                     }
                 }
                 check(render->ReleaseBuffer(n,have?0:AUDCLNT_BUFFERFLAGS_SILENT),"Release render buffer");
-                if(!have){std::fill_n(mono.data(),n,0);std::fill_n(modified.data(),n,0);std::fill_n(effectOnly.data(),n,0);std::fill_n(echoOnly.data(),n,0);std::fill_n(routed.data(),n,RoutedSample{});}
+                if(!have){std::fill_n(mono.data(),n,0.0f);std::fill_n(modified.data(),n,uint8_t{0});std::fill_n(effectOnly.data(),n,0.0f);std::fill_n(echoOnly.data(),n,0.0f);std::fill_n(routed.data(),n,RoutedSample{});}
                 preview(effectOnly.data(),echoOnly.data(),routed.data(),modified.data(),n);
                 if(muted && fade==0) stats.outputPeak=0;
                 else peakHold(stats.outputPeak,outputPeak);
@@ -1510,7 +1527,7 @@ void Headphones::ioLoop(std::wstring outputId) {
     try {
         Com com;HANDLE readyEvents[]={stop_,ready_};
         if(WaitForMultipleObjects(2,readyEvents,FALSE,INFINITE)!=WAIT_OBJECT_0+1)return;
-        Event changed,renderEvent;
+        Event renderEvent;
         ensureTagHost();HeadphoneClient tag;
         Stream output;output.open(outputId,false,renderEvent.h,5);
         if(output.channels>2 || output.capacity>8192)throw std::runtime_error("Выберите моно или стерео наушники.");
@@ -1524,12 +1541,12 @@ void Headphones::ioLoop(std::wstring outputId) {
         std::array<float,8192> left{},right{};std::array<StereoSample,8192> frames{};
         bool active=false,primed=false;TagClock clock;Drift drift;Ramp gain;
         auto last=std::chrono::steady_clock::now(),adjusted=last;
-        HANDLE events[]={stop_,changed.h,renderEvent.h,timer};
+        HANDLE events[]={stop_,renderEvent.h,timer};
         LARGE_INTEGER initialDue{};initialDue.QuadPart=-20000;
         if(!SetWaitableTimer(timer,&initialDue,2,nullptr,nullptr,FALSE))throw std::runtime_error("Headphone timer start failed");
         state=2;Mmcss priority;
         for(;;) {
-            const auto wait=WaitForMultipleObjects(4,events,FALSE,INFINITE);
+            const auto wait=WaitForMultipleObjects(3,events,FALSE,INFINITE);
             if(wait==WAIT_OBJECT_0)break;
             if(wait==WAIT_FAILED)throw std::runtime_error("Headphone wait failed");
             tag.handleEvent();const auto now=std::chrono::steady_clock::now();

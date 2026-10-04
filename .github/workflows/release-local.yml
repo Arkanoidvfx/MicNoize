@@ -27,9 +27,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
+          COMPONENT_SIGNING_KEY: ${{ secrets.COMPONENT_SIGNING_KEY }}
         run: |
           if (-not (Test-Path .\scripts\release-local.ps1)) { throw 'Local checkout missing.' }
           if (-not $env:MNR_TELEMETRY_SECRET) { throw 'Release secret missing.' }
+          if (-not $env:COMPONENT_SIGNING_KEY) { throw 'Update signing key missing.' }
           gh auth status *> $null
           if ($LASTEXITCODE -ne 0) { throw 'GitHub release token unavailable.' }
           "Local runner ready: $env:COMPUTERNAME"
@@ -38,6 +40,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
+          COMPONENT_SIGNING_KEY: ${{ secrets.COMPONENT_SIGNING_KEY }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           if (-not (Test-Path "Releases/v$env:RELEASE_VERSION/.release-source.json")) {

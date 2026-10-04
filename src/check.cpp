@@ -222,7 +222,7 @@ static void protocolTest() {
         require(rejected(3),"Duplicate own topology rejected");
     }
     {
-        const auto* saved=_wgetenv(L"MNR_TAG_HOST_PATH");const std::wstring previous=saved?saved:L"";
+        const auto previous=mic::environment(L"MNR_TAG_HOST_PATH");
         _wputenv_s(L"MNR_TAG_HOST_PATH",L"C:/Mic Noize/current/../current/mic_tag_host.exe");
         const auto path=mic::tagHostPath();_wputenv_s(L"MNR_TAG_HOST_PATH",previous.c_str());
         require(path.native()==L"C:\\Mic Noize\\current\\mic_tag_host.exe","Host ownership normalizes Windows separators and lexical components");

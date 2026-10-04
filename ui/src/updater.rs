@@ -26,8 +26,10 @@ pub fn check_and_download() -> Status {
             if let Err(error)=crate::maintenance::preserve_current_package_for_download(){return Status::Unavailable(error);}
             manager
                 .download_updates(&update, None)
+                .map_err(|e| e.to_string())
+                .and_then(|_| crate::maintenance::verify_download(&update.TargetFullRelease))
                 .map(|_| Status::Ready(version))
-                .unwrap_or_else(|e| Status::Unavailable(e.to_string()))
+                .unwrap_or_else(Status::Unavailable)
         }
         Ok(_) => Status::Current,
         Err(error) => Status::Unavailable(error.to_string()),

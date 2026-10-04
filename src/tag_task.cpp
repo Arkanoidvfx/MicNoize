@@ -259,7 +259,7 @@ std::wstring tagHostMode(const wchar_t* arguments) {
     return count==2?args[1]:L"";
 }
 std::filesystem::path tagHostPath() {
-    if(const auto* configured=_wgetenv(L"MNR_TAG_HOST_PATH");configured && *configured)return std::filesystem::path(configured).lexically_normal().make_preferred();
+    if(const auto configured=environment(L"MNR_TAG_HOST_PATH");!configured.empty())return std::filesystem::path(configured).lexically_normal().make_preferred();
     wchar_t module[32768]{};const auto length=GetModuleFileNameW(nullptr,module,std::size(module));
     if(!length || length==std::size(module))throw std::runtime_error("Cannot resolve bundled host path");
     const auto bundled=std::filesystem::path(module).parent_path()/L"mic_tag_host.exe";
