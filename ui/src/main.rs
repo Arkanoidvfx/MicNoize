@@ -857,6 +857,8 @@ struct App {
     /// The «Обновление готово» card's celebration: when it started, and whether a
     /// newly downloaded update still waits to be celebrated where the user sees it.
     ready_fx: Option<Instant>,
+    /// Visible playback elapsed before focus/visibility was lost; no hidden redraw clock.
+    ready_fx_paused: Option<Duration>,
     /// The interface snapshot whose pieces detach during restart preparation.
     restart_mosaic: Option<Arc<tacho::Mosaic>>,
     ready_fx_due: bool,
@@ -1376,6 +1378,7 @@ impl App {
                 driver_ready,
                 devices_known: false,
                 ready_fx: None,
+                ready_fx_paused: None,
                 restart_mosaic: None,
                 ready_fx_due: false,
                 ready_preview: None,
@@ -1757,15 +1760,51 @@ impl App {
             }
         }
     }
-    /// Plays the ready card's reveal from now, without an offscreen card repaint.
+    /// Queues the ready card's reveal until the window is visible and focused.
     fn start_ready_fx(&mut self) {
-        self.ready_fx = Some(Instant::now());
+        self.ready_fx = None;
+        self.ready_fx_paused = Some(Duration::ZERO);
+        self.sync_ready_fx(Instant::now());
+    }
+    fn ready_clock(&self) -> tacho::ReadyClock {
+        tacho::ReadyClock { start: self.ready_fx,
+            paused: self.ready_fx_paused.or(self.ready_fx_due.then_some(Duration::ZERO)) }
+    }
+    fn sync_ready_fx(&mut self, now: Instant) {
+        if !self.update_ready && self.ready_preview.is_none() {
+            self.ready_fx = None;
+            self.ready_fx_paused = None;
+            self.ready_fx_due = false;
+            return;
+        }
+        let visible = self.ui_active() && !self.own_minimize && self.morph.is_none() && self.restart.is_none();
+        let end = Duration::from_millis(tacho::ready::END as u64);
+        if let Some(start) = self.ready_fx {
+            let played = now.saturating_duration_since(start);
+            if played >= end {
+                self.ready_fx = None;
+            } else if !visible {
+                self.ready_fx = None;
+                self.ready_fx_paused = Some(played);
+            }
+        }
+        if visible && self.ready_fx.is_none() {
+            if let Some(played) = self.ready_fx_paused.take() {
+                self.ready_fx = Some(now - played);
+                if self.ready_preview.is_some() { self.ready_preview = Some(now - played); }
+            } else if self.ready_fx_due {
+                self.ready_fx = Some(now);
+            }
+            self.ready_fx_due = false;
+        }
     }
     fn start_restart_fx(&mut self) {
         let size=tacho::window_area().unwrap_or(Self::window_size());
         self.restart_mosaic=self.window_mosaic(size);
         self.restart=Some(tacho::Restart::new(Instant::now(),tacho::Fall::random()));
         self.ready_fx=None;
+        self.ready_fx_paused=None;
+        self.ready_fx_due=false;
     }
     /// The version the ready card shows: the download, or one patch up for the preview.
     fn ready_version(&self) -> String {
@@ -1819,7 +1858,8 @@ impl App {
     fn backdrop(&self) -> iced::Color {
         // Animated overlays overlap many damage regions. One full pass is cheaper than
         // repainting the same pixels several times; the mantissa changes remain invisible.
-        let motion=self.restart.map(|r|r.start).or(self.ready_fx);
+        let motion=self.morph.as_ref().and_then(|m|m.anim.as_ref()).map(|m|m.start)
+            .or(self.restart.map(|r|r.start)).or(self.ready_fx);
         let stamp=motion.map_or(0,|start|((start.elapsed().as_millis() as u32)&255)<<1);
         iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ stamp ^ self.repaint_all as u32), ..view::BG }
     }
@@ -2266,17 +2306,10 @@ impl App {
                 self.log_message();
                 // A new download celebrates where the user sees it: now if the window is in
                 // front, else the next time it is.
-                if self.ready_fx_due && self.update_ready && self.ui_active() && self.morph.is_none() {
-                    self.ready_fx_due = false;
-                    self.start_ready_fx();
-                }
+                self.sync_ready_fx(Instant::now());
                 // A window left in the background gets no «pointer left» from the signature.
                 if self.glitch.is_some() && !self.ui_active() {
                     self.glitch = None;
-                }
-                // A played celebration leaves no empty layers behind.
-                if self.ready_fx.is_some_and(|start| start.elapsed().as_secs_f32() * 1000.0 > tacho::ready::END) {
-                    self.ready_fx = None;
                 }
                 if let Some(since) = self.ready_preview {
                     // The preview's restart only plays: its steps pass by time, then the card goes.
@@ -2288,7 +2321,7 @@ impl App {
                                 (self.ready_preview, self.restart) = (None, None);
                             }
                         }
-                        None if since.elapsed() > Duration::from_secs(8) => self.ready_preview = None,
+                        None if self.ready_fx_paused.is_none() && since.elapsed() > Duration::from_secs(8) => self.ready_preview = None,
                         None => {}
                     }
                 }
@@ -2722,6 +2755,7 @@ impl App {
                 }
                 if let Some(id) = self.window.take() {
                     self.window_focused = false;
+                    self.sync_ready_fx(Instant::now());
                     // Keep the native window alive while audio continues in the tray.
                     self.hidden_window = Some(id);
                     return window::set_mode(id, window::Mode::Hidden);
@@ -2745,6 +2779,7 @@ impl App {
             }
             Msg::Minimize => {
                 self.window_focused = false;
+                self.sync_ready_fx(Instant::now());
                 if let Some(id) = self.window {
                     self.own_minimize = true;
                     return window::minimize(id, true);
@@ -2792,7 +2827,11 @@ impl App {
                         self.update_status = "Установлена актуальная версия".into();
                     }
                     updater::Status::Ready(version) => {
-                        self.ready_fx_due |= !self.update_ready;
+                        if self.update_version.as_deref() != Some(&version) {
+                            self.ready_fx_due = true;
+                            self.ready_fx = None;
+                            self.ready_fx_paused = None;
+                        }
                         self.update_ready = true;
                         self.update_version = Some(version.clone());
                         self.update_status = format!("Версия {version} скачана и готова");
@@ -4515,6 +4554,7 @@ impl App {
                 }
             }
         }
+        self.sync_ready_fx(Instant::now());
         Task::none()
     }
     /// Keyboard focus target of a `Msg::Bind` button.
@@ -5915,6 +5955,64 @@ page_pixelate=0")).unwrap().unwrap();
         let _ = app.update(Msg::UpdatePrepared(Ok(())));
         assert!(app.apply_after_quit);
         assert_eq!(app.restart.map(|r| r.step), Some(2));
+    }
+    #[test]
+    fn ready_reveal_waits_for_focus_and_preserves_visible_time() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let id = window::Id::unique();
+        app.window = Some(id);
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into())));
+        app.sync_ready_fx(Instant::now() + Duration::from_secs(600));
+        assert!(app.ready_fx.is_none() && app.ready_fx_due);
+        assert_eq!(app.ready_clock().paused, Some(Duration::ZERO));
+        let _ = app.update(Msg::WindowFocus(id, true));
+        assert!(app.ready_fx.is_some() && !app.ready_fx_due);
+        app.ready_fx = Some(Instant::now() - Duration::from_millis(1800));
+        let _ = app.update(Msg::WindowFocus(id, false));
+        let played = app.ready_fx_paused.expect("confetti pauses on loss of focus");
+        assert!(played >= Duration::from_millis(1800) && app.ready_fx.is_none());
+        app.sync_ready_fx(Instant::now() + Duration::from_secs(600));
+        assert_eq!(app.ready_fx_paused, Some(played), "hidden time never advances playback");
+        let _ = app.update(Msg::WindowFocus(id, true));
+        let resumed = app.ready_fx.unwrap();
+        assert!(resumed.elapsed() >= played && resumed.elapsed() < played + Duration::from_millis(100));
+        let _ = app.update(Msg::Minimize);
+        assert!(app.ready_fx.is_none() && app.ready_fx_paused.is_some());
+        let _ = app.update(Msg::WindowFocus(id, true));
+        app.sync_ready_fx(app.ready_fx.unwrap() + Duration::from_secs(4));
+        assert!(app.ready_fx.is_none() && app.ready_fx_paused.is_none() && !app.ready_fx_due);
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into())));
+        assert!(app.ready_fx.is_none(), "an already-seen version does not celebrate on every check");
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.10".into())));
+        assert!(app.ready_fx.is_some(), "a different download celebrates again");
+    }
+    #[test]
+    fn ready_reveal_waits_for_intro_and_survives_the_tray() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let id = window::Id::unique();
+        app.window = Some(id);
+        app.window_focused = true;
+        app.tray_ok = true;
+        app.morph = Some(MorphView { base: MorphBase::Root, from_version: String::new(), to_version: String::new(), anim: None, hwnd: None, center: None, shown: None });
+        assert!(!app.clock().animate && !app.clock().idle && app.clock().opened.is_none());
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into())));
+        assert!(app.ready_fx.is_none() && app.ready_fx_due);
+        let _ = app.update(Msg::MorphStep(MorphStep::Done));
+        assert!(app.ready_fx.is_some());
+        let _ = app.update(Msg::Hide);
+        let played = app.ready_fx_paused;
+        assert!(app.ready_fx.is_none() && played.is_some());
+        app.sync_ready_fx(Instant::now() + Duration::from_secs(600));
+        let _ = app.update(Msg::Show);
+        assert_eq!(app.ready_fx_paused, played, "show without focus cannot consume the reveal");
+        let _ = app.update(Msg::WindowFocus(id, true));
+        assert!(app.ready_fx.is_some() && app.ready_fx_paused.is_none());
+        let _ = app.update(Msg::WindowFocus(id, false));
+        let _ = app.update(Msg::ReadyPreview);
+        app.ready_preview = Some(Instant::now() - Duration::from_secs(600));
+        let _ = app.update(Msg::WindowFocus(id, true));
+        let _ = app.update(Msg::Tick);
+        assert!(app.ready_preview.is_some(), "a hidden preview must survive until it is seen");
     }
     #[test]
     fn ready_preview_plays_the_restart_without_restarting() {

@@ -1743,8 +1743,19 @@ const FLASH_GREEN: Color = Color::from_rgb8(0x6F, 0xE1, 0x8B);
 /// around it, outside the card's own bounds (drawing there from the card would leave stale
 /// pixels behind, tiny-skia repaints only a widget's damaged bounds).
 static READY_CARD: std::sync::Mutex<Option<Rectangle>> = std::sync::Mutex::new(None);
-fn ready_ms(start: Instant, now: Instant) -> f32 {
-    now.saturating_duration_since(start).as_secs_f32() * 1000.0
+/// All reveal stages share visible playback time; a paused clock draws a still frame.
+#[derive(Clone, Copy, Default)]
+pub struct ReadyClock {
+    pub start: Option<Instant>,
+    pub paused: Option<Duration>,
+}
+impl ReadyClock {
+    pub fn present(self) -> bool { self.start.is_some() || self.paused.is_some() }
+    fn running(self) -> bool { self.start.is_some() && self.paused.is_none() }
+    fn ms(self, now: Instant) -> Option<f32> {
+        self.paused.or_else(|| self.start.map(|start| now.saturating_duration_since(start)))
+            .map(|elapsed| elapsed.as_secs_f32() * 1000.0)
+    }
 }
 fn ready_span(ms: f32, (a, b): (f32, f32)) -> f32 {
     ((ms - a) / (b - a)).clamp(0.0, 1.0)
@@ -1773,11 +1784,11 @@ fn ready_button(card: Rectangle) -> Rectangle {
 
 /// The card's own layer: hides it while the tag falls, then its mosaic dissolves in a wave
 /// from the bottom left; later a ring around the button and a gleam across it.
-pub fn ready_fx<'a, Message: 'a>(start: Option<Instant>, cover: Color) -> Element<'a, Message> {
-    Element::new(ReadyFx { start, cover })
+pub fn ready_fx<'a, Message: 'a>(clock: ReadyClock, cover: Color) -> Element<'a, Message> {
+    Element::new(ReadyFx { clock, cover })
 }
 struct ReadyFx {
-    start: Option<Instant>,
+    clock: ReadyClock,
     cover: Color,
 }
 impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
@@ -1788,8 +1799,8 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
         layout::atomic(limits, Length::Fill, Length::Fill)
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
-        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start)
-            && ready_ms(start, *now) < ready::END
+        if let Event::Window(window::Event::RedrawRequested(now)) = event
+            && self.clock.running() && self.clock.ms(*now).is_some_and(|ms| ms < ready::END)
         {
             shell.request_redraw_at(frame_after(*now));
         }
@@ -1799,8 +1810,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
         if let Ok(mut card) = READY_CARD.lock() {
             *card = Some(b);
         }
-        let Some(start) = self.start else { return };
-        let ms = ready_ms(start, Instant::now());
+        let Some(ms) = self.clock.ms(Instant::now()) else { return };
         if ms >= ready::END {
             return;
         }
@@ -1815,7 +1825,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
                 for c in 0..cols {
                     let u = ((c as f32 + 0.5) / cols as f32 + (rows - 1 - r) as f32 / rows as f32) / 2.0;
                     let local = (p * 1.6 - u * 0.6).clamp(0.0, 1.0);
-                    let alpha = ((1.0 - local) * 10.0).round() / 10.0;
+                    let alpha = ((1.0 - local) * 32.0).round() / 32.0;
                     slant(&mut shapes, b.x + c as f32 * side, b.y + r as f32 * side, side + 0.6, side + 0.6, 0.0, Color { a: alpha, ..self.cover });
                 }
             }
@@ -1824,8 +1834,8 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
         renderer.with_layer(b, |renderer| {
             let mut frame = Frame::new(b);
             // One contour per opacity band instead of hundreds of cell-sized layers.
-            for step in 1..=10 {
-                let alpha = step as f32 / 10.0;
+            for step in 1..=32 {
+                let alpha = step as f32 / 32.0;
                 let path = Path::new(|p| {
                     for s in shapes.iter().filter(|s| (s.color.a-alpha).abs()<0.001) {
                         p.rectangle(Point::new(s.x,s.y),Size::new(s.w,s.h));
@@ -1843,7 +1853,8 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
                 );
                 frame.stroke(&path, iced_tiny_skia::graphics::geometry::Stroke::default().with_width(2.0).with_color(Color { a: 0.9 * (1.0 - ring), ..TAG }));
             }
-            renderer.draw_geometry(frame.into_geometry());
+            let cache = frame.into_geometry().cache(Group::unique(), None);
+            renderer.draw_geometry(Geometry::load(&cache));
             let gleam = ready_span(ms, ready::GLEAM);
             if gleam > 0.0 && gleam < 1.0 {
                 renderer.with_layer(button, |renderer| {
@@ -1858,11 +1869,11 @@ impl<Message> Widget<Message, Theme, Renderer> for ReadyFx {
 
 /// The window's layer over everything: the falling tag, then the confetti from the button,
 /// flying high over the whole app. Draws nothing outside the celebration.
-pub fn celebrate<'a, Message: 'a>(start: Option<Instant>) -> Element<'a, Message> {
-    Element::new(Celebrate { start })
+pub fn celebrate<'a, Message: 'a>(clock: ReadyClock) -> Element<'a, Message> {
+    Element::new(Celebrate { clock })
 }
 struct Celebrate {
-    start: Option<Instant>,
+    clock: ReadyClock,
 }
 impl<Message> Widget<Message, Theme, Renderer> for Celebrate {
     fn size(&self) -> Size<Length> {
@@ -1872,19 +1883,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Celebrate {
         layout::atomic(limits, Length::Fill, Length::Fill)
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
-        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start)
-            && ready_ms(start, *now) < ready::END
+        if let Event::Window(window::Event::RedrawRequested(now)) = event
+            && self.clock.running() && self.clock.ms(*now).is_some_and(|ms| ms < ready::END)
         {
             shell.request_redraw_at(frame_after(*now));
         }
     }
     fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
-        let Some(start) = self.start else { return };
+        let Some(ms) = self.clock.ms(Instant::now()) else { return };
         let Some(card) = READY_CARD.lock().ok().and_then(|c| *c) else { return };
-        let ms = ready_ms(start, Instant::now());
         if ms >= ready::END {
             return;
         }
+        if ms >= ready::OPEN.1 && ms < ready::CONFETTI.0 { return; }
         let window = layout.bounds();
         let mut frame = Frame::new(window);
         if ms < ready::OPEN.1 {
@@ -1958,7 +1969,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Celebrate {
                 frame.fill(&path, Color { a: fade, ..color });
             }
         }
-        renderer.draw_geometry(frame.into_geometry());
+        // Cache the actual cloud/tag bounds. An uncached full-window geometry damages the
+        // entire GUI, even for a tiny moving tag, and doubles that work at high DPI.
+        let mut geometry = frame.into_geometry();
+        if let Geometry::Live { primitives, clip_bounds, .. } = &mut geometry {
+            let Some(bounds) = primitives.iter().map(iced_tiny_skia::Primitive::visible_bounds)
+                .reduce(|a, b| a.union(&b)).and_then(|b| b.expand(2.0).intersection(&window)) else { return };
+            *clip_bounds = bounds;
+        }
+        let cache = geometry.cache(Group::unique(), None);
+        renderer.draw_geometry(Geometry::load(&cache));
     }
 }
 /// The confetti's air: its burst slows with this time constant (ms), then it drifts down at
@@ -2016,7 +2036,7 @@ impl Restart {
         }
     }
     fn ms(&self, now: Instant) -> f32 {
-        ready_ms(self.start, now)
+        now.saturating_duration_since(self.start).as_secs_f32() * 1000.0
     }
     /// The share the hole's floor shows: each step fills its third, slowing as it goes.
     fn progress(&self, now: Instant) -> f32 {
@@ -2381,13 +2401,13 @@ fn restart_debris(frame: &mut Frame, window: Rectangle, slot: Rectangle, mosaic:
 
 /// A version number whose differing tail rolls from the old one to the new one, then flashes
 /// green; without a start it simply shows the new one.
-pub fn roll<'a, Message: 'a>(from: &str, to: &str, start: Option<Instant>, size: f32, color: Color) -> Element<'a, Message> {
-    Element::new(Roll { from: from.to_owned(), to: to.to_owned(), start, size, color })
+pub fn roll<'a, Message: 'a>(from: &str, to: &str, clock: ReadyClock, size: f32, color: Color) -> Element<'a, Message> {
+    Element::new(Roll { from: from.to_owned(), to: to.to_owned(), clock, size, color })
 }
 struct Roll {
     from: String,
     to: String,
-    start: Option<Instant>,
+    clock: ReadyClock,
     size: f32,
     color: Color,
 }
@@ -2412,15 +2432,15 @@ impl<Message> Widget<Message, Theme, Renderer> for Roll {
         layout::Node::new(limits.resolve(Length::Shrink, Length::Shrink, Size::new(self.width(), (self.size * 1.3).ceil())))
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
-        if let (Event::Window(window::Event::RedrawRequested(now)), Some(start)) = (event, self.start)
-            && ready_ms(start, *now) < ready::FLASH.1
+        if let Event::Window(window::Event::RedrawRequested(now)) = event
+            && self.clock.running() && self.clock.ms(*now).is_some_and(|ms| ms < ready::FLASH.1)
         {
             shell.request_redraw_at(frame_after(*now));
         }
     }
     fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
-        let ms = self.start.map_or(f32::MAX, |start| ready_ms(start, Instant::now()));
+        let ms = self.clock.ms(Instant::now()).unwrap_or(f32::MAX);
         let (prefix, old, new) = self.parts();
         let roll = smooth(ready_span(ms, ready::ROLL));
         let flash = ready_span(ms, ready::FLASH);
@@ -2455,7 +2475,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Roll {
                     shaping: text::Shaping::Basic,
                 });
             }
-            renderer.draw_geometry(frame.into_geometry());
+            let cache = frame.into_geometry().cache(Group::unique(), None);
+            renderer.draw_geometry(Geometry::load(&cache));
         });
     }
 }
@@ -2763,37 +2784,68 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
                 renderer.fill_quad(Quad { bounds: Rectangle { x, y, width: w, height: h }, snap: true, ..Quad::default() }, KEY);
             }
         }
-        let side = block.round().max(MOSAIC_CELL);
+        // The sharp root fades in underneath: keep the disappearing overlay at 16 px,
+        // rather than painting thousands of barely visible 4 px blocks over sharp text.
+        let side = block.round().max(MOSAIC_CELL * 4.0);
         let cols = (frame.width / side).ceil().max(1.0) as usize;
         let rows = (frame.height / side).ceil().max(1.0) as usize;
+        if alpha <= 0.0 { return; }
+        let reveal = if m.to_rect.width > m.from_rect.width { smooth(span(tl.fade_out.0, tl.fade_out.1)) } else { 0.0 };
         for row in 0..rows {
+            // A slightly broken pixel edge reveals the sharp GUI left to right. The
+            // disappearing overlay no longer covers all four million pixels at 200%.
+            let edge = frame.x + (reveal * frame.width / side
+                + (grain(row as u32, 64) - 0.5) * (std::f32::consts::PI * reveal).sin()).floor().max(0.0) * side;
             let mut run: Option<(usize, [u8; 3])> = None;
             for col in 0..=cols {
                 let color = (col < cols).then(|| {
                     let (u0, v0) = (col as f32 * side / frame.width, row as f32 * side / frame.height);
                     let (u1, v1) = (((col + 1) as f32 * side / frame.width).min(1.0), ((row + 1) as f32 * side / frame.height).min(1.0));
-                    let a = sample(&m.from, u0, v0, u1, v1);
-                    let z = sample(&m.to, u0, v0, u1, v1);
-                    [0, 1, 2].map(|i| (a[i] + (z[i] - a[i]) * blend).round() as u8)
+                    let color = if blend <= 0.0 { sample(&m.from, u0, v0, u1, v1) }
+                        else if blend >= 1.0 { sample(&m.to, u0, v0, u1, v1) }
+                        else {
+                            let a = sample(&m.from, u0, v0, u1, v1);
+                            let z = sample(&m.to, u0, v0, u1, v1);
+                            [0, 1, 2].map(|i| a[i] + (z[i] - a[i]) * blend)
+                        };
+                    color.map(|v| v.round() as u8)
                 });
                 let same = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 3);
                 match (run, color) {
                     (Some((_, c)), Some(next)) if same(c, next) => {}
                     (current, next) => {
                         if let Some((first, c)) = current {
-                            let x = frame.x + first as f32 * side;
+                            let left = frame.x + first as f32 * side;
+                            let x = left.max(edge);
                             let y = frame.y + row as f32 * side;
-                            let w = ((col - first) as f32 * side).min(frame.x + frame.width - x);
+                            let w = (frame.x + col as f32 * side).min(frame.x + frame.width) - x;
                             let h = side.min(frame.y + frame.height - y);
-                            slant(&mut shapes, x, y, w + 0.6, h + 0.6, 0.0, Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) });
+                            if w > 0.0 { slant(&mut shapes, x, y, w + 0.6, h + 0.6, 0.0, Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) }); }
                         }
                         run = next.map(|c| (col, c));
                     }
                 }
             }
         }
-        let cache = geometry(b, &shapes).cache(Group::unique(), None);
-        renderer.draw_geometry(Geometry::load(&cache));
+        // Pixel edges need no supersampling. Batch identical colours in one contour,
+        // above the root's text, with one full damage pass per frame.
+        renderer.with_layer(b, |renderer| {
+            let mut colors = std::collections::BTreeMap::<[u8; 3], Vec<Shape>>::new();
+            for s in shapes { colors.entry([s.color.r, s.color.g, s.color.b].map(|v| (v * 255.0).round() as u8)).or_default().push(s); }
+            let mut paint = Frame::new(b);
+            for (c, cells) in colors {
+                let path = Path::new(|p| { for s in cells { p.rectangle(Point::new(s.x, s.y), Size::new(s.w, s.h)); } });
+                paint.fill(&path, Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) });
+            }
+            let mut geometry = paint.into_geometry();
+            if let Geometry::Live { primitives, .. } = &mut geometry {
+                for primitive in primitives {
+                    if let iced_tiny_skia::Primitive::Fill { paint, .. } = primitive { paint.anti_alias = false; }
+                }
+            }
+            let cache = geometry.cache(Group::unique(), None);
+            renderer.draw_geometry(Geometry::load(&cache));
+        });
     }
 }
 
@@ -2915,9 +2967,9 @@ mod tests {
     }
     #[test]
     fn version_rolls_only_its_changed_tail() {
-        let roll = Roll { from: "0.3.19".into(), to: "0.3.20".into(), start: None, size: 13.0, color: INK };
+        let roll = Roll { from: "0.3.19".into(), to: "0.3.20".into(), clock: ReadyClock::default(), size: 13.0, color: INK };
         assert_eq!(roll.parts(), ("0.3.".into(), "19".into(), "20".into()));
-        let same = Roll { from: "0.3.14".into(), to: "0.3.15".into(), start: None, size: 13.0, color: INK };
+        let same = Roll { from: "0.3.14".into(), to: "0.3.15".into(), clock: ReadyClock::default(), size: 13.0, color: INK };
         assert_eq!(same.parts(), ("0.3.1".into(), "4".into(), "5".into()));
         assert!(ready::DROP.1 <= ready::MOSAIC.0 && ready::MOSAIC.1 <= ready::ROLL.0 && ready::ROLL.1 <= ready::CONFETTI.0 && ready::CONFETTI.1 < ready::END, "D, then B, then A");
     }

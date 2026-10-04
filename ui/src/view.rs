@@ -499,9 +499,9 @@ impl App {
     pub fn clock(&self) -> Clock {
         Clock {
             epoch: self.epoch,
-            opened: self.opened_at.filter(|_| self.slider_idle),
-            animate: self.ui_active(),
-            idle: self.slider_idle,
+            opened: self.opened_at.filter(|_| self.slider_idle && self.morph.is_none()),
+            animate: self.ui_active() && self.morph.is_none(),
+            idle: self.slider_idle && self.morph.is_none(),
         }
     }
     fn ring(&self, focused: bool) -> bool {
@@ -535,8 +535,8 @@ impl App {
         let mut layers = widget::stack![base, glitch].width(Length::Fill).height(Length::Fill);
         if self.morph.is_none() {
             // The ready card's tag and confetti fly over the whole window.
-            if self.ready_fx.is_some() {
-                layers = layers.push(tacho::celebrate(self.ready_fx));
+            if self.ready_clock().present() {
+                layers = layers.push(tacho::celebrate(self.ready_clock()));
             }
             // The restart's air stops where the morph takes over: under its colour key it
             // would float over the desktop.
@@ -727,8 +727,8 @@ impl App {
         if self.update_ready || self.ready_preview.is_some() {
             // The celebration's layer only while it plays: the card keeps its widget state.
             let mut card = widget::stack![self.ready_card()];
-            if self.ready_fx.is_some() {
-                card = card.push(tacho::ready_fx(self.ready_fx, RAIL));
+            if self.ready_clock().present() {
+                card = card.push(tacho::ready_fx(self.ready_clock(), RAIL));
             }
             rail = rail.push(card);
             rail = rail.push(Space::new().height(8));
@@ -768,7 +768,7 @@ impl App {
         container(
             column![
                 bold(heading, 13, INK),
-                row![label("Версия", 12, DIM), tacho::roll(env!("CARGO_PKG_VERSION"), &self.ready_version(), self.ready_fx, 14.0, INK)]
+                row![label("Версия", 12, DIM), tacho::roll(env!("CARGO_PKG_VERSION"), &self.ready_version(), self.ready_clock(), 14.0, INK)]
                     .spacing(6)
                     .align_y(iced::Center),
                 label(step, 12, DIM),
@@ -3619,6 +3619,69 @@ mod tests {
         times.sort_by(f64::total_cmp);
         eprintln!("slider values: mean {mean:.1} ms, p95 {:.1} ms", times[114]);
         assert!(mean < 16.0 && times[114] < 24.0, "slider changes fell below the frame budget");
+    }
+    #[test]
+    #[ignore]
+    fn update_animation_budget() {
+        use iced::advanced::{Renderer as _, Layout, graphics::{Viewport, damage}};
+        let (w, h) = (1040.0_f32, 740.0_f32);
+        let full = iced::Rectangle::with_size(Size::new(w, h));
+        let mut over_budget = Vec::new();
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let size = Size::new((w * scale) as u32, (h * scale) as u32);
+            let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+            app.window = Some(window::Id::unique());
+            app.window_focused = true;
+            let root = app.window_mosaic(full.size()).unwrap();
+            let card = iced::Rectangle { x: (w - UPDATE_CARD.width) / 2.0, y: (h - UPDATE_CARD.height) / 2.0, width: UPDATE_CARD.width, height: UPDATE_CARD.height };
+            let launching = mosaic_of::<Msg>(update_card(tacho::BarStage::Launching, "", "9.9.9"), UPDATE_CARD).unwrap();
+            let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+            let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            let mut tree = iced::advanced::widget::Tree::empty();
+            let mut previous: Vec<iced_tiny_skia::Layer> = Vec::new();
+            let mut previous_backdrop = BG;
+            let mut frame = |app: &App| {
+                let started = Instant::now();
+                let mut element = app.view(window::Id::unique());
+                tree.diff(element.as_widget());
+                let node = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, full.size()));
+                renderer.reset(full);
+                element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&node), iced::mouse::Cursor::Unavailable, &full);
+                let backdrop = app.backdrop();
+                let patches = if backdrop != previous_backdrop { vec![full] } else { damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full) };
+                previous_backdrop = backdrop;
+                previous = renderer.layers().to_vec();
+                renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, scale), &patches, backdrop);
+                started.elapsed().as_secs_f64() * 1000.0
+            };
+            let _ = frame(&app);
+            let _ = frame(&app);
+            for (stage, begin, end) in [("grow", 0, 950), ("final sharpen", 820, 950),
+                ("tag/drop", 0, 420), ("wiggle/open", 420, 760), ("card reveal", 700, 1200),
+                ("version roll", 1200, 1500), ("ring/gleam", 1500, 2350), ("confetti", 1650, 3250)] {
+                let mut times = Vec::new();
+                for ms in (begin..end).step_by(16) {
+                    if stage == "grow" || stage == "final sharpen" {
+                        app.morph = Some(MorphView { base: if ms < 100 { MorphBase::Card(tacho::BarStage::Launching) } else if ms >= 820 { MorphBase::Root } else { MorphBase::Key },
+                            from_version: String::new(), to_version: "9.9.9".into(), hwnd: None, center: None, shown: None,
+                            anim: Some(tacho::Morph { from: launching.clone(), to: root.clone(), from_rect: card, to_rect: full,
+                                start: Instant::now() - Duration::from_millis(ms), timeline: tacho::MorphTimeline::GROW, events: Vec::new() }) });
+                    } else {
+                        app.morph = None;
+                        app.ready_preview = Some(Instant::now());
+                        app.ready_fx = Some(Instant::now() - Duration::from_millis(ms));
+                    }
+                    times.push(frame(&app));
+                }
+                let mean = times.iter().sum::<f64>() / times.len() as f64;
+                times.sort_by(f64::total_cmp);
+                let p95 = times[(times.len() * 95 / 100).min(times.len() - 1)];
+                eprintln!("{stage}, {}%: mean {mean:.1} ms, p95 {p95:.1} ms", scale * 100.0);
+                if mean >= 16.0 || p95 >= 24.0 { over_budget.push((stage, scale)); }
+            }
+        }
+        assert!(over_budget.is_empty(), "stages exceeding the frame budget: {over_budget:?}");
     }
     #[test]
     #[ignore]
