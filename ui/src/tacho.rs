@@ -32,6 +32,10 @@ const FRAME: Duration = Duration::from_millis(16);
 fn frame_after(now: Instant) -> RedrawRequest {
     RedrawRequest::At(now + FRAME)
 }
+fn pointer_frame<Message>(due: &mut Option<Instant>, shell: &mut Shell<'_, Message>) {
+    // Keep the first deadline: resetting it on every packet starves a high-Hz drag.
+    shell.request_redraw_at(*due.get_or_insert_with(|| Instant::now() + FRAME));
+}
 const OFF: Color = Color::from_rgb8(0x1E, 0x1F, 0x22);
 const OFF_RED: Color = Color::from_rgb8(0x2C, 0x1A, 0x1A);
 const OFF_EDGE: Color = Color::from_rgb8(0x2A, 0x2B, 0x30);
@@ -221,9 +225,11 @@ impl<'a, Message> Tacho<'a, Message> {
         SliderScale { range: self.range.clone(), step: self.step, track }
     }
     fn grab(&self, track: Rectangle, x: f32, value: f32, fine: bool) -> (f32, f32) {
-        let (_, _, head) = self.lit(value);
-        let drawn_head = self.seg_x(track, head.max(0) as usize) + self.seg_width() / 2.0;
+        let drawn_head = self.head_x(track, value) + self.seg_width() / 2.0;
         self.scale(track).begin(x, value, fine || (x - drawn_head).abs() <= self.seg_width() / 2.0 + 4.0)
+    }
+    fn head_x(&self, track: Rectangle, value: f32) -> f32 {
+        track.x + (track.width - self.seg_width()).max(0.0) * self.frac(value)
     }
     /// The nearest step, inside the range.
     fn snap(&self, v: f32) -> f32 {
@@ -244,6 +250,7 @@ struct State {
     anchor: (f32, f32),
     /// Last model and proposed value; several input events can arrive before a rebuild.
     input: Option<(f32, f32)>,
+    frame_due: Option<Instant>,
     /// Wheel notches not applied yet (touchpads send fractions).
     wheel: f32,
     painted: Painted,
@@ -271,7 +278,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         _: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
-        if !self.enabled { state.drag = false; }
+        if !self.enabled { state.drag = false; state.frame_due = None; }
         let bounds = layout.bounds();
         let track = self.track(bounds);
         let scale = self.scale(track);
@@ -287,6 +294,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if self.enabled => {
                 if let Some(p) = cursor.position_over(hit) {
+                    state.frame_due = None;
                     if state.mods.command() {
                         publish(self.default, &mut current, shell);
                     } else {
@@ -303,22 +311,23 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag => {
                 if let Some(p) = cursor.position() {
-                    let v = scale.dragged(&mut state.anchor, p.x, state.mods.shift());
-                    publish(v, &mut current, shell);
+                    current = scale.dragged(&mut state.anchor, p.x, state.mods.shift());
                 }
+                if current != self.value { shell.publish((self.on_change)(current)); }
+                state.frame_due = None;
                 state.drag = false;
                 state.touched = Some(Instant::now());
                 shell.capture_event();
                 shell.request_redraw();
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => {
-                let v = scale.dragged(&mut state.anchor, position.x, state.mods.shift());
-                publish(v, &mut current, shell);
+                current = scale.dragged(&mut state.anchor, position.x, state.mods.shift());
                 state.touched = Some(Instant::now());
                 shell.capture_event();
-                shell.request_redraw();
+                pointer_frame(&mut state.frame_due, shell);
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if self.enabled && self.wheel && cursor.is_over(hit) => {
+                if state.frame_due.take().is_some() && current != self.value { shell.publish((self.on_change)(current)); }
                 let whole = wheel_steps(&mut state.wheel, *delta);
                 if whole != 0.0 {
                     publish(self.snap(current + whole * self.step), &mut current, shell);
@@ -331,6 +340,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.mods = *m,
             Event::Window(window::Event::Unfocused) => {
+                if state.frame_due.take().is_some() && current != self.value { shell.publish((self.on_change)(current)); }
                 state.drag = false;
                 state.mods = keyboard::Modifiers::default();
                 state.wheel = 0.0;
@@ -338,7 +348,8 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let now = *now;
-                let v = self.value;
+                if state.frame_due.take().is_some() && current != self.value { shell.publish((self.on_change)(current)); }
+                let v = current;
                 if !state.ready {
                     state.ready = true;
                     state.last = v;
@@ -419,7 +430,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             let hot = lit && red && !is_head;
             let ghost = !lit && state.peak.is_some_and(|(p, _)| p == ii);
             let mut color = if lit {
-                if is_head { HEAD } else if red { HOT } else { lerp(i as f32 / n as f32) }
+                if red { HOT } else { lerp(i as f32 / n as f32) }
             } else if ghost {
                 Color { a: 0.4, ..HEAD }
             } else if red { OFF_RED } else { OFF };
@@ -450,11 +461,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 color = brighten(color, glow);
             }
             let y = track.y + track.height + lift - height;
-            if overdrive && is_head {
-                halo(&mut shapes, x, y, w, height, if self.compact { 8.0 } else { 12.0 }, Color { a: 0.6, ..HOT });
-            } else if self.enabled && is_head {
-                halo(&mut shapes, x, y, w, height, if self.compact { 7.0 } else { 11.0 }, Color { a: 0.6, ..GLOW });
-            } else if self.enabled && hot {
+            if self.enabled && hot {
                 halo(&mut shapes, x, y, w, height, 6.0, Color { a: 0.35 * pulse, ..HOT });
             }
             if lit {
@@ -464,6 +471,16 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 segment(&mut shapes, x, y, w, height, Color { a: alpha, ..OFF_EDGE });
                 segment(&mut shapes, x + 1.0, y + 1.0, w - 2.0, height - 2.0, Color { a: color.a * alpha, ..color });
             }
+        }
+        // The handle follows the unrounded drag position. Audio/text keep their configured
+        // steps, but a semitone or a sparse segment must not make the visual motion jump.
+        let pointer_value = if state.drag { state.anchor.1 } else { self.value };
+        let hx = self.head_x(track, pointer_value);
+        if ignition.is_none() {
+            let h = track.height * press * (1.0 + flash.map_or(0.0, |t| 0.5 * (1.0 - t)));
+            let y = track.y + track.height - h;
+            if self.enabled { halo(&mut shapes, hx, y, w, h, if self.compact { 7.0 } else { 11.0 }, Color { a: 0.6, ..if overdrive { HOT } else { GLOW } }); }
+            segment(&mut shapes, hx, y, w, h, Color { a: alpha, ..HEAD });
         }
         let text_value = if matches!(ignition, Some(Sweep::Up(_))) {
             "MAX".to_owned()
@@ -483,8 +500,7 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
         } else {
             let text = label(text_value, 14.0, Size::new(120.0, 23.0), text::Alignment::Center);
             let tw = measure(&text).width + 24.0;
-            let at = if hi > lo { head as f32 + 0.5 } else { lo as f32 };
-            let cx = track.x + w / 2.0 + (track.width - w) * (at - 0.5).max(0.0) / (n - 1) as f32;
+            let cx = hx + w / 2.0;
             let tx = (cx - tw / 2.0).clamp(bounds.x, bounds.x + bounds.width - tw);
             let ty = bounds.y + if state.drag { -4.0 } else { 0.0 };
             // The tag's slant matches the mockup's clip-path: 7 px over its height.
@@ -1162,6 +1178,7 @@ struct MeterState {
     mods: keyboard::Modifiers,
     wheel: f32,
     input: Option<(f32, f32)>,
+    frame_due: Option<Instant>,
 }
 /// Stable pseudo-random 0..1 for bar `i` in flicker frame `t`.
 fn grain(i: u32, t: u32) -> f32 {
@@ -1187,6 +1204,15 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
         let scale = SliderScale { range: -72.0..=0.0, step: 1.0,
             track: Rectangle { x: bounds.x + 4.0, width: (bounds.width - 8.0).max(1.0), ..bounds } };
         let current = state.input.filter(|(model, _)| *model == self.gate_db).map_or(self.gate_db, |(_, v)| v);
+        if let Event::Mouse(mouse::Event::CursorMoved { position }) = event
+            && state.drag {
+            state.input = Some((self.gate_db, scale.dragged(&mut state.anchor, position.x, state.mods.shift())));
+            shell.capture_event();
+            pointer_frame(&mut state.frame_due, shell);
+            return;
+        }
+        if matches!(event, Event::Window(window::Event::RedrawRequested(_) | window::Event::Unfocused))
+            && state.frame_due.take().is_some() && current != self.gate_db { shell.publish(on_change(current)); }
         let value = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(bounds) => {
                 state.drag = true;
@@ -1195,8 +1221,6 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
                     state.anchor.1
                 })
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag =>
-                Some(scale.dragged(&mut state.anchor, position.x, state.mods.shift())),
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag => {
                 state.drag = false;
                 shell.capture_event();
@@ -1224,9 +1248,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
             _ => None,
         };
         if let Some(value) = value {
-            if value != current || matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) {
+            if value != current || state.frame_due.is_some() && value != self.gate_db
+                || matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))) {
                 shell.publish(on_change(value));
             }
+            state.frame_due = None;
             shell.capture_event();
             shell.request_redraw();
         }
@@ -1267,7 +1293,7 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
                 }
             }
             if self.on_change.is_some() {
-                let db = self.gate_db;
+                let db = if m.drag { m.anchor.1 } else { self.gate_db };
                 let x = b.x + 4.0 + (b.width - 8.0) * ((db + 72.0) / 72.0).clamp(0.0, 1.0);
                 let color = if db <= -72.0 { Color::from_rgb8(0x8A, 0x8B, 0x92) } else { TAG };
                 slant(&mut shapes, x - 1.0, b.y + 2.0, 2.0, b.height - 4.0, 0.0, color);
@@ -1344,7 +1370,35 @@ mod gate_tests {
             send(Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 } }), 416.0);
         }
         send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), 416.0);
-        assert_eq!(messages, [-36.0, -34.0, -36.0, -35.0, -34.0, -33.0, -72.0]);
+        assert_eq!(messages, [-36.0, -35.0, -34.0, -33.0, -72.0]);
+    }
+    #[test]
+    fn gate_coalesces_pointer_packets_and_flushes_on_focus_loss() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let mut meter = gate_meter(0.5, Color::WHITE, -36.0, |v| v);
+        let mut tree = Tree::new(meter.as_widget());
+        let node = meter.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(728.0, 24.0)));
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut send = |event, x| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            meter.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Available(Point::new(x, 12.0)),
+                &renderer, &mut clipboard, &mut shell, &node.bounds());
+            let due = shell.redraw_request();
+            (messages, due)
+        };
+        assert_eq!(send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), 366.0).0, [-36.0]);
+        let mut deadline = None;
+        for i in 1..=1000 {
+            let x = 366.0 + i as f32 / 10.0;
+            let (messages, due) = send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(x, 12.0) }), x);
+            assert!(messages.is_empty());
+            assert_eq!(*deadline.get_or_insert(due), due);
+        }
+        assert_eq!(send(Event::Window(window::Event::RedrawRequested(Instant::now())), 466.0).0, [-26.0]);
+        assert!(send(Event::Window(window::Event::RedrawRequested(Instant::now())), 466.0).0.is_empty());
+        assert!(send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(486.0, 12.0) }), 486.0).0.is_empty());
+        assert_eq!(send(Event::Window(window::Event::Unfocused), 486.0).0, [-24.0]);
     }
 }
 
@@ -2992,14 +3046,16 @@ mod tests {
         }
     }
     #[test]
-    fn slider_pickup_uses_the_visible_segment_not_just_its_numeric_position() {
+    fn slider_pickup_and_handle_follow_the_exact_position() {
         let slider = t(0.0..=200.0, 40.0);
         let track = Rectangle { width: 716.0, ..Rectangle::default() };
-        // A segmented head has a coarser position than the exact value on a wide track.
-        let drawn_edge = slider.seg_x(track, 3) + slider.seg_width();
-        assert!(slider.scale(track).locate(drawn_edge) < 40.0);
+        let drawn_edge = slider.head_x(track, 40.0) + slider.seg_width() / 2.0;
         assert_eq!(slider.grab(track, drawn_edge, 40.0, false).1, 40.0);
         assert_eq!(slider.grab(track, track.width, 40.0, false).1, 200.0);
+        assert!(slider.head_x(track, 41.0) > slider.head_x(track, 40.0));
+        let pitch = t(-12.0..=12.0, 0.0);
+        assert_eq!(pitch.snap(0.1), pitch.snap(0.2));
+        assert!(pitch.head_x(track, 0.2) > pitch.head_x(track, 0.1), "the handle moves even within one audio step");
     }
     #[test]
     fn touching_cancels_warmup_only_for_the_current_window_open() {
@@ -3034,7 +3090,7 @@ mod tests {
         // The release position must be applied even without a preceding CursorMoved event.
         send(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), at(34.0));
         send(moved(200.0), at(200.0));
-        assert_eq!(messages, [300.0, 490.0, 300.0, 301.0, 303.0]);
+        assert_eq!(messages, [300.0, 303.0]);
         assert!(!tree.state.downcast_ref::<State>().drag);
     }
     #[test]
@@ -3059,6 +3115,37 @@ mod tests {
         assert_eq!(messages, [101.0, 102.0, 100.0, 100.0]);
         let state = tree.state.downcast_ref::<State>();
         assert!(!state.drag && !state.mods.shift());
+    }
+    #[test]
+    fn high_hz_drag_keeps_one_deadline_and_commits_once_per_frame() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let mut slider: Element<'_, f32> = tacho(100.0..=2000.0, 300.0, |v| v,
+            Clock { epoch: Instant::now(), opened: None, animate: true, idle: false }).into();
+        let mut tree = Tree::new(slider.as_widget());
+        let node = slider.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(202.0, 66.0)));
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut send = |event, x| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            slider.as_widget_mut().update(&mut tree, &event, Layout::new(&node),
+                mouse::Cursor::Available(Point::new(x, 45.0)), &renderer, &mut clipboard, &mut shell, &node.bounds());
+            let due = shell.redraw_request();
+            (messages, due)
+        };
+        assert_eq!(send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), 28.0).0, [300.0]);
+        let mut deadline = None;
+        for i in 1..=1000 {
+            let x = 28.0 + i as f32 / 10.0;
+            let (messages, due) = send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(x, 45.0) }), x);
+            assert!(messages.is_empty(), "pointer packets must not rebuild the app");
+            assert_eq!(*deadline.get_or_insert(due), due, "a stream cannot push the first deadline back");
+        }
+        let frame = Event::Window(window::Event::RedrawRequested(Instant::now()));
+        assert_eq!(send(frame.clone(), 128.0).0, [1300.0]);
+        assert!(send(frame, 128.0).0.is_empty(), "Iced reenters redraw after rebuilding");
+        assert!(send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(150.0, 45.0) }), 150.0).0.is_empty());
+        assert_eq!(send(Event::Window(window::Event::Unfocused), 150.0).0, [1520.0]);
+        assert!(send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(200.0, 45.0) }), 200.0).0.is_empty());
     }
     #[test]
     fn page_shift_starts_at_its_first_frame() {

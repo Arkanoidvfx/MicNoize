@@ -3622,6 +3622,73 @@ mod tests {
     }
     #[test]
     #[ignore]
+    fn slider_pointer_frame_budget() {
+        use iced::advanced::{Renderer as _, Layout, graphics::{Viewport, damage}};
+        use iced::Point;
+        let full = iced::Rectangle::with_size(Size::new(1040.0, 740.0));
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+            let id = window::Id::unique();
+            app.window = Some(id);
+            app.window_focused = true;
+            let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+            let mut tree = iced::advanced::widget::Tree::empty();
+            let size = Size::new((1040.0 * scale) as u32, (740.0 * scale) as u32);
+            let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            let mut clipboard = iced::advanced::clipboard::Null;
+            let mut previous = Vec::new();
+            let mut times = Vec::new();
+            let mut total = 0;
+            for frame in 0..120 {
+                let started = Instant::now();
+                let mut messages = Vec::new();
+                {
+                    let mut element = app.view(id);
+                    tree.diff(element.as_widget());
+                    let node = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, full.size()));
+                    let mut send = |event, x| element.as_widget_mut().update(&mut tree, &event, Layout::new(&node),
+                        iced::mouse::Cursor::Available(Point::new(x, 500.0)), &renderer, &mut clipboard,
+                        &mut iced::advanced::Shell::new(&mut messages), &full);
+                    if frame == 0 { send(iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)), 310.0); }
+                    for packet in 0..16 {
+                        let x = 310.0 + 100.0 * ((frame * 16 + packet) as f32 / 190.0).sin();
+                        send(iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: Point::new(x, 500.0) }), x);
+                    }
+                    send(iced::Event::Window(window::Event::RedrawRequested(Instant::now())), 310.0);
+                }
+                total += messages.len();
+                assert!(messages.len() <= 2, "one frame must not apply every pointer packet");
+                for message in messages { let _ = app.update(message); }
+                let mut element = app.view(id);
+                tree.diff(element.as_widget());
+                let node = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, full.size()));
+                renderer.reset(full);
+                element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&node), iced::mouse::Cursor::Unavailable, &full);
+                let patches = damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full);
+                previous = renderer.layers().to_vec();
+                renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, scale), &patches, BG);
+                if frame > 1 { times.push(started.elapsed().as_secs_f64() * 1000.0); }
+            }
+            assert!(total > 50 && app.controls.intensity != 0.4, "the drag must reach the real controller");
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            times.sort_by(f64::total_cmp);
+            let p95 = times[times.len() * 95 / 100];
+            eprintln!("1000 Hz input, {}%: {total} messages / 1920 packets, mean {mean:.1} ms, p95 {p95:.1} ms", scale * 100.0);
+            assert!(mean < 16.0 && p95 < 24.0, "pointer input exceeds the frame budget");
+            if let Ok(dir) = std::env::var("MNR_DESIGN_DIR") {
+                let mut data = pixels.data().to_vec();
+                for pixel in data.as_chunks_mut::<4>().0 { pixel.swap(0, 2); }
+                let path = PathBuf::from(dir).join(format!("drag-{}.png", (scale * 100.0) as u32));
+                let mut encoder = png::Encoder::new(std::fs::File::create(path).unwrap(), size.width, size.height);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder.write_header().unwrap().write_image_data(&data).unwrap();
+            }
+        }
+    }
+    #[test]
+    #[ignore]
     fn update_animation_budget() {
         use iced::advanced::{Renderer as _, Layout, graphics::{Viewport, damage}};
         let (w, h) = (1040.0_f32, 740.0_f32);
