@@ -31,16 +31,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The effect defaults of 0.3.16 (boost 167 %, ×0.67, ×1.67, pitch −6) reach existing installs
-/// once: settings without this `[effects] defaults_version` get them, and every save writes it.
-const EFFECT_DEFAULTS_VERSION: i32 = 2;
+/// Changed defaults reach existing installs once, step by step: settings below a step's
+/// `[effects] defaults_version` get it, and every save writes the current version.
+/// 2 (0.3.16): boost 167 %, ×0.67, ×1.67, pitch −6. 3 (0.4.14): «Слышать эффекты» on.
+const EFFECT_DEFAULTS_VERSION: i32 = 3;
 fn apply_effect_defaults(settings: &mut Settings) {
-    if settings.number("effects", "defaults_version", 1, 1, 99) >= EFFECT_DEFAULTS_VERSION {
+    let version = settings.number("effects", "defaults_version", 1, 1, 99);
+    if version >= EFFECT_DEFAULTS_VERSION {
         return;
     }
-    for (key, value) in [("boost", 167), ("slow_speed", 67), ("fast_speed", 167), ("pitch", -6)] {
-        settings.set("effects", key, value);
+    if version < 2 {
+        for (key, value) in [("boost", 167), ("slow_speed", 67), ("fast_speed", 167), ("pitch", -6)] {
+            settings.set("effects", key, value);
+        }
     }
+    settings.set("effects", "monitor_effects", 1);
     settings.set("effects", "defaults_version", EFFECT_DEFAULTS_VERSION);
 }
 /// The effects page's two groups, by effect row: what sounds while the key is held (boost,
@@ -1114,7 +1119,7 @@ impl App {
         let headphone_volume = settings.number("headphones", "volume", 70, 0, 100) as f32 / 100.0;
         let headphone_pitch = settings.number("headphones", "pitch", 0, -12, 12);
         let headphone_reverse = settings.number("headphones", "reverse", 0, 0, 1) != 0;
-        let effects_monitor = settings.number("effects", "monitor_effects", 0, 0, 1) != 0;
+        let effects_monitor = settings.number("effects", "monitor_effects", 1, 0, 1) != 0;
         let boost_monitor = settings.number("effects", "monitor_boost", 0, 0, 1) != 0;
         let controls = Controls {
             slow: settings.number("effects", "slow_speed", 67, 50, 95) as f32 / 100.0,
@@ -5373,7 +5378,11 @@ fn main() {
             )
         })
         .style(|s: &App, _| iced::theme::Style { background_color: s.backdrop(), text_color: view::INK })
-        .default_font(Font::with_name("Segoe UI"))
+        .font(tacho::UI_FONTS[0])
+        .font(tacho::UI_FONTS[1])
+        .font(tacho::UI_FONTS[2])
+        .font(tacho::UI_FONTS[3])
+        .default_font(tacho::UI)
         .subscription(App::subscription)
         .executor::<Pool>()
         .scale_factor(|s: &App, _| s.qa_scale)
@@ -5485,6 +5494,7 @@ mod controller_tests {
         use keyboard::{Key, Modifiers, key::Named};
         let saved = "[studio]\nbpm=137\nevents=[{\"step\":0,\"note\":60,\"sample\":\"kick.wav\"}]";
         let (mut app, _) = App::from_settings(Settings::for_test(saved)).unwrap().unwrap();
+        app.effects_monitor = false;
         assert_eq!(app.studio_bpm, 137);
         assert_eq!(app.studio_events.len(), 1);
         app.studio_samples.push("kick.wav".into());
@@ -6105,11 +6115,16 @@ page_pixelate=0")).unwrap().unwrap();
         let _ = app.update(Msg::EffectsMonitor(true));
         assert!(!app.boost_monitor);
         let (saved, _) = App::from_settings(Settings::for_test(
-            "[effects]\nmonitor_effects=0\nmonitor_boost=1",
+            "[effects]\nmonitor_effects=0\nmonitor_boost=1\ndefaults_version=3",
         ))
         .unwrap()
         .unwrap();
         assert_eq!(saved.monitor_mode(), 3);
+        // «Слышать эффекты» is on for new installs and once for older settings, then it stays chosen.
+        for (ini, on) in [("", true), ("[effects]\nmonitor_effects=0\ndefaults_version=2", true), ("[effects]\nmonitor_effects=0\ndefaults_version=3", false)] {
+            let (app, _) = App::from_settings(Settings::for_test(ini)).unwrap().unwrap();
+            assert_eq!(app.effects_monitor, on, "{ini:?}");
+        }
     }
     #[test]
     fn route_device_selection_is_validated_and_keyboard_accessible() {
@@ -6306,6 +6321,8 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.sound_stop_key, 120);
         assert_eq!(app.sound_volume, 1.5);
         assert!(app.sound_monitor);
+        // Effects monitoring defaults on since 0.4.14; this checks the sound-only mode.
+        app.effects_monitor = false;
         assert_eq!(app.monitor_mode(), 5);
         app.effects_monitor = true;
         assert_eq!(app.monitor_mode(), 6);

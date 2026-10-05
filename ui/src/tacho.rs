@@ -49,10 +49,21 @@ const TAG: Color = Color::from_rgb8(0xFF, 0x9F, 0x56);
 const INK: Color = Color::from_rgb8(242, 237, 227);
 const DARK: Color = Color::from_rgb8(0x1A, 0x12, 0x06);
 
-/// The numbers font of the design: Windows' own condensed DIN-like face.
+/// The display face: Russo One (SIL OFL 1.1, `assets/fonts/OFL-RussoOne.txt`), one weight.
+/// It has no U+2212 minus; numbers use the hyphen, which it draws as one.
+pub const DISPLAY: Font = Font::with_name("Russo One");
+/// The numbers font of the design.
 pub fn numbers() -> Font {
-    Font { weight: iced::font::Weight::Bold, ..Font::with_name("Bahnschrift") }
+    DISPLAY
 }
+/// The interface font: Onest (SIL OFL 1.1, `assets/fonts/OFL-Onest.txt`), drawn Cyrillic-first.
+pub const UI: Font = Font::with_name("Onest");
+pub const UI_FONTS: [&[u8]; 4] = [
+    include_bytes!("../assets/fonts/Onest-Regular.ttf"),
+    include_bytes!("../assets/fonts/Onest-Medium.ttf"),
+    include_bytes!("../assets/fonts/Onest-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/RussoOne-Regular.ttf"),
+];
 
 /// Shared clocks: `epoch` keeps the idle waves of all sliders in step; `opened` starts the
 /// warm-up sweep once per shown window.
@@ -2147,7 +2158,7 @@ fn restart_label(frame: &mut Frame, at: Point, alpha: f32) {
         color: Color { a: alpha, ..BUTTON_LABEL },
         size: Pixels(13.0),
         line_height: text::LineHeight::default(),
-        font: Font::with_name("Segoe UI"),
+        font: UI,
         align_x: text::Alignment::Center,
         align_y: iced::alignment::Vertical::Center,
         shaping: text::Shaping::Basic,
@@ -2911,7 +2922,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
 /// "by ARKANOID" in the sliders' tag style: a quiet slanted chip for the title bar. Hovered, it
 /// glows (a pulsing orange aura, brighter letters) and tells the app, which glitches the window.
 pub fn signature<'a, Message: 'a>(on_hover: impl Fn(bool) -> Message + 'a) -> Element<'a, Message> {
-    let by = text_width("by", 11.0, Font::with_name("Segoe UI"));
+    let by = text_width("by", 11.0, UI);
     let name = text_width("ARKANOID", 11.0, numbers());
     Element::new(Signature { by, name, on_hover: Box::new(on_hover) })
 }
@@ -2989,7 +3000,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Signature<'_, Message> {
         };
         let x = b.x + SIGNATURE_LEAN / 2.0 + 9.0;
         let by = Color::from_rgb8(0x85, 0x86, 0x8D);
-        put(renderer, text("by", Font::with_name("Segoe UI")), Point::new(x, b.center_y()), brighten(by, glow), b.expand(4.0));
+        put(renderer, text("by", UI), Point::new(x, b.center_y()), brighten(by, glow), b.expand(4.0));
         let name = Color { r: INK.r + (HEAD.r - INK.r) * glow, g: INK.g + (TAG.g - INK.g) * glow * 0.5, b: INK.b + (TAG.b - INK.b) * glow * 0.6, a: 1.0 };
         put(renderer, text("ARKANOID", numbers()), Point::new(x + self.by + 5.0, b.center_y()), name, b.expand(4.0));
     }

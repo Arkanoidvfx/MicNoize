@@ -336,7 +336,11 @@ pub fn watch(runtime: PathBuf, center: Option<Point>, versions: Option<(String, 
     )
     .title("Mic Noize")
     .theme(|_: &Watcher, _: Id| Theme::Dark)
-    .default_font(iced::Font::with_name("Segoe UI"))
+    .font(crate::tacho::UI_FONTS[0])
+    .font(crate::tacho::UI_FONTS[1])
+    .font(crate::tacho::UI_FONTS[2])
+    .font(crate::tacho::UI_FONTS[3])
+    .default_font(crate::tacho::UI)
     .run()
     .map_err(|e| e.to_string())?;
     match error.borrow_mut().take() {
