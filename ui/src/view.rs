@@ -3273,6 +3273,9 @@ mod tests {
     fn update_morph_frames() {
         use iced::advanced::{Renderer as _, Layout, graphics::Viewport};
         let dir = PathBuf::from(std::env::var("MNR_DESIGN_DIR").expect("MNR_DESIGN_DIR"));
+        for font in tacho::UI_FONTS {
+            iced_tiny_skia::graphics::text::font_system().write().unwrap().load_font(std::borrow::Cow::Borrowed(font));
+        }
         let (w, h) = (1040.0_f32, 740.0_f32);
         let size = Size::new(w as u32, h as u32);
         let full = iced::Rectangle::with_size(Size::new(w, h));
@@ -3311,8 +3314,8 @@ mod tests {
         let waiting = mosaic_of::<Msg>(update_card(tacho::BarStage::Waiting, "0.2.14", "0.2.15"), UPDATE_CARD).unwrap();
         let done = mosaic_of::<Msg>(update_card(tacho::BarStage::Done, "", "0.2.15"), UPDATE_CARD).unwrap();
         for (kind, from, to, from_rect, to_rect, timeline, times) in [
-            ("shrink", root.clone(), waiting, iced::Rectangle::with_size(window), card, tacho::MorphTimeline::SHRINK, [0u64, 150, 320, 450, 700, 900]),
-            ("grow", done, root, card, iced::Rectangle::with_size(window), tacho::MorphTimeline::GROW, [0, 150, 300, 450, 700, 900]),
+            ("shrink", root.clone(), waiting, iced::Rectangle::with_size(window), card, tacho::MorphTimeline::SHRINK, vec![0u64, 150, 320, 450, 700, 760, 790, 800, 810, 830, 860, 900, 950, 1000]),
+            ("grow", done, root, card, iced::Rectangle::with_size(window), tacho::MorphTimeline::GROW, vec![0, 20, 50, 90, 100, 110, 130, 150, 300, 450, 700, 900]),
         ] {
             for ms in times {
                 let base = match (kind, ms) {

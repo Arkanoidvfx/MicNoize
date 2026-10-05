@@ -95,11 +95,47 @@ pub fn color_key(hwnd: u64, on: bool, alpha: u8) {
         if on {
             SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
             SetLayeredWindowAttributes(window, colorref, alpha, LWA_COLORKEY | LWA_ALPHA);
+            no_caption_paint(window);
         } else {
             // Keep the composed surface: clearing WS_EX_LAYERED discards its picture and
             // can expose a black client area for a DWM frame before tiny-skia presents.
             SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
             set_region(hwnd, None);
+        }
+    }
+}
+
+/// winit keeps WS_CAPTION on undecorated windows (for snapping) and passes WM_NCACTIVATE to
+/// DefWindowProc, which on a layered window paints the classic white «Mic Noize» title bar over
+/// the client area when the window activates: for a few frames as the update card appeared and
+/// as the new version's window took over. With lParam −1 DefWindowProc keeps the non-client area
+/// as it is; winit still sees the activation.
+fn no_caption_paint(window: isize) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetWindowLongPtrW(window: isize, index: i32, value: isize) -> isize;
+        fn GetWindowLongPtrW(window: isize, index: i32) -> isize;
+        fn CallWindowProcW(previous: isize, window: isize, message: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    const GWLP_WNDPROC: i32 = -4;
+    const WM_NCACTIVATE: u32 = 0x0086;
+    static PREVIOUS: std::sync::Mutex<Vec<(isize, isize)>> = std::sync::Mutex::new(Vec::new());
+    unsafe extern "system" fn proc(window: isize, message: u32, wparam: usize, lparam: isize) -> isize {
+        let previous = PREVIOUS.lock().ok().and_then(|p| p.iter().find(|(w, _)| *w == window).map(|(_, p)| *p)).unwrap_or(0);
+        let lparam = if message == WM_NCACTIVATE { -1 } else { lparam };
+        unsafe { CallWindowProcW(previous, window, message, wparam, lparam) }
+    }
+    let Ok(mut previous) = PREVIOUS.lock() else { return };
+    if previous.iter().any(|(w, _)| *w == window) {
+        return;
+    }
+    let ours = proc as unsafe extern "system" fn(isize, u32, usize, isize) -> isize as usize as isize;
+    unsafe {
+        let old = GetWindowLongPtrW(window, GWLP_WNDPROC);
+        if old != 0 && old != ours {
+            // Recorded before the swap: the first message through `proc` must find it.
+            previous.push((window, old));
+            SetWindowLongPtrW(window, GWLP_WNDPROC, ours);
         }
     }
 }
