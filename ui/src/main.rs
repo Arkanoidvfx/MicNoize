@@ -34,7 +34,8 @@ use std::{
 /// Changed defaults reach existing installs once, step by step: settings below a step's
 /// `[effects] defaults_version` get it, and every save writes the current version.
 /// 2 (0.3.16): boost 167 %, ×0.67, ×1.67, pitch −6. 3 (0.4.14): «Слышать эффекты» on.
-const EFFECT_DEFAULTS_VERSION: i32 = 3;
+/// 4 (0.4.15): AutoTune hard-tunes to the minor pentatonic; «Размер голоса» −5 replaces pitch −6.
+const EFFECT_DEFAULTS_VERSION: i32 = 4;
 fn apply_effect_defaults(settings: &mut Settings) {
     let version = settings.number("effects", "defaults_version", 1, 1, 99);
     if version >= EFFECT_DEFAULTS_VERSION {
@@ -45,7 +46,12 @@ fn apply_effect_defaults(settings: &mut Settings) {
             settings.set("effects", key, value);
         }
     }
-    settings.set("effects", "monitor_effects", 1);
+    if version < 3 {
+        settings.set("effects", "monitor_effects", 1);
+    }
+    for (key, value) in [("tune_scale", 3), ("tune_speed_ms", 0), ("pitch", 0), ("formant", -5)] {
+        settings.set("effects", key, value);
+    }
     settings.set("effects", "defaults_version", EFFECT_DEFAULTS_VERSION);
 }
 /// The effects page's two groups, by effect row: what sounds while the key is held (boost,
@@ -88,10 +94,10 @@ fn load_effect_options(settings: &Settings) -> EffectOptions {
         grain_scatter_ms: settings.number("effects", "grain_scatter_ms", 30, 0, 100),
         grain_pitch: settings.number("effects", "grain_pitch", 0, -12, 12),
         tune_root: settings.number("effects", "tune_root", 0, 0, 11),
-        tune_scale: settings.number("effects", "tune_scale", 0, 0, 2),
-        tune_speed_ms: settings.number("effects", "tune_speed_ms", 80, 5, 150),
+        tune_scale: settings.number("effects", "tune_scale", 3, 0, 3),
+        tune_speed_ms: settings.number("effects", "tune_speed_ms", 0, 0, 150),
         tune_strength: settings.number("effects", "tune_strength", 100, 0, 100),
-        formant: settings.number("effects", "formant", 0, -12, 12),
+        formant: settings.number("effects", "formant", -5, -12, 12),
     }
 }
 
@@ -837,6 +843,9 @@ struct App {
     headphone_busy: bool,
     headphone_message: String,
     engine: Engine,
+    /// What the tray and the window icon show: whether the «NEW» badge is on, and on which window.
+    tray_badged: bool,
+    icon_window: Option<(window::Id, bool)>,
     settings: Settings,
     window: Option<window::Id>,
     window_focused: bool,
@@ -1051,7 +1060,9 @@ fn exit_ui() -> Task<Msg> {
     if !cfg!(test) { unsafe { PostQuitMessage(0); } }
     iced::exit()
 }
-fn window_icon() -> window::Icon {
+/// The 64 px application icon as RGBA; with `badge`, a green «NEW» plate over its lower half
+/// marks a downloaded update in the taskbar and the tray.
+fn icon_rgba(badge: bool) -> (Vec<u8>, u32, u32) {
     let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../assets/app-64.png")));
     let mut reader = decoder
         .read_info()
@@ -1060,8 +1071,49 @@ fn window_icon() -> window::Icon {
     let info = reader
         .next_frame(&mut rgba)
         .expect("read embedded application icon");
-    window::icon::from_rgba(rgba[..info.buffer_size()].to_vec(), info.width, info.height)
-        .expect("valid embedded application icon")
+    rgba.truncate(info.buffer_size());
+    let (w, h) = (info.width, info.height);
+    if badge && info.color_type == png::ColorType::Rgba && w == 64 && h == 64 {
+        // 5×7 pixel letters at 3× scale: sharp at every size Windows scales the icon to.
+        const LETTERS: [[u8; 7]; 3] = [
+            [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+            [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+            [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        ];
+        let (top, radius) = (34i32, 5i32);
+        let mut put = |x: i32, y: i32, c: [u8; 3]| {
+            let i = ((y * 64 + x) * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+        };
+        for y in top..64 {
+            for x in 0..64 {
+                // Rounded corners; a darker rim keeps the plate visible on light taskbars.
+                let (dx, dy) = ((radius - x).max(x - 63 + radius).max(0), (top + radius - y).max(y - 63 + radius).max(0));
+                let d = dx * dx + dy * dy;
+                if d > radius * radius { continue; }
+                let rim = x == 0 || x == 63 || y == top || y == 63 || d > (radius - 1) * (radius - 1);
+                put(x, y, if rim { [0x0B, 0x5D, 0x27] } else { [0x1F, 0xB0, 0x4C] });
+            }
+        }
+        let (left, glyph_top) = (7, top + 4);
+        for (n, letter) in LETTERS.iter().enumerate() {
+            for (row, bits) in letter.iter().enumerate() {
+                for col in 0..5 {
+                    if bits >> (4 - col) & 1 == 0 { continue; }
+                    for sy in 0..3 {
+                        for sx in 0..3 {
+                            put(left + n as i32 * 17 + col * 3 + sx, glyph_top + row as i32 * 3 + sy, [0xFF, 0xFF, 0xFF]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (rgba, w, h)
+}
+fn window_icon(badge: bool) -> window::Icon {
+    let (rgba, w, h) = icon_rgba(badge);
+    window::icon::from_rgba(rgba, w, h).expect("valid embedded application icon")
 }
 impl App {
     fn window_size() -> Size {
@@ -1082,7 +1134,7 @@ impl App {
                 window::Position::Specific(iced::Point::new(c.x - size.width / 2.0, c.y - size.height / 2.0))
             }),
             visible: intro.is_none(),
-            icon: Some(window_icon()),
+            icon: Some(window_icon(false)),
             decorations: false,
             exit_on_close_request: false,
             ..Default::default()
@@ -1128,7 +1180,7 @@ impl App {
             boost: settings.number("effects", "boost", 167, 100, 2000) as f32 / 100.0,
             overload: settings.number("effects", "overload", 0, 0, 1) != 0,
             discord_volume: load_discord_volume(&settings),
-            pitch: settings.number("effects", "pitch", -6, -12, 12),
+            pitch: settings.number("effects", "pitch", 0, -12, 12),
             effects: load_effect_options(&settings),
             intensity: settings.number("audio", "intensity", 40, 0, 200) as f32 / 100.0,
             alternate_intensity: settings.number("audio", "alternate_intensity", 10, 0, 200) as f32
@@ -1457,6 +1509,8 @@ impl App {
                 rvc_delete_confirm: false,
                 update_checking: !cfg!(test),
                 last_update_check: Instant::now(),
+                tray_badged: false,
+                icon_window: None,
                 update_ready: false,
                 update_status: if cfg!(test) {
                     String::new()
@@ -2276,7 +2330,22 @@ impl App {
     fn restoring(&self) -> bool {
         self.shown_at.is_some_and(|at| at.elapsed() < Duration::from_millis(1500))
     }
+    /// Every message, then the update badge follows `update_ready` in the tray and the taskbar.
     fn update(&mut self, msg: Msg) -> Task<Msg> {
+        let task = self.update_state(msg);
+        if self.tray_badged != self.update_ready {
+            self.tray_badged = self.update_ready;
+            let (rgba, w, h) = icon_rgba(true);
+            self.engine.tray_icon(self.update_ready.then_some((&rgba[..], w, h)));
+        }
+        let Some(id) = self.window else { return task };
+        if self.icon_window.map_or(self.update_ready, |(window, badge)| window != id || badge != self.update_ready) {
+            self.icon_window = Some((id, self.update_ready));
+            return Task::batch([task, window::set_icon(id, window_icon(self.update_ready))]);
+        }
+        task
+    }
+    fn update_state(&mut self, msg: Msg) -> Task<Msg> {
         if matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize
             | Msg::WindowFocus(_, false) | Msg::SoundpadFilter(_) | Msg::SoundpadSort(_)
             | Msg::SectionSelect(_) | Msg::SoundpadRefresh | Msg::SoundpadNormalize(_)
@@ -4766,14 +4835,15 @@ impl App {
                 for &row in EFFECT_GROUPS[self.effects_group] {
                     items.extend(match row {
                         0 => vec![OVERLOAD, BOOST, BOOST_BIND, discord(0)],
-                        1 => vec![DETAIL_BASE + 1, PITCH, PITCH_BIND, discord(1)],
+                        1 => vec![DETAIL_BASE + 1, OPTION_BASE + 12, PITCH_BIND, discord(1)],
                         2 => vec![SLOW, SLOW_BIND, discord(2)],
                         3 => vec![FAST, FAST_BIND, discord(3)],
                         4 => vec![REVERSE_WORD, REVERSE_BIND, discord(4)],
                         _ => vec![DETAIL_BASE + row, OPTION_BASE + [0, 4, 5, 10][row - 5], NEW_MIC_BIND_BASE + row - 5, NEW_DISCORD_BIND_BASE + row - 5],
                     });
                     if self.effect_details == Some(row) {
-                        let options: &[usize] = match row { 1=>&[12],5=>&[1,2,3],8=>&[8,9,11],_=>&[] };
+                        if row == 1 { items.push(PITCH); }
+                        let options: &[usize] = match row { 5=>&[1,2,3],8=>&[8,9,11],_=>&[] };
                         items.extend(options.iter().map(|&i| OPTION_BASE + i));
                     }
                 }
@@ -5204,8 +5274,10 @@ impl App {
                 }
                 PITCH_BIND if activate => Msg::Bind(1),
                 f if activate && (DETAIL_BASE..DETAIL_BASE+9).contains(&f) => Msg::EffectDetails(f-DETAIL_BASE),
-                f if delta != 0 && (OPTION_BASE..OPTION_BASE+13).contains(&f) =>
-                    Msg::EffectOption(f-OPTION_BASE,(self.controls.effects.value(f-OPTION_BASE)+delta) as f32),
+                f if delta != 0 && (OPTION_BASE..OPTION_BASE+13).contains(&f) => {
+                    let delta = if f == OPTION_BASE + 10 { -delta } else { delta };
+                    Msg::EffectOption(f-OPTION_BASE,(self.controls.effects.value(f-OPTION_BASE)+delta) as f32)
+                }
                 f if activate && (NEW_MIC_BIND_BASE..NEW_MIC_BIND_BASE+4).contains(&f) => Msg::Bind(13+f-NEW_MIC_BIND_BASE),
                 f if activate && (NEW_DISCORD_BIND_BASE..NEW_DISCORD_BIND_BASE+4).contains(&f) => Msg::Bind(17+f-NEW_DISCORD_BIND_BASE),
                 CLIP_TO_SOUNDPAD if activate => match self.clip_menu {
@@ -5414,7 +5486,7 @@ mod controller_tests {
     use super::*;
     #[test]
     fn extended_effect_settings_and_bindings() {
-        let ini="[effects]\npitch=3\ndefaults_version=2\necho_delay_ms=1500\ngrain_pitch=-7\ntune_scale=2\nformant=5\necho_key=130\ngranular_key=131\ndiscord_granular_key=130\ndiscord_autotune_key=131";
+        let ini="[effects]\npitch=3\ndefaults_version=4\necho_delay_ms=1500\ngrain_pitch=-7\ntune_scale=2\nformant=5\necho_key=130\ngranular_key=131\ndiscord_granular_key=130\ndiscord_autotune_key=131";
         let (mut app, _) = App::from_settings(Settings::for_test(ini)).unwrap().unwrap();
         assert_eq!(app.controls.pitch,3);
         assert_eq!((app.controls.effects.echo_delay_ms,app.controls.effects.grain_pitch,
@@ -5679,7 +5751,7 @@ mod controller_tests {
     fn discord_volume_uses_the_new_scale_and_migrates_legacy_eight_percent() {
         let (defaults, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         assert_eq!(defaults.controls.boost, 1.67);
-        assert_eq!((defaults.controls.slow, defaults.controls.fast, defaults.controls.pitch), (0.67, 1.67, -6), "first-install effect defaults");
+        assert_eq!((defaults.controls.slow, defaults.controls.fast, defaults.controls.pitch), (0.67, 1.67, 0), "first-install effect defaults");
         assert!(!defaults.controls.overload);
         assert!((defaults.controls.discord_volume - 0.08).abs() < 0.0001);
         assert!((defaults.studio_gain() - 0.08).abs() < 0.0001);
@@ -5727,13 +5799,14 @@ pitch=-5
 overload=1";
         let (app, _) = App::from_settings(Settings::for_test(old)).unwrap().unwrap();
         let c = app.controls;
-        assert_eq!((c.boost, c.slow, c.fast, c.pitch, c.overload), (1.67, 0.67, 1.67, -6, true), "once, other settings kept");
+        assert_eq!((c.boost, c.slow, c.fast, c.pitch, c.overload), (1.67, 0.67, 1.67, 0, true), "once, other settings kept");
+        assert_eq!((c.effects.tune_scale, c.effects.tune_speed_ms, c.effects.formant), (3, 0, -5), "hard tune and voice size reach old settings");
         let chosen = "[effects]
 boost=500
 slow_speed=80
 fast_speed=120
 pitch=3
-defaults_version=2";
+defaults_version=4";
         let (app, _) = App::from_settings(Settings::for_test(chosen)).unwrap().unwrap();
         let c = app.controls;
         assert_eq!((c.boost, c.slow, c.fast, c.pitch), (5.0, 0.8, 1.2, 3), "never again after that");
@@ -6088,6 +6161,26 @@ page_pixelate=0")).unwrap().unwrap();
         assert!(app.restart.is_none(),"a failed preparation brings the button back");
         assert_eq!(app.snapshot.state,2);assert!(!app.quitting && !app.apply_pending && !app.apply_after_quit);
         assert!(app.update_status.contains("invalid bundle"));
+    }
+    #[test]
+    fn downloaded_update_badges_the_icon() {
+        let (plain, _, _) = icon_rgba(false);
+        let (badged, w, h) = icon_rgba(true);
+        assert_eq!((w, h), (64, 64));
+        assert_ne!(plain, badged);
+        let pixel = |x: usize, y: usize| badged[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].to_vec();
+        assert_eq!(pixel(7, 38), [255, 255, 255, 255], "the N of «NEW»");
+        assert_eq!(pixel(32, 62), [0x1F, 0xB0, 0x4C, 255], "the green plate");
+        assert_eq!(pixel(32, 10), plain[(10 * 64 + 32) * 4..(10 * 64 + 32) * 4 + 4].to_vec(), "the logo above stays");
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let _ = app.update(Msg::Page(0));
+        assert!(!app.tray_badged);
+        app.update_ready = true;
+        let _ = app.update(Msg::Page(0));
+        assert!(app.tray_badged, "a ready update puts the badge on the tray");
+        app.update_ready = false;
+        let _ = app.update(Msg::Page(0));
+        assert!(!app.tray_badged, "and takes it off again");
     }
     #[test]
     fn boost_monitor_is_independent_and_defaults_off() {

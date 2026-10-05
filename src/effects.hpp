@@ -365,13 +365,19 @@ public:
     }
 };
 // 40 ms of 12 kHz samples, updated every 10 ms. A voiced YIN minimum controls one live shifter.
+// Speed 0 snaps to the note at once (the robotic hard tune). A held note changes only when another
+// scale note is clearly nearer, so it does not flicker between two notes; through short unvoiced gaps
+// (consonants, breath) the last correction holds for 120 ms, then eases back to neutral.
 class AutoTunePitch {
+    static constexpr unsigned scales[4]={0xFFF,0xAB5,0x5AD,0x4A9}; // chromatic, major, minor, minor pentatonic
     std::array<float,480> history_{};
     size_t write_=0,filled_=0;
     float correction_=0;
+    int target_=-1000;
+    unsigned silentMs_=0;
     bool voiced_=false;
 public:
-    void reset(){write_=filled_=0;correction_=0;voiced_=false;}
+    void reset(){write_=filled_=0;correction_=0;target_=-1000;silentMs_=0;voiced_=false;}
     bool voiced() const{return voiced_;}
     float process(const float* data,size_t n,bool held,int manual,int root,int scale,unsigned speed,unsigned strength){
         for(size_t i=0;i<n;i+=4){
@@ -379,13 +385,15 @@ public:
             history_[write_]=sample/4;write_=(write_+1)%history_.size();filled_=std::min(filled_+1,history_.size());
         }
         voiced_=false;
-        if(!held){correction_=0;return 0;}
+        if(!held){correction_=0;target_=-1000;silentMs_=0;return 0;}
         float desired=0;
         if(filled_==history_.size()){
             std::array<float,151> difference{},normalized{};
-            double energy=0;
-            for(size_t i=0;i<history_.size();++i){const float v=history_[(write_+i)%history_.size()];energy+=v*v;}
-            if(energy/history_.size()>0.000016){
+            double energy=0;std::array<double,4> quarter{};
+            for(size_t i=0;i<history_.size();++i){const float v=history_[(write_+i)%history_.size()];energy+=v*v;quarter[i/120]+=v*v;}
+            // A window that is partly silent (voice starting or stopping) gives a false period: skip it.
+            const bool steady=*std::min_element(quarter.begin(),quarter.end())>0.1*energy/4;
+            if(energy/history_.size()>0.000016 && steady){
                 double running=0;int chosen=0;float best=1;
                 for(int lag=15;lag<=150;++lag){
                     double d=0;
@@ -401,24 +409,27 @@ public:
                     const float curve=left-2*middle+right;
                     const float offset=std::abs(curve)>1e-9f?std::clamp(0.5f*(left-right)/curve,-0.5f,0.5f):0;
                     const float midi=69+12*std::log2((12000.0f/(chosen+offset))/440.0f)+manual;
+                    const unsigned mask=scales[std::clamp(scale,0,3)];
+                    const auto allowed=[&](int note){return (mask>>static_cast<unsigned>((note-root%12+1200)%12)&1)!=0;};
                     const int center=static_cast<int>(std::round(midi));
-                    int target=center;float distance=100;
-                    constexpr unsigned major=0xAB5,minor=0x5AD;
-                    for(int note=center-12;note<=center+12;++note){
-                        const unsigned degree=static_cast<unsigned>((note-root%12+1200)%12);
-                        if(scale==0 || ((scale==1?major:minor)>>degree&1)){
-                            const float delta=std::abs(note-midi);
-                            if(delta<distance){distance=delta;target=note;}
-                        }
-                    }
-                    desired=std::clamp(target-midi,-2.0f,2.0f)*std::clamp(strength,0u,100u)/100.0f;
+                    int nearest=center;float distance=100;
+                    for(int note=center-6;note<=center+6;++note)
+                        if(allowed(note)&&std::abs(note-midi)<distance){distance=std::abs(note-midi);nearest=note;}
+                    // Hysteresis: keep the held note until another is nearer by a quarter tone.
+                    if(target_<-999||!allowed(target_)||std::abs(target_-midi)>distance+0.25f)target_=nearest;
+                    desired=std::clamp(target_-midi,-4.0f,4.0f)*std::clamp(strength,0u,100u)/100.0f;
                     voiced_=true;
                 }
             }
         }
-        // Keep the delayed stream continuous through consonants; return to neutral smoothly.
-        const float alpha=1-std::exp(-10.0f/(voiced_?std::clamp(speed,5u,150u):60u));
-        correction_+=alpha*(desired-correction_);
+        if(voiced_){
+            silentMs_=0;
+            correction_=speed==0?desired:correction_+(1-std::exp(-10.0f/std::min(speed,150u)))*(desired-correction_);
+        }else if((silentMs_+=10)>120){
+            // Keep the delayed stream continuous through consonants; return to neutral smoothly.
+            target_=-1000;
+            correction_+=(1-std::exp(-10.0f/60))*(0-correction_);
+        }
         return correction_;
     }
 };

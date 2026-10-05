@@ -462,6 +462,14 @@ fn meter<'a>(level: f32, color: Color) -> Element<'a, Msg> {
 /// The hero recording's bars, as in the mockup: a stable pseudo-waveform per clip (the real
 /// samples are not decoded for the UI), filled with the slider gradient as it plays.
 /// `progress` is (fraction, backwards): a reversed recording fills from the right.
+/// «Размер голоса»: lower formants sound like a bigger speaker.
+fn voice_size(v: f32) -> String {
+    match v.round() as i32 {
+        0 => "как есть".into(),
+        n if n < 0 => format!("крупнее {}", -n),
+        n => format!("мельче {n}"),
+    }
+}
 fn panel_row<'a>(name: Element<'a, Msg>, control: Element<'a, Msg>) -> widget::Row<'a, Msg> {
     row![container(name).width(112), control].spacing(12).align_y(iced::Center).height(34)
 }
@@ -1593,19 +1601,20 @@ impl App {
                     BOOST_BIND,
                     self.snapshot.boost_active != 0,
                 ),
+                // Formants only: the same voice sounds bigger (left) or smaller (right); tone in the details.
                 1 => (
-                    "Formant Shift",
-                    glyph::NOTE,
-                    action(medium("тон · форманты", 11, DIM), Msg::EffectDetails(1), self.focus == DETAIL_BASE + 1, false).into(),
+                    "Размер голоса",
+                    glyph::VOICE,
+                    action(medium("тон", 11, DIM), Msg::EffectDetails(1), self.focus == DETAIL_BASE + 1, false).into(),
                     frame(
-                        tacho(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch, clock)
-                            .default(-6.0)
+                        tacho(-12.0..=12.0, self.controls.effects.formant as f32, |v| Msg::EffectOption(12, v), clock)
+                            .default(-5.0)
                             .origin(0.0)
                             .segments(16)
                             .compact()
                             .phase(150.0)
-                            .format(|v| format!("{:+.0}", v)),
-                        self.ring(self.focus == PITCH),
+                            .format(voice_size),
+                        self.ring(self.focus == OPTION_BASE + 12),
                     ),
                     PITCH_BIND,
                     self.effect_activity & ((1 << 1) | (1 << 6)) != 0,
@@ -1673,9 +1682,10 @@ impl App {
                 _ => (
                     "AutoTune", glyph::NOTE,
                     action(medium("тональность · гамма", 11, DIM), Msg::EffectDetails(8), self.focus == DETAIL_BASE + 8, false).into(),
-                    frame(tacho(5.0..=150.0, self.controls.effects.tune_speed_ms as f32,
-                        |v| Msg::EffectOption(10, v), clock).default(80.0).compact()
-                        .format(|v| format!("{v:.0} мс")), self.ring(self.focus == OPTION_BASE + 10)),
+                    // Mirrored like «Замедление»: the instant robot tune is the strongest, on the right.
+                    frame(tacho(-150.0..=0.0, -(self.controls.effects.tune_speed_ms as f32),
+                        |v| Msg::EffectOption(10, -v), clock).default(0.0).compact()
+                        .format(|v| if v > -0.5 { "робот".into() } else { format!("{:.0} мс", -v) }), self.ring(self.focus == OPTION_BASE + 10)),
                     NEW_MIC_BIND_BASE + 3, self.effect_activity & ((1 << 13) | (1 << 17)) != 0,
                 ),
             };
@@ -1879,8 +1889,18 @@ impl App {
 
     fn effect_detail(&self, row: usize) -> Element<'_, Msg> {
         use focus::effects::OPTION_BASE;
+        if row == 1 {
+            let tone = tacho(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch, self.clock())
+                .default(0.0)
+                .origin(0.0)
+                .compact()
+                .format(|v| format!("{v:+.0}"));
+            return card(row![
+                column![label("Тон", 11, DIM), frame(tone, self.ring(self.focus == focus::effects::PITCH))].spacing(4).width(Length::Fill),
+                caption("Размер меняет тембр, тон меняет высоту. Для великана: размер влево и тон вниз.").width(Length::Fill),
+            ].spacing(16).align_y(iced::Center)).padding([12, 16]).into();
+        }
         let options: &[(usize, &str)] = match row {
-            1 => &[(12, "Форманты")],
             5 => &[(1, "Повторы"), (2, "Затухание"), (3, "Уровень")],
             8 => &[(8, "Тоника"), (9, "Гамма"), (11, "Сила")],
             _ => &[],
@@ -1898,8 +1918,8 @@ impl App {
                 .compact()
                 .format(move |v| match index {
                     8 => ["C","C♯","D","D♯","E","F","F♯","G","G♯","A","A♯","B"][(v.round() as usize).min(11)].into(),
-                    9 => ["Хроматика","Мажор","Минор"][(v.round() as usize).min(2)].into(),
-                    7 | 12 => format!("{v:+.0}"),
+                    9 => ["Хроматика","Мажор","Минор","Пента"][(v.round() as usize).min(3)].into(),
+                    7 => format!("{v:+.0}"),
                     1 => format!("{v:.0}"),
                     6 => format!("{v:.0} мс"),
                     _ => format!("{v:.0} %"),
@@ -3821,6 +3841,16 @@ mod tests {
             return;
         }
         if std::env::var_os("MNR_CLIPS_ONLY").is_some() {
+            // The update badge at 4×, nearest-neighbour, as the taskbar would scale a 64 px icon.
+            let (icon, w, h) = super::icon_rgba(true);
+            let big: Vec<u8> = (0..h * 4).flat_map(|y| (0..w * 4).flat_map(move |x| {
+                let i = (((y / 4) * w + x / 4) * 4) as usize;
+                [i, i + 1, i + 2, i + 3]
+            })).map(|i| icon[i]).collect();
+            let mut encoder = png::Encoder::new(std::fs::File::create(dir.join("design-icon-new.png")).unwrap(), w * 4, h * 4);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&big).unwrap();
             app.clips = ["19-41-07", "19-40-59", "18-27-17", "18-27-12", "18-19-52", "17-21-34"].iter().map(|t| Sound {
                 name: format!("Запись 2026-10-04 {t}.wav"),
                 path: PathBuf::new(),
@@ -3844,6 +3874,11 @@ mod tests {
             app.page_shift = None;
             scale.set(1.0);
             render(&app, "effects-save-menu");
+            app.clip_menu = None;
+            for (row, name) in [(1, "effects-size"), (8, "effects-tune")] {
+                app.effect_details = Some(row);
+                render(&app, name);
+            }
             return;
         }
         if std::env::var_os("MNR_GATE_ONLY").is_some() {

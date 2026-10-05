@@ -70,6 +70,8 @@ void mnr_capture_key(Mnr*,int32_t enabled);
 uint32_t mnr_events(Mnr*);
 int32_t mnr_shell_start(Mnr*,char* error,uint32_t capacity);
 void mnr_tray_hint(Mnr*);
+// Tray picture: RGBA rows top-down, at most 256x256; null restores the application icon.
+void mnr_tray_icon(Mnr*,const uint8_t* rgba,uint32_t width,uint32_t height);
 int32_t mnr_replace_file(const char* from,uint32_t from_len,const char* to,uint32_t to_len);
 void mnr_usage(uint64_t* cpu_100ns,uint64_t* working_set);
 // Soundpad. Clips are 48 kHz mono float, at most 5 minutes; id 0 means "stop" everywhere.

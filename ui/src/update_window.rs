@@ -326,7 +326,7 @@ pub fn watch(runtime: PathBuf, center: Option<Point>, versions: Option<(String, 
                 visible: false,
                 resizable: false,
                 decorations: false,
-                icon: Some(crate::window_icon()),
+                icon: Some(crate::window_icon(false)),
                 ..Default::default()
             });
             (watcher, open.map(WatchMsg::Opened))

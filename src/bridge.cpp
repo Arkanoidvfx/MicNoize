@@ -28,9 +28,14 @@ struct Mnr {
     bool locked=false,suspended=false;
     NOTIFYICONDATAW tray{};
     UINT taskbar=0;
+    // The UI's tray picture (the update badge): handed over here, applied on the shell thread.
+    std::mutex iconMutex;
+    HICON wantedIcon=nullptr,customIcon=nullptr;
+    bool iconPending=false;
     ~Mnr() {
         if(shell.joinable()) {shell.request_stop(); if(auto w=window.load()) PostMessageW(w,WM_APP+4,0,0); shell.join();}
         if(instance) CloseHandle(instance);
+        if(wantedIcon) DestroyIcon(wantedIcon);
     }
 };
 static void copy(const std::string& text,char* out,uint32_t capacity) {
@@ -169,8 +174,8 @@ extern "C" void mnr_effect_options(Mnr* p,const MnrEffectOptions* o) {
        o->echo_decay<0||o->echo_decay>90||o->echo_level<0||o->echo_level>100||
        o->stutter_ms<50||o->stutter_ms>300||o->grain_ms<30||o->grain_ms>150||
        o->grain_scatter_ms<0||o->grain_scatter_ms>100||o->grain_pitch< -12||o->grain_pitch>12||
-       o->tune_root<0||o->tune_root>11||o->tune_scale<0||o->tune_scale>2||
-       o->tune_speed_ms<5||o->tune_speed_ms>150||o->tune_strength<0||o->tune_strength>100||
+       o->tune_root<0||o->tune_root>11||o->tune_scale<0||o->tune_scale>3||
+       o->tune_speed_ms<0||o->tune_speed_ms>150||o->tune_strength<0||o->tune_strength>100||
        o->formant< -12||o->formant>12)return;
     auto& e=p->engine;
     e.echoDelayMs=o->echo_delay_ms;e.echoRepeats=o->echo_repeats;e.echoDecay=o->echo_decay;e.echoLevel=o->echo_level;
@@ -376,6 +381,41 @@ static HICON trayIcon() {
     auto icon=static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_SHARED));
     return icon?icon:LoadIconW(nullptr,IDI_APPLICATION);
 }
+// Shell thread: take the UI's latest picture (or the default) and show it in the tray.
+static void applyTrayIcon(Mnr* p) {
+    HICON next=nullptr;
+    {std::lock_guard lock(p->iconMutex); if(!p->iconPending) return; next=p->wantedIcon; p->wantedIcon=nullptr; p->iconPending=false;}
+    const HICON old=p->customIcon;
+    p->customIcon=next;
+    p->tray.hIcon=next?next:trayIcon();
+    p->tray.uFlags=NIF_ICON;
+    Shell_NotifyIconW(NIM_MODIFY,&p->tray);
+    if(old) DestroyIcon(old);
+}
+// RGBA, rows top-down; null pixels restore the application icon.
+extern "C" void mnr_tray_icon(Mnr* p,const uint8_t* rgba,uint32_t width,uint32_t height) {
+    if(!p || (rgba && (width==0 || height==0 || width>256 || height>256))) return;
+    HICON icon=nullptr;
+    if(rgba) {
+        BITMAPINFO info{};info.bmiHeader.biSize=sizeof(info.bmiHeader);info.bmiHeader.biWidth=static_cast<LONG>(width);
+        info.bmiHeader.biHeight=-static_cast<LONG>(height);info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+        void* bits=nullptr;
+        HBITMAP color=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+        std::vector<uint8_t> zeros(((width+15)/16*2)*height);
+        HBITMAP mask=CreateBitmap(static_cast<int>(width),static_cast<int>(height),1,1,zeros.data());
+        if(color && mask && bits) {
+            auto* out=static_cast<uint8_t*>(bits);
+            for(size_t i=0;i<size_t(width)*height;++i){out[i*4]=rgba[i*4+2];out[i*4+1]=rgba[i*4+1];out[i*4+2]=rgba[i*4];out[i*4+3]=rgba[i*4+3];}
+            ICONINFO ii{};ii.fIcon=TRUE;ii.hbmMask=mask;ii.hbmColor=color;
+            icon=CreateIconIndirect(&ii);
+        }
+        if(color) DeleteObject(color);
+        if(mask) DeleteObject(mask);
+        if(!icon) return;
+    }
+    {std::lock_guard lock(p->iconMutex); if(p->wantedIcon) DestroyIcon(p->wantedIcon); p->wantedIcon=icon; p->iconPending=true;}
+    if(auto w=p->window.load()) PostMessageW(w,WM_APP+5,0,0);
+}
 static LRESULT CALLBACK shellProc(HWND w,UINT message,WPARAM wp,LPARAM lp) {
     auto p=reinterpret_cast<Mnr*>(GetWindowLongPtrW(w,GWLP_USERDATA));
     if(message==WM_NCCREATE) {p=static_cast<Mnr*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(p));}
@@ -383,6 +423,7 @@ static LRESULT CALLBACK shellProc(HWND w,UINT message,WPARAM wp,LPARAM lp) {
     if(message==p->taskbar && p->taskbar) {addTray(p);return 0;}
     switch(message) {
     case WM_APP+4: EndMenu();return 0;
+    case WM_APP+5: applyTrayIcon(p);return 0;
     case WM_APP+2: p->events.fetch_or(1);return 0;
     case WM_APP+3:
         p->tray.uFlags=NIF_INFO;
@@ -446,7 +487,7 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
             p->window=w;p->taskbar=RegisterWindowMessageW(L"TaskbarCreated");
             WTSRegisterSessionNotification(w,NOTIFY_FOR_THIS_SESSION);
             p->tray.cbSize=sizeof(p->tray);p->tray.hWnd=w;p->tray.uID=1;p->tray.uCallbackMessage=WM_APP+1;
-            p->tray.hIcon=trayIcon();wcscpy_s(p->tray.szTip,L"Mic Noize");addTray(p);
+            p->tray.hIcon=trayIcon();wcscpy_s(p->tray.szTip,L"Mic Noize");addTray(p);applyTrayIcon(p);
             mic::HoldLatch latch,replayLatch,noiseLatch; unsigned previousReplay=0; bool monitorArmed=false,captureArmed=false,capturedThisSession=false;unsigned captureGeneration=0;
             std::vector<std::pair<unsigned,unsigned>> soundKeys;std::vector<bool> soundArmed;unsigned soundGeneration=0;
             bool desktop=true;ULONGLONG lastDesktop=0,lastTick=GetTickCount64();
@@ -498,6 +539,7 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
                 }
             }
             p->engine.releaseEffects();Shell_NotifyIconW(NIM_DELETE,&p->tray);
+            if(p->customIcon) {DestroyIcon(p->customIcon);p->customIcon=nullptr;}
             WTSUnRegisterSessionNotification(w);DestroyWindow(w);p->window=nullptr;
         });
         return 1;

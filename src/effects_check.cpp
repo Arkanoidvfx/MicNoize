@@ -213,6 +213,34 @@ int main() {try {
         require(voice.back()==0.2f&&!continuous.active(),"AutoTune release lost dry bypass");
         continuous.reset();voice.fill(0);continuous.processAdvanced(voice.data(),480,0,0,true);
         require(std::all_of(voice.begin(),voice.end(),[](float v){return v==0;}),"AutoTune reset leaked old source");
+        {
+            // Hard tune: speed 0 lands on the scale note at once, holds it against small drift and
+            // through a short gap, and changes only when another note is clearly nearer.
+            mic::AutoTunePitch hard;double phase=0;
+            const auto sing=[&](float midi,int blocks,int scale){
+                float c=0;
+                for(int block=0;block<blocks;++block){
+                    for(int i=0;i<480;++i){phase+=6.28318530718*440*std::exp2((midi-69)/12)/48000;voice[i]=0.3f*static_cast<float>(std::sin(phase));}
+                    c=hard.process(voice.data(),480,true,0,0,scale,0,100);
+                }
+                return c;
+            };
+            float c=sing(69.45f,8,3); // C minor pentatonic: A4 is not in it, B♭4 is nearest.
+            require(std::abs(c-0.55f)<0.12f,"Hard tune did not land on B-flat");
+            hard.reset();phase=0;
+            c=sing(69.4f,8,0);
+            require(std::abs(c+0.4f)<0.12f,"Hard tune did not land on A");
+            c=sing(69.6f,4,0);
+            require(std::abs(c+0.6f)<0.12f,"Hard tune flickered to the next note on small drift");
+            c=sing(69.85f,4,0);
+            require(std::abs(c-0.15f)<0.12f,"Hard tune did not move to the clearly nearer note");
+            voice.fill(0);
+            const float before=c;
+            for(int i=0;i<10;++i)c=hard.process(voice.data(),480,true,0,0,0,0,100);
+            require(std::abs(c-before)<0.05f,"Hard tune dropped the note in a 100 ms gap");
+            for(int i=0;i<60;++i)c=hard.process(voice.data(),480,true,0,0,0,0,100);
+            require(std::abs(c)<0.01f,"Hard tune did not ease back after the gap");
+        }
         mic::PitchEffect formant;unsigned crossings=0;float previous=0;
         for(int block=0;block<180;++block){
             for(int i=0;i<480;++i)voice[i]=0.2f*std::sin(6.28318530718f*440*(block*480+i)/48000);
@@ -220,7 +248,7 @@ int main() {try {
             if(block>80)for(float sample:voice){if(previous<=0&&sample>0)++crossings;previous=sample;}
         }
         require(std::abs(crossings/0.99f-440)<20,"Formant shift changed fundamental pitch");
-        std::cout<<"autotune=passed formant=passed\n";
+        std::cout<<"autotune=passed hardtune=passed formant=passed\n";
     }
     std::array<float,480> original{},data{};
     {
