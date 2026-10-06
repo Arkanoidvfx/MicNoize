@@ -24,6 +24,24 @@
 #include "tag.hpp"
 #include "effects.hpp"
 
+// Undocumented but stable since Windows 7 (Sound control panel, SoundSwitch, EarTrumpet):
+// the only way to set the default endpoint. Only the vtable order matters here.
+struct __declspec(uuid("f8679f50-850a-41cf-9c72-430f290290c8")) IPolicyConfig : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetMixFormat(PCWSTR,WAVEFORMATEX**)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetDeviceFormat(PCWSTR,INT,WAVEFORMATEX**)=0;
+    virtual HRESULT STDMETHODCALLTYPE ResetDeviceFormat(PCWSTR)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR,WAVEFORMATEX*,WAVEFORMATEX*)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetProcessingPeriod(PCWSTR,INT,PINT64,PINT64)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR,PINT64)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR,void*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR,void*)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR,const PROPERTYKEY&,PROPVARIANT*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR,const PROPERTYKEY&,PROPVARIANT*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR,ERole)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR,INT)=0;
+};
+class __declspec(uuid("870af99c-171d-4f9e-af0d-e63df40c2bc9")) CPolicyConfigClient;
+
 namespace mic {
 using Microsoft::WRL::ComPtr;
 // Windows invalidates an endpoint when it is unplugged, disabled or switches format.
@@ -38,6 +56,28 @@ static void check(HRESULT hr, const char* where) {
 struct Com {
     Com() { check(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM initialization"); }
     ~Com() { CoUninitialize(); }
+};
+// Discord grabs a physical microphone again when its loose cable reconnects. With Discord's
+// input on "Default" it stays on Mic Noize only while Mic Noize is the Windows default, so a
+// running TAG session keeps it the default for every role. Best effort: never fails audio.
+struct DefaultMicrophone {
+    ComPtr<IMMDeviceEnumerator> devices;
+    ComPtr<IPolicyConfig> policy;
+    bool broken=false;
+    void hold(const std::wstring& endpoint) noexcept {
+        if(broken || endpoint.empty()) return;
+        if(!devices && FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&devices)))) {broken=true;return;}
+        for(const auto role:{eConsole,eMultimedia,eCommunications}) {
+            ComPtr<IMMDevice> current;LPWSTR id=nullptr;
+            if(SUCCEEDED(devices->GetDefaultAudioEndpoint(eCapture,role,&current)) && SUCCEEDED(current->GetId(&id))) {
+                const bool same=_wcsicmp(id,endpoint.c_str())==0;CoTaskMemFree(id);
+                if(same) continue;
+            }
+            // ponytail: a rejected call stops the guard for this session, not retried every tick.
+            if((!policy && FAILED(CoCreateInstance(__uuidof(CPolicyConfigClient),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&policy)))) ||
+               FAILED(policy->SetDefaultEndpoint(endpoint.c_str(),role))) {broken=true;return;}
+        }
+    }
 };
 struct Event {
     HANDLE h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -867,7 +907,10 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
             std::promise<float> ready;auto result=ready.get_future();
             tagLevelThread_=std::thread([this,ready=std::move(ready)]() mutable {
                 bool initialized=false;
+                const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+                struct Uninitialize {HRESULT hr;~Uninitialize(){if(SUCCEEDED(hr))CoUninitialize();}} uninitialize{com};
                 try {
+                    DefaultMicrophone defaults;defaults.broken=FAILED(com);
                     TagEndpointStatus endpoint;
                     auto read=[&] {
                         if(!readTagEndpointStatus(endpoint) || !endpoint.ready || !std::isfinite(endpoint.compensation) || endpoint.compensation<=0 || endpoint.compensation>1)
@@ -875,10 +918,12 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
                     };
                     read();const std::wstring identity=endpoint.endpoint;
                     ready.set_value(endpoint.compensation);initialized=true;
-                    while(WaitForSingleObject(stop_,100)==WAIT_TIMEOUT) {
+                    defaults.hold(identity);
+                    for(unsigned tick=1;WaitForSingleObject(stop_,100)==WAIT_TIMEOUT;++tick) {
                         read();
                         if(identity!=endpoint.endpoint)throw std::runtime_error("TAG endpoint changed; reconnect processing");
                         tagLevelCompensation_=endpoint.compensation;
+                        if(tick%5==0) defaults.hold(identity);
                     }
                 } catch(const std::exception& error) {
                     if(initialized) fail(error);

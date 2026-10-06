@@ -931,7 +931,12 @@ impl App {
                     row![
                         fixed(glyph::CHIP, "Обработка", processing.clone(), gpu),
                         icon(glyph::RIGHT, 12, ORANGE),
-                        fixed(glyph::OUTPUT, "Выход", output.clone(), "Выберите его микрофоном в Discord".into()),
+                        fixed(glyph::OUTPUT, "Выход", output.clone(), if self.output.as_ref().is_some_and(|o| o.id == "TAG") {
+                            // Mic Noize holds the Windows default: Discord on «По умолчанию» survives a replugged microphone.
+                            "В Discord выберите «По умолчанию»".into()
+                        } else {
+                            "Выберите его микрофоном в Discord".into()
+                        }),
                     ]
                     .spacing(14)
                     .align_y(iced::Center),
