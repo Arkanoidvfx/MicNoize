@@ -1,6 +1,6 @@
 [package]
 name = "micnoize"
-version = "0.4.17"
+version = "0.4.18"
 edition = "2024"
 rust-version = "1.97"
 build = "build.rs"
@@ -17,6 +17,8 @@ iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["g
 # Iced's rasterizer, used directly to paint pages offscreen for the page-switch pixelation.
 tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
 png = "0.18"
+# Component archives are .tar.zst; tar.exe before Windows 11 23H2 cannot read zstd.
+ruzstd = "0.9"
 hex = "0.4"
 hmac = "0.12"
 ndarray = "0.15"

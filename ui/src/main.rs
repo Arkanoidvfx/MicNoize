@@ -3496,7 +3496,10 @@ impl App {
                     // The note carries what the log files cannot: what the UI last showed.
                     let note = format!(
                         "state={} driver={} core={} message={}",
-                        self.snapshot.state, self.driver_ready, !self.core_installing, self.message
+                        self.snapshot.state,
+                        self.driver_ready,
+                        components::core_installed(&self.component_root),
+                        self.message
                     );
                     self.report_sending = true;
                     self.message = "Отправляем логи…".into();

@@ -456,34 +456,56 @@ fn assemble(parts: &[PathBuf], archive: &Path, expected: &str) -> Result<(), Str
 }
 
 /// Unpacks through tar's standard input; tar reads as it writes, so the bytes fed track it.
+/// zstd is decoded here: tar.exe before Windows 11 23H2 reads plain tar but not zstd.
+/// tar's errors go to a file, not a pipe nobody drains while the archive is fed.
 fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
+    let log = archive.with_extension("log");
     let mut tar = Command::new("tar.exe")
         .args(["-xf", "-", "-C"])
         .arg(stage)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(File::create(&log).map_err(|e| e.to_string())?)
         .creation_flags(NO_WINDOW)
         .spawn()
         .map_err(|e| e.to_string())?;
     let fed = feed(archive, tar.stdin.take().ok_or("tar без stdin")?);
     let status = tar.wait().map_err(|e| e.to_string())?;
+    let errors = std::fs::read_to_string(&log).unwrap_or_default();
     match fed {
         Ok(()) if status.success() => Ok(()),
-        _ => Err("Не удалось распаковать компонент".into()),
+        fed => Err(unpack_error(fed.err(), status.code(), &errors)),
     }
 }
-/// A tar that stops early breaks the pipe; its exit status then tells the error.
+
+/// tar's own last error is the most useful; a broken pipe only means tar stopped first.
+fn unpack_error(fed: Option<std::io::Error>, code: Option<i32>, errors: &str) -> String {
+    let detail = match errors.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+        Some(line) => line.chars().take(300).collect(),
+        None => match fed {
+            Some(e) => e.to_string(),
+            None => format!("tar завершился с кодом {code:?}"),
+        },
+    };
+    format!("Не удалось распаковать компонент: {detail}")
+}
+
 fn feed(archive: &Path, mut input: ChildStdin) -> std::io::Result<()> {
-    let mut file = File::open(archive)?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(());
-        }
-        input.write_all(&buffer[..count])?;
+    let compressed = std::io::BufReader::with_capacity(1024 * 1024, Counted(File::open(archive)?));
+    let mut tar =
+        ruzstd::decoding::StreamingDecoder::new(compressed).map_err(std::io::Error::other)?;
+    std::io::copy(&mut tar, &mut input)?;
+    Ok(())
+}
+
+/// Counts the compressed bytes read, the same units the download and SHA-256 stages count.
+struct Counted(File);
+
+impl Read for Counted {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.0.read(buffer)?;
         DONE.fetch_add(count as u64, Ordering::Relaxed);
+        Ok(count)
     }
 }
 
@@ -602,7 +624,9 @@ mod tests {
         assert_eq!(std::fs::read(out.join("vendor/x.dll")).unwrap().len(), 300_000);
         std::fs::write(&archive, b"not an archive").unwrap();
         std::fs::create_dir_all(root.join("bad")).unwrap();
-        assert!(unpack(&archive, &root.join("bad")).is_err());
+        let error = unpack(&archive, &root.join("bad")).unwrap_err();
+        assert!(error.starts_with("Не удалось распаковать компонент: ") && error.len() > 70, "{error}");
+        assert_eq!(unpack_error(None, Some(1), "\r\ntar.exe: Error opening archive\r\n\r\n"), "Не удалось распаковать компонент: tar.exe: Error opening archive");
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
