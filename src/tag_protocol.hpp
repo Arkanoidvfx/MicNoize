@@ -14,6 +14,7 @@ struct TagRecoveryBudget {
     ULONGLONG missingAt=0;
     bool current(const GUID& expected)const{return active && generation!=GUID_NULL && generation==expected;}
     bool take(const GUID& expected){if(!current(expected) || used>=3)return false;++used;return true;}
+    void refresh(){used=0;missingAt=0;}
 };
 inline bool tagTransientStartup(std::string_view error) {
     return error.find("0x80070490")!=error.npos || error.find("0x8007048F")!=error.npos ||

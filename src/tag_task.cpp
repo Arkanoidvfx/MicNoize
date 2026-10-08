@@ -456,15 +456,13 @@ void runTagTask() {
     if(tagMaintenancePending())throw std::runtime_error("Mic Noize device maintenance in progress");
     Task current;if(!current.task)throw std::runtime_error("Host task missing");
     struct Close {HANDLE h;~Close(){if(h)CloseHandle(h);}} process{tagHostProcess(0)};
-    bool retainWorker=false;
     if(process.h) {
         Close managed{OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\MicNoize.TagHost.Scheduled.v2")};
         if(managed.h) {
-            retainWorker=true;
             Close supervisor{OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\MicNoize.TagSupervisor.v2")};
             if(supervisor.h){
                 RecoveryStore state;
-                if(state.ours() && state.record.budget.active && state.record.budget.used>=3){armRecovery(current);state.record.budget.used=0;state.save();}
+                if(state.ours() && state.record.budget.active && state.record.budget.used>=3){armRecovery(current);state.record.budget.refresh();state.save();}
                 return;
             }
             // A surviving worker asks the Scheduler to restore its supervisor, without audio restart.
@@ -481,7 +479,8 @@ void runTagTask() {
     if(local.h && !process.h)throw std::runtime_error("TAG host initializing; wait for its identity before scheduled handoff");
     armRecovery(current);
     RecoveryStore state;
-    if(retainWorker && state.ours() && state.record.budget.active){state.record.budget.used=0;state.record.budget.missingAt=0;state.save();}
+    // A second RunEx can arrive before the worker publishes its identity; do not cancel that launch's generation.
+    if(state.ours() && state.record.budget.active){state.record.budget.refresh();state.save();}
     else state.begin();
     startTask(current);
 }

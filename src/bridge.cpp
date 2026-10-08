@@ -189,7 +189,11 @@ extern "C" int32_t mnr_refresh_host(char* error,uint32_t capacity) {
         catch(const std::exception& e){mic::setTagTaskWarning(std::string("Фоновое восстановление недоступно: ")+e.what());}
         mic::ensureTagHost();return 1;
     }
-    catch(const std::exception& e){copy(e.what(),error,capacity);return 0;}
+    catch(const std::exception& e){
+        std::string message=e.what();
+        try{const auto warning=mic::tagTaskWarning();if(!warning.empty())message+="; "+warning;}catch(...){}
+        copy(message,error,capacity);return 0;
+    }
     catch(...){copy("TAG host recovery failed",error,capacity);return 0;}
 }
 extern "C" int32_t mnr_tag_stop_host(char* error,uint32_t capacity) {

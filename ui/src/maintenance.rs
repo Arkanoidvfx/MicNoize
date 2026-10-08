@@ -332,7 +332,11 @@ fn verify_ready(runtime:&Path,allow_setup:bool)->Result<(),String> {
     if !require_device {
         crate::logs::note(runtime,"Комплект UI/хоста проверен; core или TAG-драйвер отсутствует. Открываем интерфейс для завершения установки устройства.");
     }
-    ready_with_retry(require_device,||native(|e,n|unsafe{mnr_refresh_host(e,n)},1).map(|_|()),|seconds|{
+    ready_with_retry(require_device,||{
+        let result=native(|e,n|unsafe{mnr_refresh_host(e,n)},1).map(|_|());
+        if let Err(error)=&result {crate::logs::note(runtime,&format!("Проверка комплекта не прошла: {error}"));}
+        result
+    },|seconds|{
         crate::logs::note(runtime,&format!("Проверка комплекта: ожидаем устройство, повтор через {seconds} с"));
         std::thread::sleep(std::time::Duration::from_secs(seconds));
     })
@@ -544,6 +548,9 @@ fn finish_reinstallation(j:&mut Journal)->Result<bool,String> {
     // Keep the interrupted operation and rollback packages for support before retiring it.
     fs::create_dir_all(folder(j)).map_err(|e|e.to_string())?;
     copy_synced(&j.runtime.join(".update/journal.json"),&folder(j).join("superseded-journal.json"))?;
+    // Setup has replaced the files, but a worker from the previous bundle can still be running.
+    atomic(&j.runtime.join(".update/hold"),b"signed reinstallation")?;
+    stop()?;task(0)?;
     let hold=j.runtime.join(".update/hold");if hold.exists(){fs::remove_file(hold).map_err(|e|e.to_string())?;}
     verify_ready(&j.runtime,true)?;
     release(j)?;
@@ -868,6 +875,7 @@ pub fn startup() -> Result<bool,String> {
         let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
         let ready=verify_ready(&runtime,true);
         if ready.is_ok(){retain_current_package(&j)?;*RESUME.lock().map_err(|e|e.to_string())?=j.resume;release(&mut j)?;return Ok(true);}
+        if let Err(error)=ready {crate::logs::note(&runtime,&format!("Новый комплект {} отклонён до отката: {error}",j.after.version));}
     }
     if recovery.is_none() && finish_reinstallation(&mut j)? {return Ok(true);}
     if j.rollback_attempts>=2{return Err("Автоматический откат не завершился. Предыдущий пакет сохранён в .update; требуется восстановление установки".into());}

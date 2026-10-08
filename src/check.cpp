@@ -182,7 +182,10 @@ static void protocolTest() {
         require(budget.take(generation),"Recovery consumes durable budget");
         mic::TagRecoveryBudget restored{};memcpy(&restored,&budget,sizeof(budget));
         require(restored.take(generation) && restored.take(generation) && !restored.take(generation),"Deserialized budget retains exactly three retries");
-        restored.active=0;restored.used=0;
+        restored.missingAt=100;restored.refresh();restored.refresh();
+        require(restored.current(generation) && restored.used==0 && restored.missingAt==0,"Repeated launch refresh retains the pending worker generation");
+        require(!restored.take(old) && restored.take(generation),"Refreshed recovery accepts only its current generation");
+        restored.active=0;restored.refresh();
         require(!restored.take(generation),"Stop cancels delayed recovery even with tickets left");
     }
     {
