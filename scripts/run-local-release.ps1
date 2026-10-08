@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Smoke)
+param([ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Smoke, [switch]$SkipTests)
 
 $ErrorActionPreference = 'Stop'
 if (-not $Smoke -and -not $Version) { throw 'Specify -Version for a release or -Smoke for a runner check.' }
@@ -51,7 +51,7 @@ try {
     if (-not $online) { throw 'Runner did not connect in 45 seconds.' }
     $ghArgs = @('workflow','run','release-local.yml','-R',$repo)
     if ($Smoke) { $ghArgs += @('-f','smoke=true') } else { $ghArgs += @('-f',"version=$Version") }
-    $url = & gh @ghArgs
+    if ($SkipTests) { $ghArgs += @('-f','skip_tests=true') }; $url = & gh @ghArgs
     if ($LASTEXITCODE -ne 0 -or $url -notmatch '/runs/(\d+)') { throw 'Could not dispatch the local release workflow.' }
     $runId = $Matches[1]
     Write-Output "Local runner job: $url"

@@ -2,7 +2,7 @@
 # file of its full package, Velopack's launcher and updater included (they exist only after vpk
 # pack). Writes <package>.sig.json, then gates on the client's own check with the embedded key.
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Package, [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version)
+param([Parameter(Mandatory)][string]$Package, [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$SkipTests)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -36,6 +36,8 @@ try {
     $envelope = [ordered]@{ payload = $payload; signature = [Convert]::ToBase64String([IO.File]::ReadAllBytes($signature)) } | ConvertTo-Json
     [IO.File]::WriteAllText("$Package.sig.json", $envelope, [Text.UTF8Encoding]::new($false))
 } finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+
+if ($SkipTests) { Write-Output 'Client test skipped by explicit release request.'; return }
 
 # The gate always uses the key embedded in the app; a test override must never reach a release.
 Remove-Item Env:MNR_SIGNED_PUBLIC_KEY -ErrorAction SilentlyContinue

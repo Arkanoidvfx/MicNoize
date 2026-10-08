@@ -6,6 +6,10 @@ on:
       version:
         description: Patch version to release
         required: false
+      skip_tests:
+        description: Skip tests for an explicitly requested fast release
+        type: boolean
+        default: false
       smoke:
         description: Check runner connectivity without publishing
         type: boolean
@@ -42,8 +46,9 @@ jobs:
           MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
           COMPONENT_SIGNING_KEY: ${{ secrets.COMPONENT_SIGNING_KEY }}
           RELEASE_VERSION: ${{ inputs.version }}
+          SKIP_TESTS: ${{ inputs.skip_tests }}
         run: |
           if (-not (Test-Path "Releases/v$env:RELEASE_VERSION/.release-source.json")) {
-            .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION
+            .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION -SkipTests:($env:SKIP_TESTS -eq 'true')
           }
-          .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION -Publish
+          .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION -SkipTests:($env:SKIP_TESTS -eq 'true') -Publish

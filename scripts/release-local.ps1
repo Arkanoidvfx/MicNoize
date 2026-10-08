@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Publish, [switch]$CheckOnly)
+param([Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Publish, [switch]$CheckOnly, [switch]$SkipTests)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -23,9 +23,11 @@ $recordPath = Join-Path $output '.release-source.json'
 if (-not $Publish) {
     if (-not $env:MNR_TELEMETRY_SECRET) { throw 'MNR_TELEMETRY_SECRET is required for the release UI; set it locally without putting it in Git or chat.' }
     if (Test-Path -LiteralPath $output) { throw "Local release output already exists: $output" }
-    & (Join-Path $root 'verify.ps1')
-    if ($LASTEXITCODE -ne 0) { throw 'Release checks failed.' }
-    & (Join-Path $PSScriptRoot 'package-release.ps1') -Version $Version -Stage -OutputDir $output
+    if (-not $SkipTests) {
+        & (Join-Path $root 'verify.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'Release checks failed.' }
+    }
+    & (Join-Path $PSScriptRoot 'package-release.ps1') -Version $Version -Stage -OutputDir $output -SkipTests:$SkipTests
     if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed.' }
 } elseif (-not (Test-Path -LiteralPath $recordPath)) { throw 'Prepare and inspect the local release before publishing.' }
 $assets = @(Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne '.release-source.json')

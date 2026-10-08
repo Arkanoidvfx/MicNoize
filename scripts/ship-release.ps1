@@ -1,7 +1,7 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
-    [Parameter(Mandatory)][string]$Summary
+    [Parameter(Mandatory)][string]$Summary, [switch]$SkipTests
 )
 # Ships a prepared patch in one run: version bump, `Release X.Y.Z` commit on both remotes, the
 # local runner release, then the `Record the X.Y.Z release` commit. Write release/notes.md and
@@ -57,7 +57,7 @@ if ((RepoGit rev-parse 'release/main^{tree}') -ne (RepoGit rev-parse 'HEAD^{tree
 # 3. The local runner builds, verifies, packages and publishes.
 $runUrl = $null
 if (-not (Test-Published)) {
-    $out = & (Join-Path $PSScriptRoot 'run-local-release.ps1') -Version $Version
+    $out = & (Join-Path $PSScriptRoot 'run-local-release.ps1') -Version $Version -SkipTests:$SkipTests
     $out | Write-Output
     $runUrl = ($out | Select-String -Pattern 'passed: (\S+)').Matches | Select-Object -First 1 | ForEach-Object { $_.Groups[1].Value }
     if (-not (Test-Published)) { throw 'Release was not published.' }
@@ -80,7 +80,7 @@ if ($log -notmatch "релиз $([regex]::Escape($tag)) опубликован")
         "## $(Get-Date -Format yyyy-MM-dd) — релиз $tag опубликован", '',
         "- Публичный коммит ``$($release.targetCommitish)``; локальный runner [run $runId]($runUrl) завершился успешно, релиз не черновик, $(@($release.assets).Count) ассетов; runner удалён, $hostNote. Релиз: $($release.url).",
         "- Полный пакет: $(& $asset 'full\.nupkg$'); ``Setup.exe``: $(& $asset '^Setup\.exe$').",
-        '- Прошли `verify.ps1`, упаковка и публикация. Живое окно после установки, полный цикл обновления на медленной сети, несколько мониторов и отключение питания во время обновления не проверены.', '', ''
+        $(if ($SkipTests) { '- Упаковка и публикация прошли; повторные тесты пропущены по запросу пользователя. Живое окно' } else { '- Прошли `verify.ps1`, упаковка и публикация. Живое окно' }) + ' после установки, полный цикл обновления на медленной сети, несколько мониторов и отключение питания во время обновления не проверены.', '', ''
     ) -join $nl
     $at = ([regex]'(?m)^## ').Match($log).Index
     [IO.File]::WriteAllText($changelog, $log.Insert($at, $entry), [Text.UTF8Encoding]::new($false))

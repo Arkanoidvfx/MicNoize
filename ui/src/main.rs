@@ -259,6 +259,7 @@ mod focus {
     /// Page 6 (effects), split from the microphone page in 0.2.8.
     pub const TAB_EFFECTS: usize = 80;
     pub const TAB_STUDIO: usize = 30000;
+    pub const GUIDE: usize = 90000;
     pub fn tab(page: u8) -> usize {
         match page {
             4 => TAB_SOUNDPAD,
@@ -906,6 +907,7 @@ struct App {
     resume_monitor: Option<(i32,bool)>,
     report_sending: bool,
     logs_page: bool,
+    guide_page: bool,
     /// Engine denoiser: 1 NVIDIA, 2 none, 3 DeepFilterNet on the CPU, 4 input already denoised
     /// (the text names it); otherwise the text says why not NVIDIA.
     denoiser: (i32, String),
@@ -1473,6 +1475,7 @@ impl App {
                 resume_monitor:None,
                 report_sending: false,
                 logs_page: args.iter().any(|s| s == "--ui-logs"),
+                guide_page: args.iter().any(|s| s == "--ui-guide"),
                 denoiser: (0, String::new()),
                 logs_text: String::new(),
                 logs_copied: false,
@@ -1943,8 +1946,8 @@ impl App {
         let stamp=motion.map_or(0,|start|((start.elapsed().as_millis() as u32)&255)<<1);
         iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ stamp ^ self.repaint_all as u32), ..view::BG }
     }
-    fn page_key(&self) -> [bool; 6] {
-        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page, self.studio_page]
+    fn page_key(&self) -> [bool; 7] {
+        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page, self.studio_page, self.guide_page]
     }
     fn ui_active(&self) -> bool {
         self.window.is_some() && self.window_focused
@@ -3052,6 +3055,7 @@ impl App {
                     let _ = self.update(Msg::CancelBind);
                 }
                 let before = self.page_key();
+                self.guide_page = page == 8;
                 self.soundpad_page = page == 4;
                 self.studio_page = page == 7;
                 // Page 3 is no longer a page: the headphone panel opens over Шумодав.
@@ -3063,6 +3067,7 @@ impl App {
                 self.effects_page = page == 6;
                 self.reverse_edit = false;
                 self.focus = focus::NONE;
+                if self.guide_page { self.focus = focus::GUIDE; }
                 // Only a real page change pixelates; re-selecting the same page stays still.
                 // Without the effect nothing is painted offscreen.
                 self.page_shift = (!cfg!(test) && self.pixel_shift && self.ui_active() && self.page_key() != before)
@@ -4742,7 +4747,11 @@ impl App {
                 focus::TAB_BASE + 1,
                 focus::TAB_BASE + 2,
             ];
-            let order = if self.logs_page {
+            let order = if self.guide_page {
+                let mut items = vec![focus::GUIDE];
+                items.extend(tabs);
+                items
+            } else if self.logs_page {
                 use focus::logs::*;
                 let mut items = vec![BACK, COPY, FOLDER, SEND];
                 items.extend(tabs);
@@ -4871,7 +4880,7 @@ impl App {
                 items
             } else {
                 use focus::effects::*;
-                let mut items = vec![];
+                let mut items = vec![focus::GUIDE];
                 if !self.setup_error.is_empty() && !self.core_installing {
                     items.push(SETUP_RETRY);
                 }
@@ -4940,6 +4949,9 @@ impl App {
         if key == Key::Named(Named::Escape) && self.logs_page {
             return self.update(Msg::Page(2));
         }
+        if key == Key::Named(Named::Escape) && self.guide_page {
+            return self.update(Msg::Page(0));
+        }
         if key == Key::Named(Named::Escape)
             && (self.details || self.rvc_page || self.soundpad_page || self.effects_page || self.studio_page)
         {
@@ -4992,7 +5004,9 @@ impl App {
                 return self.reveal_studio(studio::FIRST_NOTE + note as u8);
             }
         }
-        let message = if self.logs_page {
+        let message = if self.focus == focus::GUIDE && activate {
+            Msg::Page(if self.guide_page { 0 } else { 8 })
+        } else if self.logs_page {
             match self.focus {
                 focus::logs::COPY if activate => Msg::LogsCopy,
                 focus::logs::FOLDER if activate => Msg::LogsFolder,
@@ -5493,6 +5507,25 @@ fn main() {
 
 #[cfg(test)]
 mod controller_tests {
+    #[test]
+    fn guide_opens_by_keyboard_and_returns_without_changing_audio() {
+        use keyboard::{Key, key::Named, Modifiers};
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let old_page = app.page_key();
+        let volume = app.controls.volume;
+        app.window = Some(App::open(1.0, None).0);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::GUIDE);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.guide_page && app.page_key() != old_page);
+        assert!(app.window_mosaic(iced::Size::new(1040.0, 740.0)).is_some(), "embedded guide renders");
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert!(!app.guide_page && app.page_key() == old_page);
+        assert_eq!(app.controls.volume, volume);
+        let _ = app.update(Msg::Page(8));
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(!app.guide_page, "Back works by keyboard");
+    }
     use super::*;
     #[test]
     fn extended_effect_settings_and_bindings() {
@@ -6686,7 +6719,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         use keyboard::{Key, Modifiers, key::Named};
         // Шумодав: devices, the headphone gear, the folded route, the gate, the two strengths, then the
         // tune panel's «Послушать себя» and «Подобрать».
-        for expected in [35, 50, 81, 82, 113, 34, 38, 37, 111, 110, 40] {
+        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 34, 38, 37, 111, 110, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }

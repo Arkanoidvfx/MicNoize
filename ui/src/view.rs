@@ -7,6 +7,24 @@ use iced::widget::{
 };
 use iced::{Border, Color, Length};
 
+fn guide_image() -> widget::image::Handle {
+    static IMAGE: std::sync::OnceLock<widget::image::Handle> = std::sync::OnceLock::new();
+    IMAGE.get_or_init(|| {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../../guide.png")));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+        let mut reader = decoder.read_info().expect("embedded guide PNG");
+        let mut bytes = vec![0; reader.output_buffer_size().expect("guide size")];
+        let info = reader.next_frame(&mut bytes).expect("guide pixels");
+        bytes.truncate(info.buffer_size());
+        let rgba = match info.color_type {
+            png::ColorType::Rgba => bytes,
+            png::ColorType::Rgb => bytes.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+            _ => panic!("guide must be an RGB or RGBA PNG"),
+        };
+        widget::image::Handle::from_rgba(info.width, info.height, rgba)
+    }).clone()
+}
+
 // Keep an off-screen keyboard target mounted without mounting every row on the way to it.
 fn sound_rows(count: usize, scroll: f32, viewport: f32, pitch: f32, focus: Option<usize>) -> Vec<usize> {
     // The stored offset can outlive a shorter section/filter until Iced clamps its scrollable.
@@ -508,7 +526,7 @@ impl App {
         self.keys_down[(vk / 64 % 4) as usize] >> (vk % 64) & 1 != 0
     }
     fn page_main(&self) -> bool {
-        !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page && !self.studio_page
+        !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page && !self.studio_page && !self.guide_page
     }
 
     /// The window: the app, with the update morph layer on top (empty unless morphing). The
@@ -608,7 +626,13 @@ impl App {
 
     /// The current page with its error banner and scrolling, right of the rail.
     fn body(&self) -> Element<'_, Msg> {
-        let content: Element<'_, Msg> = if self.logs_page {
+        let content: Element<'_, Msg> = if self.guide_page {
+            column![
+                row![title("Как пользоваться"), action(label("Назад", 13, INK), Msg::Page(0), self.focus == focus::GUIDE, false)].spacing(14).align_y(iced::Center),
+                label("В Discord выберите Thin Audio Gateway → Mic Noize в качестве устройства ввода.", 14, DIM),
+                widget::image(guide_image()).width(Length::Fill).height(400).content_fit(iced::ContentFit::Contain),
+            ].spacing(18).into()
+        } else if self.logs_page {
             self.logs_view()
         } else if self.studio_page {
             self.studio_view()
@@ -1020,7 +1044,7 @@ impl App {
             ]
             .spacing(10),
         );
-        let mut body = column![title("Шумодав")]
+        let mut body = column![row![title("Шумодав"), action(label("Как пользоваться", 13, INK), Msg::Page(8), self.focus == focus::GUIDE, false)].spacing(14).align_y(iced::Center)]
             .push(self.setup_card())
             .push(devices)
             .push(meters)
@@ -3831,6 +3855,16 @@ mod tests {
         app.in_peak = 0.2;
         app.peak = 0.08;
         app.noise_peak = 0.08;
+        if std::env::var_os("MNR_GUIDE_ONLY").is_some() {
+            render(&app, "guide-button");
+            let _ = app.update(Msg::Page(8));
+            render(&app, "guide");
+            scale.set(2.0);
+            render(&app, "guide-200pct");
+            window.set((620.0, 440.0));
+            render(&app, "guide-small-200pct");
+            return;
+        }
         if std::env::var_os("MNR_RVC_ONLY").is_some() {
             app.rvc_page = true;
             app.rvc_runtime_installed = false;

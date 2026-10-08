@@ -1,6 +1,6 @@
 [package]
 name = "micnoize"
-version = "0.4.19"
+version = "0.4.20"
 edition = "2024"
 rust-version = "1.97"
 build = "build.rs"
@@ -11,7 +11,7 @@ base64 = "0.22"
 # v0.5.6 release commit is pinned. `default-model` embeds the 8 MB DFN3 model.
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "978576aa8400552a4ce9730838c635aa30db5e61", default-features = false, features = ["tract", "default-model"] }
 ed25519-dalek = "2"
-iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "advanced"] }
+iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "advanced", "image-without-codecs"] }
 # Iced's own renderer; `geometry` draws the slanted slider shapes as anti-aliased paths.
 iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["geometry"] }
 # Iced's rasterizer, used directly to paint pages offscreen for the page-switch pixelation.
