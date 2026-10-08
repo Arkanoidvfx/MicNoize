@@ -1917,6 +1917,12 @@ impl App {
     fn setup_visible(&self) -> bool {
         self.setup_pending() || self.start_blocked()
     }
+    fn expected_device_wait(&self, error: &str) -> bool {
+        transient_device_failure(error)
+            && (!self.core_present || self.core_installing || !self.driver_ready || self.driver_installing
+                || matches!(self.device_state, engine::DeviceState::Starting
+                    | engine::DeviceState::WaitingDriver | engine::DeviceState::WaitingEndpoint))
+    }
     /// After the shrink: the real update, or the rehearsal's stand-in watcher.
     fn hand_over(&self, center: Option<iced::Point>) -> Task<Msg> {
         if !self.rehearse_after_quit {
@@ -2701,7 +2707,10 @@ impl App {
                 }
                 // During an in-flight restart the engine still reports the old failure: showing
                 // it again would leave a stale red error over a session that then starts fine.
-                if snapshot.state == 5 && !self.busy && !error.is_empty() {
+                if self.expected_device_wait(&self.message) {
+                    self.message.clear();
+                }
+                if snapshot.state == 5 && !self.busy && !error.is_empty() && !self.expected_device_wait(&error) {
                     self.message = match self.recovery.due {
                         Some(at) => format!(
                             "{error} Перезапуск через {} с.",
@@ -6623,7 +6632,14 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert!(!app.setup_visible(), "everything installed: no card");
         app.driver_ready = false;
         assert!(app.setup_visible(), "a missing virtual microphone shows it");
+        let waiting = "TAG host initializing or waiting for driver; see results/tag-host.log";
+        assert!(app.expected_device_wait(waiting), "driver setup is expected, not a red failure");
+        assert!(!app.expected_device_wait("TAG exclusive policy write access: HRESULT 0x80070005"), "real access failures stay visible during setup");
         app.driver_ready = true;
+        app.device_state = engine::DeviceState::WaitingEndpoint;
+        assert!(app.expected_device_wait(waiting), "Windows can enumerate the new endpoint after the installer exits");
+        app.device_state = engine::DeviceState::Ready;
+        assert!(!app.expected_device_wait(waiting), "unexpected host loss after readiness must remain visible");
         app.setup_error = "io: Connection reset by peer (os error 10054)".into();
         assert!(app.setup_visible(), "a failed download shows it");
         app.setup_error.clear();

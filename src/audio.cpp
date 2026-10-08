@@ -35,8 +35,8 @@ struct __declspec(uuid("f8679f50-850a-41cf-9c72-430f290290c8")) IPolicyConfig : 
     virtual HRESULT STDMETHODCALLTYPE SetProcessingPeriod(PCWSTR,PINT64)=0;
     virtual HRESULT STDMETHODCALLTYPE GetShareMode(PCWSTR,void*)=0;
     virtual HRESULT STDMETHODCALLTYPE SetShareMode(PCWSTR,void*)=0;
-    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR,const PROPERTYKEY&,PROPVARIANT*)=0;
-    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR,const PROPERTYKEY&,PROPVARIANT*)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyValue(PCWSTR,BOOL,const PROPERTYKEY&,PROPVARIANT*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetPropertyValue(PCWSTR,BOOL,const PROPERTYKEY&,PROPVARIANT*)=0;
     virtual HRESULT STDMETHODCALLTYPE SetDefaultEndpoint(PCWSTR,ERole)=0;
     virtual HRESULT STDMETHODCALLTYPE SetEndpointVisibility(PCWSTR,INT)=0;
 };
@@ -57,6 +57,14 @@ struct Com {
     Com() { check(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM initialization"); }
     ~Com() { CoUninitialize(); }
 };
+void setEndpointProperty(IMMDevice* endpoint,REFPROPERTYKEY key,PROPVARIANT& value) {
+    // PolicyConfig brokers the write for a normal user; OpenPropertyStore(STGM_READWRITE) requires elevation.
+    ComPtr<IPolicyConfig> policy;
+    check(CoCreateInstance(__uuidof(CPolicyConfigClient),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&policy)),"Audio endpoint policy");
+    LPWSTR id=nullptr;check(endpoint->GetId(&id),"Audio endpoint policy ID");
+    const auto hr=policy->SetPropertyValue(id,FALSE,key,&value);
+    CoTaskMemFree(id);check(hr,"Audio endpoint policy write");
+}
 // Discord grabs a physical microphone again when its loose cable reconnects. With Discord's
 // input on "Default" it stays on Mic Noize only while Mic Noize is the Windows default, so a
 // running TAG session keeps it the default for every role. Best effort: never fails audio.

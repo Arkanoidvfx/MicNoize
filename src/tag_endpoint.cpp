@@ -133,11 +133,8 @@ bool holdTagEndpointSharedMode(IMMDevice* endpoint) {
         return type==VT_UI4 && number==0;
     };
     if(disabled())return false;
-    ComPtr<IPropertyStore> store;checked(endpoint->OpenPropertyStore(STGM_READWRITE,&store),"TAG exclusive policy write access");
     PROPVARIANT value{};value.vt=VT_UI4;value.ulVal=0;
-    checked(store->SetValue(allowExclusive,value),"TAG disable exclusive access");
-    checked(store->Commit(),"TAG commit shared-only policy");
-    store.Reset();
+    setEndpointProperty(endpoint,allowExclusive,value);
     if(!disabled())throw std::runtime_error("TAG shared-only policy readback failed");
     return true;
 }

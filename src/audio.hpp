@@ -30,6 +30,7 @@ inline int preferredDevice(const std::vector<Device>& list,const std::wstring& s
 }
 std::vector<Device> devices(bool capture,DWORD states=DEVICE_STATE_ACTIVE);
 Device tagMicrophone();
+void setEndpointProperty(IMMDevice* endpoint,REFPROPERTYKEY key,PROPVARIANT& value);
 std::filesystem::path projectRoot();
 std::string utf8(const std::wstring& s);
 std::wstring wide(const std::string& s);

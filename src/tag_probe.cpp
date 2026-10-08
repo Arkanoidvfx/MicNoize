@@ -232,20 +232,38 @@ static void signal(const std::wstring& endpointId,bool exclusive) {
         <<" output_peak="<<peak<<" rms="<<rms<<" peak_gain="<<peak/amplitude<<" discontinuities="<<discontinuities
         <<"; synthetic signal only, no audio file\n";
 }
-static void sharedOnly(bool apply,bool challenge=false) {
+static void sharedOnly(bool apply,bool challenge=false,bool checkWrite=false) {
     Com com;mic::TagEndpointStatus status;
     if(!mic::readTagEndpointStatus(status) || !status.ready)throw std::runtime_error("Confirmed live TAG endpoint required");
     ComPtr<IMMDeviceEnumerator> enumerator;ComPtr<IMMDevice> endpoint;
     checked(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&enumerator)),"Enumerator");
     checked(enumerator->GetDevice(status.endpoint,&endpoint),"Confirmed TAG endpoint");
+    if(checkWrite) {
+        HANDLE token=nullptr;TOKEN_ELEVATION elevation{};DWORD size=0;
+        if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))throw std::runtime_error("Policy check token unavailable");
+        const bool known=GetTokenInformation(token,TokenElevation,&elevation,sizeof(elevation),&size)!=0;CloseHandle(token);
+        if(!known || elevation.TokenIsElevated)throw std::runtime_error("Run policy write check without administrator elevation");
+        if(!mic::tagDriverEndpoint(status.endpoint))throw std::runtime_error("Policy check endpoint is not TAG");
+        constexpr PROPERTYKEY key={{0xb3f8fa53,0x0004,0x438e,{0x90,0x03,0x51,0xa4,0x6e,0x13,0x9b,0xfc}},3};
+        ComPtr<IPropertyStore> store;checked(endpoint->OpenPropertyStore(STGM_READ,&store),"Policy check read");
+        PROPVARIANT value{};checked(store->GetValue(key,&value),"Policy check value");
+        const bool disabled=value.vt==VT_UI4 && value.ulVal==0;PropVariantClear(&value);store.Reset();
+        if(!disabled)throw std::runtime_error("Policy write check requires an already shared-only endpoint");
+        value.vt=VT_UI4;value.ulVal=0;mic::setEndpointProperty(endpoint.Get(),key,value);
+        checked(endpoint->OpenPropertyStore(STGM_READ,&store),"Policy check readback");
+        checked(store->GetValue(key,&value),"Policy check written value");
+        const bool verified=value.vt==VT_UI4 && value.ulVal==0;PropVariantClear(&value);
+        if(!verified)throw std::runtime_error("Policy write check readback failed");
+        std::cout<<"PASS: unelevated PolicyConfig write and readback; shared-only policy retained\n";
+    }
     if(apply){std::cout<<"shared_only_changed="<<mic::holdTagEndpointSharedMode(endpoint.Get())<<'\n';return;}
     if(challenge) {
         if(status.hostBuild!=mic::tagHostBuild)throw std::runtime_error("Matching new host required for policy guard test");
         constexpr PROPERTYKEY key={{0xb3f8fa53,0x0004,0x438e,{0x90,0x03,0x51,0xa4,0x6e,0x13,0x9b,0xfc}},3};
         try {
-            ComPtr<IPropertyStore> store;checked(endpoint->OpenPropertyStore(STGM_READWRITE,&store),"Policy challenge store");
+            ComPtr<IPropertyStore> store;
             PROPVARIANT value{};value.vt=VT_UI4;value.ulVal=1;
-            checked(store->SetValue(key,value),"Policy challenge enable");checked(store->Commit(),"Policy challenge commit");store.Reset();
+            mic::setEndpointProperty(endpoint.Get(),key,value);
             const auto started=GetTickCount64();bool restored=false;
             do {
                 Sleep(10);checked(endpoint->OpenPropertyStore(STGM_READ,&store),"Policy challenge read");
@@ -285,6 +303,7 @@ int wmain(int argc,wchar_t** argv) {
     try {
         if(argc==2 && std::wstring_view(argv[1])==L"--shared-only"){sharedOnly(true);return 0;}
         if(argc==2 && std::wstring_view(argv[1])==L"--check-shared-only"){sharedOnly(false);return 0;}
+        if(argc==2 && std::wstring_view(argv[1])==L"--check-shared-policy-write"){sharedOnly(false,false,true);return 0;}
         if(argc==2 && std::wstring_view(argv[1])==L"--check-shared-guard"){sharedOnly(false,true);return 0;}
         if(argc==2 && std::wstring_view(argv[1])==L"--endpoints"){endpoints();return 0;}
         if(argc==3 && std::wstring_view(argv[1])==L"--host-file") {
