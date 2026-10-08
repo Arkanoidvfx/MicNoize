@@ -492,6 +492,41 @@ fn verify_reinstallation(j:&Journal,version:&str,path:&Path,envelope:&str,key:[u
     verify_update(path,version,envelope,key)?;
     package(path,version)?.installed(&j.install)
 }
+fn download_reinstallation_package(version:&str,name:&str,pending:&Path)->Result<(),String> {
+    let url=format!("https://github.com/Arkanoidvfx/MicNoize/releases/download/v{version}/{name}");
+    let agent:ureq::Agent=ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_global(Some(std::time::Duration::from_secs(120))).build().into();
+    let response=agent.get(&url).call().map_err(|e|format!("Загрузка пакета переустановки {version}: {e}"))?;
+    let mut reader=response.into_parts().1.into_reader().take(512*1024*1024+1);
+    let mut file=File::create(pending).map_err(|e|format!("Создание {}: {e}",pending.display()))?;
+    let size=std::io::copy(&mut reader,&mut file).map_err(|e|format!("Загрузка {}: {e}",pending.display()))?;
+    if size>512*1024*1024 {return Err("Полный пакет переустановки превышает 512 МиБ".into());}
+    file.sync_all().map_err(|e|format!("Сохранение {}: {e}",pending.display()))
+}
+fn restore_reinstallation_package(j:&Journal,packages:&Path,version:&str,envelope:&str,key:[u8;32],download:impl FnOnce(&Path)->Result<(),String>)->Result<PathBuf,String> {
+    let name=format!("MicNoize-{version}-win-x64-stable-v2-full.nupkg");check_update_name(version,&name)?;
+    let destination=packages.join(&name);
+    if destination.is_file() {verify_reinstallation(j,version,&destination,envelope,key)?;return Ok(destination);}
+    if envelope.len()>1<<20 {return Err("Подпись обновления слишком велика".into());}
+    let payload=crate::components::signed_payload(envelope,key).map_err(|_|String::from("Подпись переустановки не прошла проверку"))?;
+    fs::create_dir_all(packages).map_err(|e|format!("Папка пакетов {}: {e}",packages.display()))?;
+    let pending=destination.with_extension("partial");
+    let result=(|| {
+        if let Ok(source)=current_package(packages,&j.runtime,version) {copy_synced(&source,&pending)?;}
+        else {
+            crate::logs::note(&j.runtime,&format!("Кэш переустановки {version} отсутствует; восстанавливаем официальный полный пакет"));
+            download(&pending)?;
+        }
+        check_signed_files(&pending,version,&payload)?;
+        package(&pending,version)?.installed(&j.install)?;
+        fs::rename(&pending,&destination).map_err(|e|format!("Сохранение пакета {}: {e}",destination.display()))?;
+        verify_reinstallation(j,version,&destination,envelope,key)?;
+        Ok(destination)
+    })();
+    if result.is_err() {let _=fs::remove_file(&pending);}
+    result
+}
 fn finish_reinstallation(j:&mut Journal)->Result<bool,String> {
     use velopack::locator::{auto_locate_app_manifest,LocationContext};
     let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|format!("Метаданные переустановки {}: {e}",j.install.display()))?;
@@ -504,7 +539,8 @@ fn finish_reinstallation(j:&mut Journal)->Result<bool,String> {
         Ok(text)=>text,
         Err(_)=>crate::components::update_signature(&version,&name)?,
     };
-    verify_reinstallation(j,&version,&location.get_packages_dir().join(&name),&signature,crate::components::release_key()?)?;
+    restore_reinstallation_package(j,&location.get_packages_dir(),&version,&signature,crate::components::release_key()?,|pending|download_reinstallation_package(&version,&name,pending))?;
+    atomic(&signature_path(&j.runtime,&name),signature.as_bytes())?;
     // Keep the interrupted operation and rollback packages for support before retiring it.
     fs::create_dir_all(folder(j)).map_err(|e|e.to_string())?;
     copy_synced(&j.runtime.join(".update/journal.json"),&folder(j).join("superseded-journal.json"))?;
@@ -1014,6 +1050,18 @@ mod tests {
             before:bundle("1.0.0",b"old UI",b"old host"),after:bundle("1.1.0",b"failed UI",b"failed host"),previous_hash:"a".repeat(64),candidate_hash:"b".repeat(64),updater_hash:"c".repeat(64),task_enabled:true,applier:None,rollback_attempts:2,resume:None,legacy:None};
         assert!(j.before.installed(&t.0).is_err() && j.after.installed(&t.0).is_err());
         verify_reinstallation(&j,"1.2.3",&path,&envelope,public).unwrap();
+        let packages=t.0.join("packages");fs::create_dir(&packages).unwrap();
+        let renamed=packages.join("MicNoize-1.2.3-full.nupkg");copy_synced(&path,&renamed).unwrap();
+        let restored=restore_reinstallation_package(&j,&packages,"1.2.3",&envelope,public,|_|panic!("cached package must avoid download")).unwrap();
+        verify_reinstallation(&j,"1.2.3",&restored,&envelope,public).unwrap();
+        fs::remove_file(&restored).unwrap();fs::remove_file(&renamed).unwrap();
+        // Setup may leave no full package. Restore it without trusting download bytes.
+        assert!(restore_reinstallation_package(&j,&packages,"1.2.3",&envelope,public,|pending|copy_synced(&path,pending)).is_ok());
+        fs::remove_file(&restored).unwrap();
+        assert!(restore_reinstallation_package(&j,&packages,"1.2.3",&envelope,[0;32],|_|panic!("reject invalid signature before download")).is_err());
+        assert!(restore_reinstallation_package(&j,&packages,"1.2.3",&envelope,public,|pending|{fs::write(pending,b"tampered").unwrap();Ok(())}).is_err());
+        assert!(!restored.exists() && !restored.with_extension("partial").exists());
+        assert!(restore_reinstallation_package(&j,&packages,"1.2.3",&envelope,public,|_|Err("offline".into())).unwrap_err().contains("offline"));
         assert!(verify_reinstallation(&j,"1.2.3",&path,&envelope,[0;32]).is_err(),"wrong signature key");
         fs::write(current.join("mic_tag_host.exe"),b"old host").unwrap();
         assert!(verify_reinstallation(&j,"1.2.3",&path,&envelope,public).is_err(),"mixed UI/host pair");
