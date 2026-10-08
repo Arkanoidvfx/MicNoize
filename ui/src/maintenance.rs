@@ -315,7 +315,8 @@ fn native(call: impl FnOnce(*mut c_char, u32) -> i32, minimum: i32) -> Result<i3
 }
 fn task(mode: i32) -> Result<bool, String> { native(|e,n| unsafe { mnr_tag_task_enabled(mode,e,n) },0).map(|n| n != 0) }
 fn stop() -> Result<(), String> { native(|e,n| unsafe { mnr_tag_stop_host(e,n) },1).map(|_| ()) }
-fn ready_with_retry(mut check:impl FnMut()->Result<(),String>,mut wait:impl FnMut(u64))->Result<(),String> {
+fn ready_with_retry(require_device:bool,mut check:impl FnMut()->Result<(),String>,mut wait:impl FnMut(u64))->Result<(),String> {
+    if !require_device {return Ok(());}
     let mut result=check();
     for seconds in crate::RECOVERY_DELAYS {
         if !result.as_ref().is_err_and(|error|crate::transient_device_failure(error)){return result;}
@@ -323,8 +324,15 @@ fn ready_with_retry(mut check:impl FnMut()->Result<(),String>,mut wait:impl FnMu
     }
     result
 }
-fn verify_ready(runtime:&Path)->Result<(),String> {
-    ready_with_retry(||native(|e,n|unsafe{mnr_refresh_host(e,n)},1).map(|_|()),|seconds|{
+fn verify_ready(runtime:&Path,allow_setup:bool)->Result<(),String> {
+    // Paired UI/host files were validated by installed() before this call. Core and the
+    // machine-wide driver are installed by the UI; rollback cannot restore either of them.
+    // Legacy migration still needs a live endpoint to validate its explicit line transfer.
+    let require_device=!allow_setup || (crate::components::core_installed(runtime) && crate::components::driver_installed());
+    if !require_device {
+        crate::logs::note(runtime,"Комплект UI/хоста проверен; core или TAG-драйвер отсутствует. Открываем интерфейс для завершения установки устройства.");
+    }
+    ready_with_retry(require_device,||native(|e,n|unsafe{mnr_refresh_host(e,n)},1).map(|_|()),|seconds|{
         crate::logs::note(runtime,&format!("Проверка комплекта: ожидаем устройство, повтор через {seconds} с"));
         std::thread::sleep(std::time::Duration::from_secs(seconds));
     })
@@ -479,6 +487,37 @@ fn release(j: &mut Journal) -> Result<(), String> {
     task(i32::from(j.task_enabled))?;
     if j.legacy.is_some(){return complete_legacy(j,false);}
     j.phase = Phase::Complete; save(j)?; run_recovery(None,&j.runtime)
+}
+/// Setup.exe can replace an installation while its persistent update journal survives.
+/// Accept that replacement only as a complete, signed release, never as a mixed pair.
+fn verify_reinstallation(j:&Journal,version:&str,path:&Path,envelope:&str,key:[u8;32])->Result<(),String> {
+    if j.legacy.is_some() || version==j.before.version || version==j.after.version {
+        return Err("Это не отдельная переустановка приложения".into());
+    }
+    verify_update(path,version,envelope,key)?;
+    package(path,version)?.installed(&j.install)
+}
+fn finish_reinstallation(j:&mut Journal)->Result<bool,String> {
+    use velopack::locator::{auto_locate_app_manifest,LocationContext};
+    let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|e.to_string())?;
+    let version=location.get_manifest_version().to_string();
+    if version==j.before.version || version==j.after.version {return Ok(false);}
+    if location.get_root_dir()!=j.install {return Err("Переустановка относится к другой папке приложения".into());}
+    let name=format!("MicNoize-{version}-win-x64-stable-v2-full.nupkg");
+    check_update_name(&version,&name)?;
+    let signature=match fs::read_to_string(signature_path(&j.runtime,&name)) {
+        Ok(text)=>text,
+        Err(_)=>crate::components::update_signature(&version,&name)?,
+    };
+    verify_reinstallation(j,&version,&location.get_packages_dir().join(&name),&signature,crate::components::release_key()?)?;
+    // Keep the interrupted operation and rollback packages for support before retiring it.
+    fs::create_dir_all(folder(j)).map_err(|e|e.to_string())?;
+    copy_synced(&j.runtime.join(".update/journal.json"),&folder(j).join("superseded-journal.json"))?;
+    let hold=j.runtime.join(".update/hold");if hold.exists(){fs::remove_file(hold).map_err(|e|e.to_string())?;}
+    verify_ready(&j.runtime,true)?;
+    release(j)?;
+    crate::logs::note(&j.runtime,&format!("Подписанная переустановка {version} проверена; прежний журнал обновления сохранён и завершён"));
+    Ok(true)
 }
 fn process_created(handle: isize) -> Option<u64> {
     let (mut created,mut exited,mut kernel,mut user)=(0,0,0,0);
@@ -746,6 +785,7 @@ pub fn startup() -> Result<bool,String> {
     if !runtime.join(".update/journal.json").exists() {return Ok(recovery.is_none());}
     let _lock = match Lock::wait(10000) {Ok(lock)=>lock,Err(_)=>return Ok(false)};
     let mut j=read(&runtime)?;
+    crate::logs::note(&runtime,&format!("Восстановление обновления: {:?}, {} -> {}",j.phase,j.before.version,j.after.version));
     for _ in 0..100 {if !applier_alive(&j){break;}std::thread::sleep(std::time::Duration::from_millis(100));}
     if applier_alive(&j){return Ok(false);}
     if j.phase==Phase::Complete && j.legacy.is_none() { run_recovery(None,&runtime)?; return Ok(recovery.is_none()); }
@@ -765,7 +805,7 @@ pub fn startup() -> Result<bool,String> {
             }
             let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
             let login=j.legacy.as_ref().unwrap().host_login.iter().any(Option::is_some);
-            let ready=native(|e,n|unsafe{mnr_tag_autostart(i32::from(login),e,n)},0).and_then(|_|verify_ready(&runtime));
+            let ready=native(|e,n|unsafe{mnr_tag_autostart(i32::from(login),e,n)},0).and_then(|_|verify_ready(&runtime,false));
             if ready.is_ok(){release(&mut j)?;return Ok(true);}
             if let Err(error)=ready{crate::logs::note(&runtime,&format!("Переход со старой версии отклонён: {error}"));}
         }
@@ -785,8 +825,8 @@ pub fn startup() -> Result<bool,String> {
         }
         if j.phase!=Phase::Prepared {
             let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
-            // Complete files alone do not prove that rollback restored a usable host.
-            verify_ready(&runtime)?;
+            // Check a usable host when its separately installed prerequisites are present.
+            verify_ready(&runtime,true)?;
         }
         *RESUME.lock().map_err(|e|e.to_string())?=j.resume;
         release(&mut j)?;
@@ -794,9 +834,10 @@ pub fn startup() -> Result<bool,String> {
     }
     if j.phase!=Phase::RollingBack && j.after.installed(&j.install).is_ok() {
         let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
-        let ready=verify_ready(&runtime);
+        let ready=verify_ready(&runtime,true);
         if ready.is_ok(){retain_current_package(&j)?;*RESUME.lock().map_err(|e|e.to_string())?=j.resume;release(&mut j)?;return Ok(true);}
     }
+    if recovery.is_none() && finish_reinstallation(&mut j)? {return Ok(true);}
     if j.rollback_attempts>=2{return Err("Автоматический откат не завершился. Предыдущий пакет сохранён в .update; требуется восстановление установки".into());}
     atomic(&runtime.join(".update/hold"),b"rollback")?; stop()?; task(0)?;
     j.phase=Phase::RollingBack;j.rollback_attempts+=1;save(&j)?;apply(&mut j,true,None)?;
@@ -909,16 +950,25 @@ mod tests {
     #[test]
     fn readiness_waits_for_late_audio_but_not_access_or_version_failures() {
         let mut attempts=0;let mut waits=Vec::new();
-        ready_with_retry(||{attempts+=1;if attempts<4{Err("0x88890010".into())}else{Ok(())}},|seconds|waits.push(seconds)).unwrap();
+        ready_with_retry(true,||{attempts+=1;if attempts<4{Err("0x88890010".into())}else{Ok(())}},|seconds|waits.push(seconds)).unwrap();
         assert_eq!(attempts,4);assert_eq!(waits,vec![2,5,15]);
         for error in ["TAG open driver: HRESULT 0x80070005","TAG host protocol mismatch","TAG microphone endpoint disabled in Windows"] {
             let mut attempts=0;
-            assert!(ready_with_retry(||{attempts+=1;Err(error.into())},|_|panic!("Permanent error retried")).is_err());
+            assert!(ready_with_retry(true,||{attempts+=1;Err(error.into())},|_|panic!("Permanent error retried")).is_err());
             assert_eq!(attempts,1);
         }
         waits.clear();
-        assert!(ready_with_retry(||Err("Waiting for the TAG microphone endpoint in Windows".into()),|seconds|waits.push(seconds)).is_err());
+        assert!(ready_with_retry(true,||Err("Waiting for the TAG microphone endpoint in Windows".into()),|seconds|waits.push(seconds)).is_err());
         assert_eq!(waits,crate::RECOVERY_DELAYS);
+    }
+    #[test]
+    fn missing_prerequisites_open_setup_without_waiting_for_the_host() {
+        ready_with_retry(false,||panic!("Setup must install core/driver before checking the host"),|_|panic!("Setup must not wait")).unwrap();
+        let t=temp();
+        // An empty runtime cannot start TAG even on a machine whose driver is installed.
+        assert!(!crate::components::core_installed(&t.0));
+        verify_ready(&t.0,true).unwrap();
+        assert!(fs::read_to_string(t.0.join("results/app.log")).unwrap().contains("Открываем интерфейс"));
     }
     struct Temp(PathBuf);
     impl Drop for Temp { fn drop(&mut self){let _=fs::remove_dir_all(&self.0);} }
@@ -937,6 +987,35 @@ mod tests {
         zip.start_file("MicNoize.nuspec",zip::write::SimpleFileOptions::default()).unwrap();
         zip.write_all(format!("<package><metadata><id>MicNoize</id><version>{}</version><mainExe>MicNoize.exe</mainExe></metadata></package>",b.version).as_bytes()).unwrap();
         zip.finish().unwrap();
+    }
+    #[test]
+    fn reinstallation_requires_a_signed_matching_pair_outside_old_transaction() {
+        use base64::Engine as _;use ed25519_dalek::{Signer,SigningKey};
+        let t=temp();let current=t.0.join("current");fs::create_dir(&current).unwrap();
+        fs::write(t.0.join("Update.exe"),b"updater").unwrap();fs::write(t.0.join(".portable"),b"").unwrap();
+        fs::write(current.join("sq.version"),"<package><metadata><id>MicNoize</id><version>1.2.3</version><mainExe>MicNoize.exe</mainExe></metadata></package>").unwrap();
+        fs::write(current.join("MicNoize.exe"),b"new UI").unwrap();fs::write(current.join("mic_tag_host.exe"),b"new host").unwrap();
+        let path=t.0.join("MicNoize-1.2.3-win-x64-stable-v2-full.nupkg");
+        archive(&path,&bundle("1.2.3",b"new UI",b"new host"),b"new UI",b"new host");
+        let mut zip=zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut payload=String::from("MicNoize 1.2.3\n");
+        for i in 0..zip.len() {
+            let mut file=zip.by_index(i).unwrap();
+            if file.name().starts_with("lib/") {let name=file.name().to_owned();payload.push_str(&format!("{}  {name}\n",hash(&mut file).unwrap()));}
+        }
+        drop(zip);
+        let key=SigningKey::from_bytes(&[11;32]);let public=key.verifying_key().to_bytes();
+        let envelope=serde_json::json!({"payload":payload,"signature":base64::engine::general_purpose::STANDARD.encode(key.sign(payload.as_bytes()).to_bytes())}).to_string();
+        let mut j=Journal{schema:1,transaction:uuid::Uuid::new_v4().to_string(),install:t.0.clone(),runtime:t.0.join("runtime"),phase:Phase::RollingBack,
+            before:bundle("1.0.0",b"old UI",b"old host"),after:bundle("1.1.0",b"failed UI",b"failed host"),previous_hash:"a".repeat(64),candidate_hash:"b".repeat(64),updater_hash:"c".repeat(64),task_enabled:true,applier:None,rollback_attempts:2,resume:None,legacy:None};
+        assert!(j.before.installed(&t.0).is_err() && j.after.installed(&t.0).is_err());
+        verify_reinstallation(&j,"1.2.3",&path,&envelope,public).unwrap();
+        assert!(verify_reinstallation(&j,"1.2.3",&path,&envelope,[0;32]).is_err(),"wrong signature key");
+        fs::write(current.join("mic_tag_host.exe"),b"old host").unwrap();
+        assert!(verify_reinstallation(&j,"1.2.3",&path,&envelope,public).is_err(),"mixed UI/host pair");
+        fs::write(current.join("mic_tag_host.exe"),b"new host").unwrap();
+        j.after.version="1.2.3".into();
+        assert!(verify_reinstallation(&j,"1.2.3",&path,&envelope,public).is_err(),"same-version corruption is not a reinstall");
     }
     #[test]
     fn installed_pair_rejects_stale_version_metadata() {

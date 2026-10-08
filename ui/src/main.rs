@@ -3495,10 +3495,17 @@ impl App {
                 if !self.report_sending {
                     // The note carries what the log files cannot: what the UI last showed.
                     let note = format!(
-                        "state={} driver={} core={} message={}",
+                        "state={} driver={} core={} models={} installing={}\nGPU: {:?}\nsetup_error={}\ndriver_error={}\ndevice={:?}: {}\nmessage={}",
                         self.snapshot.state,
                         self.driver_ready,
-                        components::core_installed(&self.component_root),
+                        components::core_installed(&self.runtime_root),
+                        self.models_present,
+                        self.core_installing,
+                        self.gpu,
+                        self.setup_error,
+                        self.driver_error,
+                        self.device_state,
+                        self.device_detail,
                         self.message
                     );
                     self.report_sending = true;
@@ -5473,7 +5480,7 @@ fn main() {
     if let Err(e) = result {
         if let Some(root) = root {
             let _ = std::fs::create_dir_all(root.join("Logs"));
-            let _ = std::fs::write(root.join("Logs/rust-ui-error.log"), &e);
+            let _ = std::fs::write(root.join("Logs/rust-ui-error.log"), format!("Mic Noize {}\n{e}", env!("CARGO_PKG_VERSION")));
         }
         eprintln!("{e}");
         // Startup recovery failures must remain visible even in the GUI subsystem build.

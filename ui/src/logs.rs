@@ -1,6 +1,6 @@
 //! One copyable report: what the UI showed (`app.log`) plus the tails of every runtime log.
 use std::{
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     os::windows::process::CommandExt,
     path::Path,
     process::Command,
@@ -61,7 +61,7 @@ fn tail(text: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
-fn command(program: &str, args: &[&str]) -> String {
+pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
         .creation_flags(NO_WINDOW)
@@ -70,6 +70,16 @@ fn command(program: &str, args: &[&str]) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default()
+}
+
+/// Read only the newest bytes, including logs containing non-UTF-8 tool output.
+pub(crate) fn read_tail(path: &Path, limit: usize) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(limit as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `header` carries the UI state; the rest is read here, off the UI thread.

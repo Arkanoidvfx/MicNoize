@@ -166,11 +166,11 @@ pub enum Reason {
 pub fn reason(error: &str) -> Reason {
     let e = error.to_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| e.contains(n));
-    if any(&["os error 112", "os error 39"]) {
+    if any(&["os error 112", "os error 39", "no space left on device", "not enough space on the disk"]) {
         Reason::Disk
     } else if any(&["sha-256", "размер загруженной", "подпись"]) {
         Reason::Corrupt
-    } else if any(&["os error 5)", "access is denied", "отказано в доступе"]) {
+    } else if any(&["os error 5)", "access is denied", "permission denied", "отказано в доступе"]) {
         Reason::Access
     } else if any(&["os error 100", "os error 110", "dns", "timeout", "timed out", "connection", "tls", "http status", "io:"]) {
         Reason::Network
@@ -226,6 +226,11 @@ pub fn install_driver(root: &Path) -> Result<(), String> {
 fn powershell() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
         .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+pub(crate) fn tar() -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+        .join("System32/tar.exe")
 }
 
 /// `Start-Process -Verb RunAs` is the only elevation path without a service. The INF argument
@@ -460,7 +465,7 @@ fn assemble(parts: &[PathBuf], archive: &Path, expected: &str) -> Result<(), Str
 /// tar's errors go to a file, not a pipe nobody drains while the archive is fed.
 fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
     let log = archive.with_extension("log");
-    let mut tar = Command::new("tar.exe")
+    let mut tar = Command::new(tar())
         .args(["-xf", "-", "-C"])
         .arg(stage)
         .stdin(Stdio::piped())
@@ -468,26 +473,24 @@ fn unpack(archive: &Path, stage: &Path) -> Result<(), String> {
         .stderr(File::create(&log).map_err(|e| e.to_string())?)
         .creation_flags(NO_WINDOW)
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Не удалось запустить системный tar.exe: {e}"))?;
     let fed = feed(archive, tar.stdin.take().ok_or("tar без stdin")?);
     let status = tar.wait().map_err(|e| e.to_string())?;
-    let errors = std::fs::read_to_string(&log).unwrap_or_default();
+    let errors = crate::logs::read_tail(&log, 8192).unwrap_or_default();
     match fed {
         Ok(()) if status.success() => Ok(()),
         fed => Err(unpack_error(fed.err(), status.code(), &errors)),
     }
 }
 
-/// tar's own last error is the most useful; a broken pipe only means tar stopped first.
+/// Keep the cause before tar's final generic summary; a broken pipe alone is not diagnostic.
 fn unpack_error(fed: Option<std::io::Error>, code: Option<i32>, errors: &str) -> String {
-    let detail = match errors.lines().map(str::trim).rfind(|l| !l.is_empty()) {
-        Some(line) => line.chars().take(300).collect(),
-        None => match fed {
-            Some(e) => e.to_string(),
-            None => format!("tar завершился с кодом {code:?}"),
-        },
-    };
-    format!("Не удалось распаковать компонент: {detail}")
+    let lines: Vec<_> = errors.lines().map(str::trim).filter(|l| !l.is_empty()).rev().take(4).collect();
+    let mut detail = lines.into_iter().rev().collect::<Vec<_>>().join("; ");
+    if let Some(error) = fed {
+        detail.push_str(&format!("; поток архива: {error}"));
+    }
+    format!("Не удалось распаковать компонент (tar {code:?}): {}", detail.chars().take(1200).collect::<String>())
 }
 
 fn feed(archive: &Path, mut input: ChildStdin) -> std::io::Result<()> {
@@ -593,6 +596,8 @@ mod tests {
         assert_eq!(reason("timeout: connect"), Reason::Network);
         assert_eq!(reason("http status: 404"), Reason::Network);
         assert_eq!(reason("There is not enough space on the disk. (os error 112)"), Reason::Disk);
+        assert_eq!(reason("vendor/x.dll: Cannot write: No space left on device"), Reason::Disk);
+        assert_eq!(reason("vendor/x.dll: Cannot open: Permission denied"), Reason::Access);
         assert_eq!(reason(r"SHA-256 не совпадает: C:\x\part-000"), Reason::Corrupt);
         assert_eq!(reason("Access is denied. (os error 5)"), Reason::Access);
         assert_eq!(reason("Не удалось распаковать компонент"), Reason::Other);
@@ -625,8 +630,9 @@ mod tests {
         std::fs::write(&archive, b"not an archive").unwrap();
         std::fs::create_dir_all(root.join("bad")).unwrap();
         let error = unpack(&archive, &root.join("bad")).unwrap_err();
-        assert!(error.starts_with("Не удалось распаковать компонент: ") && error.len() > 70, "{error}");
-        assert_eq!(unpack_error(None, Some(1), "\r\ntar.exe: Error opening archive\r\n\r\n"), "Не удалось распаковать компонент: tar.exe: Error opening archive");
+        assert!(error.starts_with("Не удалось распаковать компонент (tar ") && error.contains("поток архива:"), "{error}");
+        let error = unpack_error(None, Some(1), "\r\nvendor/x.dll: Cannot open: No space left on device\r\ntar.exe: Error exit delayed from previous errors.\r\n");
+        assert!(error.contains("No space left on device") && error.contains("Error exit delayed"), "{error}");
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]

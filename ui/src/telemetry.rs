@@ -47,28 +47,69 @@ pub fn report(data: &Path, runtime: &Path, note: &str) -> Result<String, String>
     if !enabled() {
         return Err("Отправка отчётов доступна только в установленной версии".into());
     }
-    let mut events = vec![error_event("user-report", note)];
-    for name in ["app.log", "nvafx.log", "tag-host.log", "sessions.log", "tag-headphones.log"] {
-        let path = runtime.join("results").join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(text) if !text.trim().is_empty() => events.push(error_event(name, &text)),
-            _ => continue,
-        }
-    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut events = report_events(data, runtime, exe.parent().ok_or("Нет папки приложения")?, note);
+    events.push(error_event("report-environment", &format!(
+        "Windows: {}\ntar: {}",
+        crate::logs::command("cmd.exe", &["/d", "/c", "ver"]),
+        crate::logs::command(crate::components::tar(), &["--version"]),
+    )));
     let count = events.len();
     send(data, events, Duration::from_secs(15))?;
     Ok(format!("Отчёт отправлен ({count})"))
 }
 
-/// `stack_top` holds the newest lines: a log grows at the end, and the worker stores 2 KB.
+fn report_events(data: &Path, runtime: &Path, app: &Path, note: &str) -> Vec<serde_json::Value> {
+    let mut events = vec![error_event("user-report", note)];
+    let mut files: Vec<_> = [
+        "app.log", "nvafx.log", "tag-host.log", "tag-host.previous.log",
+        "tag-endpoint.log", "sessions.log", "tag-headphones.log",
+    ].into_iter().map(|name| (name, runtime.join("results").join(name))).collect();
+    files.push(("component-unpack.log", runtime.join(".download-rvc/rvc-runtime.tar.log")));
+    files.push(("rust-ui-error.log", data.join("Logs/rust-ui-error.log")));
+    files.push(("rust-ui-panic.log", data.join("Logs/rust-ui-panic.log")));
+    // Before Components/vendor exists, the scheduled host's projectRoot() falls back to
+    // the installation parent. Keep these early failures even after core has been installed.
+    if let Some(parent) = app.parent().filter(|p| *p != runtime) {
+        files.push(("startup/tag-host.log", parent.join("results/tag-host.log")));
+        files.push(("startup/tag-host.previous.log", parent.join("results/tag-host.previous.log")));
+        files.push(("startup/tag-endpoint.log", parent.join("results/tag-endpoint.log")));
+    }
+    let mut inventory = Vec::new();
+    for (name, path) in files {
+        let status = match crate::logs::read_tail(&path, 8192) {
+            Ok(text) if text.trim().is_empty() => "empty".to_owned(),
+            Ok(text) => {
+                events.push(error_event(name, &text));
+                let modified = path.metadata().and_then(|m| m.modified()).ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| format!("{}Z", chrono_free_utc(d.as_secs())))
+                    .unwrap_or_else(|| "unknown".into());
+                format!("included; modified={modified}")
+            }
+            Err(e) => format!("unavailable: {:?}; os={:?}", e.kind(), e.raw_os_error()),
+        };
+        inventory.push(format!("{name}: {status}"));
+    }
+    events.push(error_event("report-files", &inventory.join("\n")));
+    events
+}
+
+/// The worker's JS schema limits UTF-16 units, not Unicode scalar values or UTF-8 bytes.
 fn error_event(name: &str, text: &str) -> serde_json::Value {
-    let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = text.chars().rev().scan(0, |len, ch| {
+        *len += ch.len_utf16();
+        (*len <= 2000).then_some(ch)
+    }).collect::<Vec<_>>().into_iter().rev().collect();
     event(
         "error",
         name,
         json!({
             "exception_type": name,
-            "message": text.lines().next_back().unwrap_or("").chars().take(1000).collect::<String>(),
+            "message": text.lines().next_back().unwrap_or("").chars().scan(0, |len, ch| {
+                *len += ch.len_utf16();
+                (*len <= 1000).then_some(ch)
+            }).collect::<String>(),
             "stack_top": tail,
             "source": "micnoize",
         }),
@@ -183,6 +224,46 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reports_include_early_host_unpack_errors_and_missing_files() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../.tmp/report-test").join(std::process::id().to_string());
+        let runtime = root.join("Components");
+        let app = root.join("install/current");
+        std::fs::create_dir_all(runtime.join("results")).unwrap();
+        std::fs::create_dir_all(runtime.join(".download-rvc")).unwrap();
+        std::fs::create_dir_all(root.join("install/results")).unwrap();
+        std::fs::create_dir_all(root.join("Logs")).unwrap();
+        let app_log = runtime.join("results/app.log");
+        std::fs::write(&app_log, format!("{}\nlast failure 😀", "old log\n".repeat(10_000))).unwrap();
+        std::fs::write(runtime.join("results/nvafx.log"), b"").unwrap();
+        std::fs::write(root.join("install/results/tag-host.log"), "TAG API missing before core install").unwrap();
+        std::fs::write(runtime.join(".download-rvc/rvc-runtime.tar.log"), b"bad byte \xff\nAccess denied").unwrap();
+        std::fs::write(root.join("Logs/rust-ui-error.log"), "TAG host initializing or waiting for driver").unwrap();
+        let tail = crate::logs::read_tail(&app_log, 8192).unwrap();
+        assert!(tail.len() <= 8192 && tail.ends_with("last failure 😀"));
+        let events = report_events(&root, &runtime, &app, "state=0 driver=false core=false");
+        let get = |name| events.iter().find(|e| e["name"] == name).unwrap()["data"]["stack_top"].as_str().unwrap();
+        assert!(get("app.log").ends_with("last failure 😀"));
+        assert!(get("startup/tag-host.log").contains("TAG API missing"));
+        assert!(get("component-unpack.log").contains("Access denied"));
+        assert!(get("rust-ui-error.log").contains("waiting for driver"));
+        assert!(get("report-files").contains("tag-host.log: unavailable:"));
+        assert!(get("report-files").contains("nvafx.log: empty"));
+        assert!(get("report-files").contains("startup/tag-host.log: included; modified="));
+        assert_eq!(get("user-report"), "state=0 driver=false core=false");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_fields_fit_worker_utf16_limits() {
+        let event = error_event("app.log", &format!("{}END", "😀".repeat(3000)));
+        let tail = event["data"]["stack_top"].as_str().unwrap();
+        let message = event["data"]["message"].as_str().unwrap();
+        assert!(tail.ends_with("END") && tail.encode_utf16().count() <= 2000);
+        assert_eq!(message.encode_utf16().count(), 1000);
+    }
+
     #[test]
     fn unix_epoch_formats_as_utc() {
         assert_eq!(chrono_free_utc(0), "1970-01-01T00:00:00");
