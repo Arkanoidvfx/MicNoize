@@ -5393,7 +5393,7 @@ fn main() {
     cpu_denoise::register();
     let root = paths::Paths::resolve().ok().map(|p| p.data);
     let mut result = (|| -> Result<(), String> {
-        legacy?;
+        legacy.map_err(|e| format!("Сохранение предыдущей установки: {e}"))?;
         if let Some(at)=upgrade {
             if !args.iter().any(|arg|arg=="--repair-lines"){return Err("Переход требует явного разрешения на перенос старых виртуальных линий (--repair-lines)".into());}
             let install=args.get(at+1).ok_or("Путь установленной программы не указан")?;
@@ -5445,12 +5445,12 @@ fn main() {
             let center=args.iter().position(|arg|arg=="--ui-update-preview").and_then(|i|args.get(i+1)).and_then(|v|v.to_str()).and_then(update_window::parse_point);
             return update_window::watch(runtime,center,Some(("0.2.14".into(),"0.2.15".into())),||{std::thread::sleep(Duration::from_secs(4));Ok(false)});
         }
-        if !maintenance::startup()? { return Ok(()); }
+        if !maintenance::startup().map_err(|e| format!("Восстановление установки: {e}"))? { return Ok(()); }
         if args.iter().any(|arg|arg=="--ui-benchmark") && let Some(at)=args.iter().position(|arg|arg=="--check-update-package") {
             let package=args.get(at+1).ok_or("Check package path missing")?;
             return updater::check_local_package(std::path::Path::new(package));
         }
-        let Some((app, task)) = App::new()? else {
+        let Some((app, task)) = App::new().map_err(|e| format!("Инициализация приложения: {e}"))? else {
             return Ok(());
         };
         let state = std::cell::RefCell::new(Some((app, task)));

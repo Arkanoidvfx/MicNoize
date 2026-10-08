@@ -128,7 +128,7 @@ fn check_signed_files(package:&Path,version:&str,payload:&str)->Result<(),String
         let (sha,name)=line.split_once("  ").ok_or("Неверная строка подписи обновления")?;
         if sha.len()!=64 || !sha.bytes().all(|b|b.is_ascii_hexdigit()) || signed.insert(name,sha).is_some() {return Err("Неверная строка подписи обновления".into());}
     }
-    let mut archive=zip::ZipArchive::new(File::open(package).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    let mut archive=zip::ZipArchive::new(File::open(package).map_err(|e|format!("Открытие пакета {}: {e}",package.display()))?).map_err(|e|e.to_string())?;
     if archive.len()>4096 {return Err("Слишком много файлов в пакете приложения".into());}
     for index in 0..archive.len() {
         let mut file=archive.by_index(index).map_err(|e|e.to_string())?;
@@ -174,7 +174,7 @@ struct LegacyBackup {
     app_login:Option<String>,
 }
 fn legacy_ui_hash(path:&Path)->Result<Option<String>,String> {
-    let mut archive=zip::ZipArchive::new(File::open(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    let mut archive=zip::ZipArchive::new(File::open(path).map_err(|e|format!("Открытие файла {}: {e}",path.display()))?).map_err(|e|e.to_string())?;
     if archive.len()>4096{return Err("Слишком много файлов в старом пакете".into());}
     let names:Vec<String>=archive.file_names().map(str::to_owned).collect();
     if names.iter().any(|n|n=="micnoize-bundle.json" || n.ends_with("/micnoize-bundle.json")){return Ok(None);}
@@ -264,7 +264,7 @@ struct Journal {
 }
 fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension("tmp");
-    let mut file = File::create(&temp).map_err(|e| e.to_string())?;
+    let mut file = File::create(&temp).map_err(|e| format!("Создание {}: {e}", temp.display()))?;
     file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?; drop(file);
     let from = temp.to_str().ok_or("Invalid temporary path")?; let to = path.to_str().ok_or("Invalid journal path")?;
     if unsafe { mnr_replace_file(from.as_ptr(), from.len() as u32, to.as_ptr(), to.len() as u32) } == 0 { return Err("Не удалось сохранить этап обновления".into()); }
@@ -272,8 +272,8 @@ fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 fn save(journal: &Journal) -> Result<(), String> { atomic(&journal.runtime.join(".update/journal.json"), &serde_json::to_vec(journal).map_err(|e| e.to_string())?) }
 fn copy_synced(from: &Path, to: &Path) -> Result<(), String> {
-    fs::copy(from, to).map_err(|e| e.to_string())?;
-    File::options().write(true).open(to).and_then(|f| f.sync_all()).map_err(|e| e.to_string())
+    fs::copy(from, to).map_err(|e| format!("Копирование {} -> {}: {e}", from.display(), to.display()))?;
+    File::options().write(true).open(to).and_then(|f| f.sync_all()).map_err(|e| format!("Сохранение {}: {e}", to.display()))
 }
 fn retained_package(runtime:&Path,version:&str)->PathBuf {
     runtime.join(".update").join(format!("previous-{version}.nupkg"))
@@ -338,14 +338,9 @@ fn verify_ready(runtime:&Path,allow_setup:bool)->Result<(),String> {
     })
 }
 fn run_recovery(exe: Option<&Path>, runtime: &Path) -> Result<(), String> {
-    let mut command = Command::new("reg"); command.creation_flags(0x08000000);
-    if let Some(exe) = exe {
-        command.args(["add",RUN_KEY,"/v",RUN_NAME,"/t","REG_SZ","/d"])
-            .arg(format!("\"{}\" --recover-update \"{}\"",exe.display(),runtime.display())).arg("/f");
-    } else { command.args(["delete",RUN_KEY,"/v",RUN_NAME,"/f"]); }
-    let output = command.output().map_err(|e| e.to_string())?;
-    if !output.status.success() && exe.is_some() { return Err("Не удалось зарегистрировать восстановление прерванного обновления".into()); }
-    Ok(())
+    let value = exe.map(|exe| format!("\"{}\" --recover-update \"{}\"", exe.display(), runtime.display()));
+    write_run(RUN_NAME, value.as_deref())
+        .map_err(|e| format!("Автозапуск восстановления {RUN_NAME}: {e}"))
 }
 fn folder(j: &Journal) -> PathBuf { j.runtime.join(".update").join(&j.transaction) }
 fn legacy_guard()->Result<Lock,String> {
@@ -847,6 +842,14 @@ pub fn startup() -> Result<bool,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_file_errors_identify_paths() {
+        let t=temp();let missing=t.0.join("missing.nupkg");let copy=t.0.join("copy.nupkg");
+        let error=check_signed_files(&missing,"1.2.3","MicNoize 1.2.3\n").unwrap_err();
+        assert!(error.contains(&missing.display().to_string()),"{error}");
+        let error=copy_synced(&missing,&copy).unwrap_err();
+        assert!(error.contains(&missing.display().to_string()) && error.contains(&copy.display().to_string()),"{error}");
+    }
     #[test]
     fn update_download_retains_current_package_outside_velopack_cache() {
         let t=temp();let root=&t.0;let runtime=root.join("runtime");let current=root.join("current");
