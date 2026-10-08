@@ -5391,7 +5391,8 @@ fn main() {
     let legacy=if upgrade.is_some() || upgrade_launcher{Ok(())}else{maintenance::preserve_legacy()};
     if legacy.is_ok() && upgrade.is_none() && !upgrade_launcher{velopack::VelopackApp::build().set_auto_apply_on_startup(false).run();}
     cpu_denoise::register();
-    let root = paths::Paths::resolve().ok().map(|p| p.data);
+    let startup_paths = paths::Paths::resolve().ok();
+    let root = startup_paths.as_ref().map(|p| p.data.clone()).or_else(||std::env::var_os("APPDATA").map(|p|PathBuf::from(p).join("Mic Noize")));
     let mut result = (|| -> Result<(), String> {
         legacy.map_err(|e| format!("Сохранение предыдущей установки: {e}"))?;
         if let Some(at)=upgrade {
@@ -5483,23 +5484,31 @@ fn main() {
         .executor::<Pool>()
         .scale_factor(|s: &App, _| s.qa_scale)
         .run()
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("Создание окна приложения: {e}"))
     })();
     if result.is_ok() && RESTART.swap(false, Ordering::Relaxed) {
         result = std::env::current_exe()
-            .and_then(|exe| Command::new(exe).spawn())
-            .map(|_| ())
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("Путь приложения для перезапуска: {e}"))
+            .and_then(|exe| Command::new(&exe).spawn().map(|_| ())
+                .map_err(|e| format!("Перезапуск {}: {e}", exe.display())));
     }
     if let Err(e) = result {
-        if let Some(root) = root {
+        let report = if let Some(root) = root {
             let _ = std::fs::create_dir_all(root.join("Logs"));
             let _ = std::fs::write(root.join("Logs/rust-ui-error.log"), format!("Mic Noize {}\n{e}", env!("CARGO_PKG_VERSION")));
-        }
+            let runtime = args.iter().position(|arg|arg=="--recover-update").and_then(|at|args.get(at+1)).map(PathBuf::from)
+                .or_else(||startup_paths.as_ref().map(|p|p.runtime_root().to_path_buf())).unwrap_or_else(||root.join("Components"));
+            let sent = match telemetry::startup_failure(&root, &runtime, &e) {
+                Ok(()) => "Диагностика отправлена разработчику автоматически.".to_owned(),
+                Err(error) => format!("Диагностику не удалось отправить: {error}"),
+            };
+            let _ = std::fs::write(root.join("Logs/startup-report.log"), &sent);
+            format!("{sent}\nЛог: {}", root.join("Logs/rust-ui-error.log").display())
+        } else { "APPDATA отсутствует: локальный лог и автоматический отчёт недоступны.".into() };
         eprintln!("{e}");
         // Startup recovery failures must remain visible even in the GUI subsystem build.
         unsafe extern "system" {fn MessageBoxW(window:isize,text:*const u16,title:*const u16,flags:u32)->i32;}
-        let text:Vec<u16>=format!("Mic Noize не удалось запустить:\n\n{e}\0").encode_utf16().collect();
+        let text:Vec<u16>=format!("Mic Noize не удалось запустить:\n\n{e}\n\n{report}\0").encode_utf16().collect();
         let title:Vec<u16>="Mic Noize\0".encode_utf16().collect();
         unsafe{MessageBoxW(0,text.as_ptr(),title.as_ptr(),0x10);}
     }

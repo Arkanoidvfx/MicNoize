@@ -11,7 +11,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn resolve() -> Result<Self, String> {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = std::env::current_exe().map_err(|e| format!("Путь исполняемого файла: {e}"))?;
         let app = exe
             .parent()
             .ok_or("Executable has no parent directory")?
@@ -21,7 +21,7 @@ impl Paths {
             .ok_or("APPDATA is not set")?;
         let data = roaming.join(APP_DIR);
         let components = data.join("Components");
-        std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&data).map_err(|e| format!("Создание папки данных {}: {e}", data.display()))?;
 
         // One-time migration from the old install, then the repository-local layout.
         let legacy_repo = app
@@ -38,7 +38,7 @@ impl Paths {
                     .filter(|p| p.is_file())
             });
             if let Some(old) = old {
-                std::fs::copy(old, &settings).map_err(|e| e.to_string())?;
+                std::fs::copy(&old, &settings).map_err(|e| format!("Перенос настроек {} -> {}: {e}", old.display(), settings.display()))?;
             }
         }
         Ok(Self {

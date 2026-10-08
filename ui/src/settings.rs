@@ -17,13 +17,13 @@ impl Settings {
         let bytes = match std::fs::read(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(format!("Чтение настроек {}: {e}", path.display())),
         };
         let text = decode_ini(&bytes)?;
         if !text.contains("[effects]") && path.exists() {
             let backup = root.join("settings.pre-rust.ini");
             if !backup.exists() {
-                std::fs::copy(&path, backup).map_err(|e| e.to_string())?;
+                std::fs::copy(&path, &backup).map_err(|e| format!("Резервная копия настроек {} -> {}: {e}", path.display(), backup.display()))?;
             }
         }
         Ok(Self {

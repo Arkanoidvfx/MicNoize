@@ -59,6 +59,35 @@ pub fn report(data: &Path, runtime: &Path, note: &str) -> Result<String, String>
     Ok(format!("Отчёт отправлен ({count})"))
 }
 
+pub fn startup_failure(data: &Path, runtime: &Path, error: &str) -> Result<(), String> {
+    if !enabled() { return Err("Автоматический отчёт недоступен в этой сборке".into()); }
+    let exe = std::env::current_exe().map_err(|e| format!("Путь приложения: {e}"))?;
+    let app = exe.parent().ok_or("Нет папки приложения")?;
+    send(data, startup_events(data, runtime, app, error), Duration::from_secs(3))
+}
+
+fn startup_events(data: &Path, runtime: &Path, app: &Path, error: &str) -> Vec<serde_json::Value> {
+    let mut events = report_events(data, runtime, app, error);
+    events[0] = error_event("startup-failure", error);
+    let mut inventory = vec![format!("app={}\ndata={}\nruntime={}", app.display(), data.display(), runtime.display())];
+    if let Ok(exe) = std::env::current_exe() { inventory.push(format!("exe={}", exe.display())); }
+    for path in [app.join("MicNoize.exe"), app.join("mic_tag_host.exe"), app.join("micnoize-bundle.json"), app.join("sq.version"),
+        runtime.join(".update/journal.json"), runtime.join(".update/repair.json"), runtime.join(".update/hold")] {
+        let state = match path.metadata() {
+            Ok(meta) => format!("exists; bytes={}", meta.len()),
+            Err(e) => format!("{:?}; os={:?}", e.kind(), e.raw_os_error()),
+        };
+        inventory.push(format!("{}: {state}", path.display()));
+    }
+    if let Ok(text) = crate::logs::read_tail(&runtime.join(".update/journal.json"), 16384)
+        && let Ok(journal) = serde_json::from_str::<serde_json::Value>(&text) {
+        inventory.push(format!("journal phase={} before={} after={} install={}",
+            journal["phase"], journal["before"]["version"], journal["after"]["version"], journal["install"]));
+    }
+    events.push(error_event("startup-files", &inventory.join("\n")));
+    events
+}
+
 fn report_events(data: &Path, runtime: &Path, app: &Path, note: &str) -> Vec<serde_json::Value> {
     let mut events = vec![error_event("user-report", note)];
     let mut files: Vec<_> = [
@@ -68,6 +97,7 @@ fn report_events(data: &Path, runtime: &Path, app: &Path, note: &str) -> Vec<ser
     files.push(("component-unpack.log", runtime.join(".download-rvc/rvc-runtime.tar.log")));
     files.push(("rust-ui-error.log", data.join("Logs/rust-ui-error.log")));
     files.push(("rust-ui-panic.log", data.join("Logs/rust-ui-panic.log")));
+    files.push(("startup-report.log", data.join("Logs/startup-report.log")));
     // Before Components/vendor exists, the scheduled host's projectRoot() falls back to
     // the installation parent. Keep these early failures even after core has been installed.
     if let Some(parent) = app.parent().filter(|p| *p != runtime) {
@@ -252,6 +282,16 @@ mod tests {
         assert!(get("report-files").contains("nvafx.log: empty"));
         assert!(get("report-files").contains("startup/tag-host.log: included; modified="));
         assert_eq!(get("user-report"), "state=0 driver=false core=false");
+        std::fs::create_dir_all(runtime.join(".update")).unwrap();
+        std::fs::write(runtime.join(".update/journal.json"), r#"{"phase":"Complete","before":{"version":"0.4.17"},"after":{"version":"0.4.20"},"install":"fixture"}"#).unwrap();
+        let startup = startup_events(&root, &runtime, &app, "Восстановление установки: missing file");
+        assert_eq!(startup[0]["name"], "startup-failure");
+        assert!(startup[0]["data"]["stack_top"].as_str().unwrap().contains("missing file"));
+        let inventory = startup.iter().find(|e|e["name"]=="startup-files").unwrap()["data"]["stack_top"].as_str().unwrap();
+        assert!(inventory.contains("MicNoize.exe: NotFound") && inventory.contains("mic_tag_host.exe: NotFound"));
+        assert!(inventory.contains("Complete") && inventory.contains("0.4.17") && inventory.contains("0.4.20"));
+        std::fs::write(runtime.join(".update/journal.json"), b"{torn").unwrap();
+        assert!(startup_events(&root, &runtime, &app, "corrupt journal").len() <= 50);
         std::fs::remove_dir_all(root).unwrap();
     }
 

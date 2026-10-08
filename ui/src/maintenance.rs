@@ -74,7 +74,7 @@ impl Bundle {
     fn installed(&self,root:&Path)->Result<(),String> {
         use velopack::locator::{auto_locate_app_manifest,LocationContext};
         self.matches(&root.join("current"))?;
-        let location=auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(root.to_path_buf(),None)).map_err(|e|e.to_string())?;
+        let location=auto_locate_app_manifest(LocationContext::FromSpecifiedRootDir(root.to_path_buf(),None)).map_err(|e|format!("Метаданные установки {}: {e}",root.display()))?;
         if location.get_manifest_id()!="MicNoize" || location.get_manifest_version().to_string()!=self.version{return Err("Метаданные установки не соответствуют комплекту UI/хоста".into());}
         Ok(())
     }
@@ -494,7 +494,7 @@ fn verify_reinstallation(j:&Journal,version:&str,path:&Path,envelope:&str,key:[u
 }
 fn finish_reinstallation(j:&mut Journal)->Result<bool,String> {
     use velopack::locator::{auto_locate_app_manifest,LocationContext};
-    let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|e.to_string())?;
+    let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|format!("Метаданные переустановки {}: {e}",j.install.display()))?;
     let version=location.get_manifest_version().to_string();
     if version==j.before.version || version==j.after.version {return Ok(false);}
     if location.get_root_dir()!=j.install {return Err("Переустановка относится к другой папке приложения".into());}
@@ -698,9 +698,10 @@ pub fn update_versions(runtime: &Path) -> Option<(String, String)> {
     read(runtime).ok().map(|j| (j.before.version, j.after.version))
 }
 fn read(runtime: &Path) -> Result<Journal, String> {
-    let mut bytes=Vec::new();File::open(runtime.join(".update/journal.json")).map_err(|e|e.to_string())?.take(16385).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+    let path=runtime.join(".update/journal.json");
+    let mut bytes=Vec::new();File::open(&path).map_err(|e|format!("Открытие журнала {}: {e}",path.display()))?.take(16385).read_to_end(&mut bytes).map_err(|e|format!("Чтение журнала {}: {e}",path.display()))?;
     if bytes.len()>16384 {return Err("Update journal exceeds size limit".into());}
-    let j: Journal = serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+    let j: Journal = serde_json::from_slice(&bytes).map_err(|e|format!("Разбор журнала {}: {e}",path.display()))?;
     if j.schema!=1 || j.runtime!=runtime || !j.install.is_absolute() || !j.runtime.is_absolute() {return Err("Invalid update journal identity".into());}
     if uuid::Uuid::parse_str(&j.transaction).is_err() || j.transaction.len()!=36 {return Err("Invalid transaction directory".into());}
     if j.resume.is_some_and(|intent|!(0..=8).contains(&intent.monitor)){return Err("Invalid monitor resume mode".into());}
@@ -752,7 +753,7 @@ pub fn startup() -> Result<bool,String> {
     let args:Vec<_>=std::env::args_os().collect();
     let recovery = args.iter().position(|v|v=="--recover-update");
     let runtime = if let Some(i)=recovery {PathBuf::from(args.get(i+1).ok_or("Recovery runtime missing")?)} else {crate::paths::Paths::resolve()?.runtime_root().to_path_buf()};
-    if recovery.is_some(){std::env::set_current_dir(&runtime).map_err(|e|e.to_string())?;}
+    if recovery.is_some(){std::env::set_current_dir(&runtime).map_err(|e|format!("Папка восстановления {}: {e}",runtime.display()))?;}
     if let Some(i)=args.iter().position(|v|v=="--watch-update") {
         if recovery.is_none(){return Err("Watcher requires recovery context".into());}
         let pid=args.get(i+1).and_then(|v|v.to_str()).and_then(|v|v.parse().ok()).ok_or("Watcher PID missing")?;
@@ -767,15 +768,15 @@ pub fn startup() -> Result<bool,String> {
     let repair_path=runtime.join(".update/repair.json");
     if repair_path.exists() {
         let _lock=Lock::wait(10000)?;let mut bytes=Vec::new();
-        File::open(&repair_path).map_err(|e|e.to_string())?.take(16385).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+        File::open(&repair_path).map_err(|e|format!("Открытие журнала восстановления {}: {e}",repair_path.display()))?.take(16385).read_to_end(&mut bytes).map_err(|e|format!("Чтение журнала восстановления {}: {e}",repair_path.display()))?;
         if bytes.len()>16384{return Err("Repair journal exceeds size limit".into());}
-        let record:Repair=serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+        let record:Repair=serde_json::from_slice(&bytes).map_err(|e|format!("Разбор журнала восстановления {}: {e}",repair_path.display()))?;
         if record.runtime!=runtime || !record.app.is_absolute(){return Err("Invalid repair journal identity".into());}
         check_hash(&record.app,&record.app_hash)?;
         unsafe{std::env::set_var("MNR_RUNTIME_ROOT",&runtime);std::env::set_var("MNR_TAG_HOST_PATH",record.app.parent().ok_or("Repair app directory missing")?.join("mic_tag_host.exe"));}
         // Interrupted repair never repeats driver installation/UAC on its own.
         finish_repair(&record)?;
-        if recovery.is_some(){Command::new(&record.app).creation_flags(0x08000000).spawn().map_err(|e|e.to_string())?;return Ok(false);}
+        if recovery.is_some(){Command::new(&record.app).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {}: {e}",record.app.display()))?;return Ok(false);}
     }
     if !runtime.join(".update/journal.json").exists() {return Ok(recovery.is_none());}
     let _lock = match Lock::wait(10000) {Ok(lock)=>lock,Err(_)=>return Ok(false)};
@@ -790,12 +791,12 @@ pub fn startup() -> Result<bool,String> {
         let previous_ui=legacy_ui_matches(&j).is_ok();
         if previous_ui {
             restore_legacy(&mut j)?;
-            Command::new(current.join("MicNoize.exe")).current_dir(&runtime).creation_flags(0x08000000).spawn().map_err(|e|e.to_string())?;
+            Command::new(current.join("MicNoize.exe")).current_dir(&runtime).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {} из {}: {e}",current.join("MicNoize.exe").display(),runtime.display()))?;
             return Ok(false);
         }
         if j.phase!=Phase::RollingBack && j.after.installed(&j.install).is_ok() {
             if recovery.is_some() {
-                Command::new(current.join("MicNoize.exe")).current_dir(&runtime).creation_flags(0x08000000).spawn().map_err(|e|e.to_string())?;
+                Command::new(current.join("MicNoize.exe")).current_dir(&runtime).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {} из {}: {e}",current.join("MicNoize.exe").display(),runtime.display()))?;
                 return Ok(false);
             }
             let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
@@ -812,11 +813,11 @@ pub fn startup() -> Result<bool,String> {
     }
     // The copied recovery executable must not validate a newer protocol with its old native ABI.
     if recovery.is_some() && j.after.installed(&j.install).is_ok() && j.phase!=Phase::RollingBack {
-        Command::new(current.join("MicNoize.exe")).creation_flags(0x08000000).spawn().map_err(|e|e.to_string())?; return Ok(false);
+        Command::new(current.join("MicNoize.exe")).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {}: {e}",current.join("MicNoize.exe").display()))?; return Ok(false);
     }
     if j.before.installed(&j.install).is_ok() {
         if recovery.is_some() {
-            Command::new(current.join("MicNoize.exe")).creation_flags(0x08000000).spawn().map_err(|e|e.to_string())?;return Ok(false);
+            Command::new(current.join("MicNoize.exe")).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {}: {e}",current.join("MicNoize.exe").display()))?;return Ok(false);
         }
         if j.phase!=Phase::Prepared {
             let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
