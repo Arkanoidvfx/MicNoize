@@ -358,6 +358,7 @@ public:
     std::atomic<float> intensity{1};
     std::atomic<float> alternateIntensity{0.15f};
     std::atomic<float> noiseGateDb{-72};
+    std::atomic<unsigned> gateHoldMs{250};
     std::atomic<bool> rvcEnabled{false};
     std::atomic<uint64_t> rvcConfig{RvcSettings{}.packed()};
     std::atomic<bool> muted{false};

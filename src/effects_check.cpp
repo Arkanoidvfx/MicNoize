@@ -45,11 +45,18 @@ int main() {try {
         require(data.front()>0 && data.front()<0.001f && data.back()==0.1f,"Gate attack is not a bounded ramp");
         data.fill(0.008f);gate.process(data.data(),data.size(),-40);
         for(float v:data)require(v==0.008f,"Gate hysteresis chopped quiet speech");
-        for(unsigned frame=0;frame<12;++frame){data.fill(0.001f);gate.process(data.data(),data.size(),-40);require(data.back()==0.001f,"Gate hold cut a word ending");}
+        for(unsigned frame=0;frame<25;++frame){data.fill(0.001f);gate.process(data.data(),data.size(),-40);require(data.back()==0.001f,"Default 250 ms gate hold cut a word ending");}
         data.fill(0.001f);gate.process(data.data(),data.size(),-40);
         require(data.front()>0 && data.front()<0.001f && data.back()==0,"Gate release is not a bounded ramp");
         data.fill(0.1f);gate.process(data.data(),data.size(),-40);
         require(data.back()==0.1f,"Gate did not reopen");
+        // Adjustable hold: 0 ms releases on the next quiet block, 1 s keeps 100 blocks open.
+        for(const size_t holdMs:{size_t{0},size_t{1000}}) {
+            mic::NoiseGate held;data.fill(0.1f);held.process(data.data(),data.size(),-40,nullptr,holdMs*48);
+            for(size_t frame=0;frame<holdMs/10;++frame){data.fill(0.001f);held.process(data.data(),data.size(),-40,nullptr,holdMs*48);require(data.back()==0.001f,"Gate closed before its hold ended");}
+            data.fill(0.001f);held.process(data.data(),data.size(),-40,nullptr,holdMs*48);
+            require(data.front()>0 && data.back()==0,"Gate stayed open after its hold");
+        }
         for(unsigned i=0;i<data.size();++i)data[i]=0.2f*std::sin(i*0.1f);
         const auto dry=data;gate.process(data.data(),data.size(),-72);
         require(data==dry,"Disabled gate is not exact dry bypass");

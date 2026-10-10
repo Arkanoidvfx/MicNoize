@@ -92,6 +92,7 @@ unsafe extern "C" {
     fn mnr_bindings(p: usize, keys: *const u32, count: u32);
     fn mnr_alternate_intensity(p: usize, intensity: f32);
     fn mnr_noise_gate(p: usize, threshold_db: f32) -> i32;
+    fn mnr_gate_hold(p: usize, ms: u32) -> i32;
     fn mnr_noise_peak(p: usize) -> f32;
     fn mnr_capture_key(p: usize, enabled: i32);
     fn mnr_events(p: usize) -> u32;
@@ -237,6 +238,8 @@ pub struct Controls {
     pub intensity: f32,
     pub alternate_intensity: f32,
     pub noise_gate_db: f32,
+    /// Gate hold after the voice drops below the threshold, 0-1000 ms.
+    pub gate_hold_ms: u32,
     pub muted: bool,
     pub rvc: bool,
     pub rvc_options: crate::rvc::Options,
@@ -453,6 +456,7 @@ impl Engine {
             let o = controls.rvc_options;
             mnr_alternate_intensity(p, controls.alternate_intensity);
             mnr_noise_gate(p, controls.noise_gate_db);
+            mnr_gate_hold(p, controls.gate_hold_ms);
             mnr_rvc_settings(p, o.slot, o.pitch, o.index, o.chunk, o.gain);
             mnr_controls(
                 p,
@@ -685,6 +689,7 @@ impl Engine {
             let o = c.rvc_options;
             mnr_alternate_intensity(self.p, c.alternate_intensity);
             mnr_noise_gate(self.p, c.noise_gate_db);
+            mnr_gate_hold(self.p, c.gate_hold_ms);
             mnr_rvc_settings(self.p, o.slot, o.pitch, o.index, o.chunk, o.gain);
             mnr_controls(
                 self.p,

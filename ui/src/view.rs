@@ -991,6 +991,15 @@ impl App {
                     label(if self.controls.noise_gate_db <= -72.0 { "Гейт выключен".into() } else { format!("Гейт: {:.0} dB", self.controls.noise_gate_db) }, 12, if self.controls.noise_gate_db <= -72.0 { DIM } else { ORANGE }),
                     caption("Порог на «После» · слева / ПКМ — выкл."),
                 ].spacing(12).align_y(iced::Center),
+                column![
+                    label("Удержание после речи", 11, DIM),
+                    frame(
+                        tacho(0.0..=1000.0, self.controls.gate_hold_ms as f32, Msg::GateHold, clock)
+                            .default(crate::GATE_HOLD_MS as f32).compact()
+                            .format(|v| format!("{v:.0} мс")),
+                        self.ring(self.focus == GATE_HOLD),
+                    ),
+                ].spacing(2),
                 caption("«После» показывает уровень до гейта. Не забудьте отключить гейт в Discord."),
             ]
             .spacing(10),

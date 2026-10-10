@@ -36,6 +36,9 @@ use std::{
 /// 2 (0.3.16): boost 167 %, ×0.67, ×1.67, pitch −6. 3 (0.4.14): «Слышать эффекты» on.
 /// 4 (0.4.15): AutoTune hard-tunes to the minor pentatonic; «Размер голоса» −5 replaces pitch −6.
 const EFFECT_DEFAULTS_VERSION: i32 = 4;
+/// Gate hold default: speech pauses between syllables run 100-200 ms, so 250 ms keeps word
+/// endings and fast loud-to-quiet transitions while noise after a phrase stops within a quarter second.
+pub(crate) const GATE_HOLD_MS: u32 = 250;
 fn apply_effect_defaults(settings: &mut Settings) {
     let version = settings.number("effects", "defaults_version", 1, 1, 99);
     if version >= EFFECT_DEFAULTS_VERSION {
@@ -343,6 +346,7 @@ mod focus {
         pub const INTENSITY: usize = 34;
         pub const ALT_INTENSITY: usize = 37;
         pub const NOISE_GATE: usize = 113;
+        pub const GATE_HOLD: usize = 114;
         pub const NOISE_BIND: usize = 38;
         pub const OVERLOAD: usize = 21;
         pub const BOOST: usize = 2;
@@ -563,6 +567,7 @@ enum Msg {
     Intensity(f32),
     AlternateIntensity(f32),
     NoiseGate(f32),
+    GateHold(f32),
     Boost(f32),
     Overload(bool),
     DiscordVolume(f32),
@@ -1188,6 +1193,7 @@ impl App {
             alternate_intensity: settings.number("audio", "alternate_intensity", 10, 0, 200) as f32
                 / 100.0,
             noise_gate_db: settings.number("audio", "noise_gate_db", -72, -72, 0) as f32,
+            gate_hold_ms: settings.number("audio", "gate_hold_ms", GATE_HOLD_MS as i32, 0, 1000) as u32,
             muted: false,
             rvc: settings.number("effects", "rvc_enabled", 0, 0, 1) != 0,
             rvc_options: rvc::Options::load(&settings),
@@ -1636,6 +1642,7 @@ impl App {
             ("version", self.version),
             ("buffer_ms", self.buffer as i32),
             ("noise_gate_db", self.controls.noise_gate_db.round() as i32),
+            ("gate_hold_ms", self.controls.gate_hold_ms as i32),
             (
                 "intensity",
                 (self.controls.intensity * 100.0).round() as i32,
@@ -3306,6 +3313,13 @@ impl App {
                     self.changed();
                 }
             }
+            Msg::GateHold(v) => {
+                if v.is_finite() {
+                    self.controls.gate_hold_ms = v.round().clamp(0.0, 1000.0) as u32;
+                    self.focus = focus::effects::GATE_HOLD;
+                    self.changed();
+                }
+            }
             Msg::Boost(v) => {
                 self.controls.boost = v / 100.0;
                 self.focus = focus::effects::BOOST;
@@ -4907,7 +4921,7 @@ impl App {
                         items.push(LINES);
                     }
                 }
-                items.extend([ROUTE, NOISE_GATE, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE_LISTEN, TUNE]);
+                items.extend([ROUTE, NOISE_GATE, GATE_HOLD, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE_LISTEN, TUNE]);
                 if self.tune.as_ref().is_some_and(|t| t.phase == tune::Phase::Done) {
                     items.push(TUNE_UNDO);
                 }
@@ -5296,6 +5310,9 @@ impl App {
                 ),
                 NOISE_GATE if delta != 0 || activate => Msg::NoiseGate(
                     if activate { -72.0 } else { self.controls.noise_gate_db + delta as f32 },
+                ),
+                GATE_HOLD if delta != 0 || activate => Msg::GateHold(
+                    if activate { GATE_HOLD_MS as f32 } else { (self.controls.gate_hold_ms as i32 + delta * 10) as f32 },
                 ),
                 NOISE_BIND if activate => Msg::Bind(12),
                 BOOST if delta != 0 => Msg::Boost(
@@ -5912,6 +5929,7 @@ mic-b=65")).unwrap().unwrap();
         assert_eq!(app.controls.noise_gate_db, -72.0, "gate is off by default");
         let (fresh, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         assert_eq!((fresh.controls.intensity, fresh.controls.alternate_intensity), (0.4, 0.1), "first-install defaults");
+        assert_eq!(fresh.controls.gate_hold_ms, 250, "gate hold default");
         drop(fresh);
         assert_eq!(app.keys[12], 0);
         app.window = Some(App::open(1.0, None).0);
@@ -5929,6 +5947,20 @@ mic-b=65")).unwrap().unwrap();
         let _ = app.update(Msg::NoiseGate(-39.6));
         let _ = app.update(Msg::NoiseGate(f32::NAN));
         assert_eq!(app.controls.noise_gate_db, -40.0);
+        app.focus = focus::effects::NOISE_GATE;
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::effects::GATE_HOLD, "gate hold follows the threshold in Tab order");
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert_eq!(app.controls.gate_hold_ms, 260);
+        let _ = app.update(Msg::GateHold(5000.0));
+        assert_eq!(app.controls.gate_hold_ms, 1000);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!(app.controls.gate_hold_ms, 250, "Enter restores the default hold");
+        let _ = app.update(Msg::GateHold(-3.0));
+        assert_eq!(app.controls.gate_hold_ms, 0);
+        let _ = app.update(Msg::GateHold(f32::NAN));
+        let _ = app.update(Msg::GateHold(400.0));
+        assert_eq!(app.controls.gate_hold_ms, 400);
         app.focus = 37;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
         assert_eq!(app.controls.alternate_intensity, 0.11);
@@ -5972,6 +6004,7 @@ mic-b=65")).unwrap().unwrap();
         assert_eq!(restored.controls.intensity, 1.05);
         assert_eq!(restored.controls.alternate_intensity, 0.15);
         assert_eq!(restored.controls.noise_gate_db, -40.0);
+        assert_eq!(restored.controls.gate_hold_ms, 400);
         assert_eq!(restored.keys[12], 120 | 256);
         std::fs::remove_file(dir.join("settings.ini")).unwrap();
     }
@@ -6742,9 +6775,9 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.window = Some(App::open(1.0, None).0);
         app.keys = [0; 21];
         use keyboard::{Key, Modifiers, key::Named};
-        // Шумодав: devices, the headphone gear, the folded route, the gate, the two strengths, then the
-        // tune panel's «Послушать себя» and «Подобрать».
-        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 34, 38, 37, 111, 110, 40] {
+        // Шумодав: devices, the headphone gear, the folded route, the gate and its hold, the two strengths,
+        // then the tune panel's «Послушать себя» and «Подобрать».
+        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 114, 34, 38, 37, 111, 110, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }

@@ -1085,7 +1085,7 @@ void Engine::dspLoop(Config c) {
                 // RVC is still voice: its monitor marks must not bypass the gate.
                 microphoneRaw=out;microphone=out;
                 for(auto& mark:modified)if(mark)mark=ModifiedVoice;
-                peakHold(stats.noisePeak,noiseGate.process(microphone.data(),block,noiseGateDb.load(),gateEnvelope.data()));
+                peakHold(stats.noisePeak,noiseGate.process(microphone.data(),block,noiseGateDb.load(),gateEnvelope.data(),size_t{gateHoldMs.load()}*48));
                 // Capture processed microphone before Discord source selection. Publication is a
                 // try-lock swap of buffers reserved before this real-time loop.
                 if(studioRecording && !studioActive && !studioPending && !muted) studioActive=true;
