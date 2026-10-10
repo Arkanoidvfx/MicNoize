@@ -11,10 +11,15 @@ fn guide_image() -> widget::image::Handle {
     static IMAGE: std::sync::OnceLock<widget::image::Handle> = std::sync::OnceLock::new();
     IMAGE.get_or_init(|| embedded_png(include_bytes!("../../guide.png"))).clone()
 }
-/// Discord's voice settings for Mic Noize: Custom profile, sensitivity -99 dB, no Krisp.
-fn guide_discord_image() -> widget::image::Handle {
+/// Discord noise suppression: Standard, not Krisp on top of Mic Noize.
+fn guide_krisp_image() -> widget::image::Handle {
     static IMAGE: std::sync::OnceLock<widget::image::Handle> = std::sync::OnceLock::new();
-    IMAGE.get_or_init(|| embedded_png(include_bytes!("../../guide-discord.png"))).clone()
+    IMAGE.get_or_init(|| embedded_png(include_bytes!("../../guide-krisp.png"))).clone()
+}
+/// With the Mic Noize gate: Custom profile, automatic sensitivity off, -99 dB.
+fn guide_gate_image() -> widget::image::Handle {
+    static IMAGE: std::sync::OnceLock<widget::image::Handle> = std::sync::OnceLock::new();
+    IMAGE.get_or_init(|| embedded_png(include_bytes!("../../guide-gate.png"))).clone()
 }
 /// A guide screenshot in a thin frame, centred, at its own size or smaller: upscaling blurs the text.
 fn guide_shot<'a>(image: widget::image::Handle) -> Element<'a, Msg> {
@@ -650,8 +655,10 @@ impl App {
                 row![title("Как пользоваться"), action(label("Назад", 13, INK), Msg::Page(0), self.focus == focus::GUIDE, false)].spacing(14).align_y(iced::Center),
                 label("1. В Discord выберите Thin Audio Gateway → Mic Noize в качестве устройства ввода.", 14, DIM),
                 guide_shot(guide_image()),
-                label("2. В настройках голоса Discord: профиль Custom, чувствительность -99 dB, шумоподавление Krisp выключено.", 14, DIM),
-                guide_shot(guide_discord_image()),
+                label("2. Шумоподавление в Discord: Standard, не Krisp.", 14, DIM),
+                guide_shot(guide_krisp_image()),
+                label("3. С гейтом Mic Noize: в Discord профиль Custom, автонастройка выключена, -99 dB.", 14, DIM),
+                guide_shot(guide_gate_image()),
             ].spacing(18).into()
         } else if self.logs_page {
             self.logs_view()
