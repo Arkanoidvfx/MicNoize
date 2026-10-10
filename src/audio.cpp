@@ -903,7 +903,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; failedAt_=0;
     stats.inputQueue=0; stats.outputQueue=0; stats.renderPadding=0;
     stats.underruns=0; stats.drops=0; stats.discontinuities=0; stats.processed=0;
-    stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0;
+    stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0; stats.inputChannels=0; stats.inputFlipped=false;
     stats.tagBufferFrames=0; stats.tagDriverGaps=0; stats.tagFrames=0;
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
     stats.pitchActive=false; stats.boostActive=false; stats.pitchDelayMs=0; stats.pitchMaxMs=0;stats.phraseState=0;stats.phraseSeconds=0;
@@ -971,7 +971,12 @@ void Engine::stop() {
                <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
                <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
                <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
-               <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":stats.denoiser==4?"input":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100;
+               <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":stats.denoiser==4?"input":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100
+               // What a remote report needs to tell a bad input from a bad pipeline: capture gaps, clock drift,
+               // and which device with how many channels (all of them are averaged to mono).
+               <<" capture_gaps="<<stats.discontinuities<<" drift_ppm="<<stats.driftPpm<<" input_period_ms="<<stats.inputPeriodMs
+               <<" input_channels="<<stats.inputChannels<<" input_flip="<<stats.inputFlipped;
+            try {for(const auto& d:devices(true)) if(d.id==config_.input) log<<" input=\""<<utf8(d.name)<<'"';} catch(...) {}
             if(const auto failed=failedAt_.load()) {
                 // The line is written on the next stop(), often much later: keep when it really broke.
                 const FILETIME file{static_cast<DWORD>(failed),static_cast<DWORD>(failed>>32)};SYSTEMTIME at{};
@@ -1284,7 +1289,7 @@ void Engine::tagLoop(Config c) {
     TagClient tag;
     ComPtr<IAudioCaptureClient> capture;
     check(input.client->GetService(IID_PPV_ARGS(&capture)),"TAG microphone capture client");
-    std::vector<float> mono(input.capacity+block);
+    std::vector<float> mono(input.capacity+block); Downmix downmix;
     // Allocate once before rendering: these buffers exceed the audio thread's stack budget.
     constexpr unsigned capacity=16384;
     std::vector<float> output(capacity);
@@ -1296,7 +1301,7 @@ void Engine::tagLoop(Config c) {
     struct Timer {HANDLE h; ~Timer(){CancelWaitableTimer(h);CloseHandle(h);}} closeTimer{timer};
     LARGE_INTEGER due{}; due.QuadPart=-20000;
     if(!SetWaitableTimer(timer,&due,2,nullptr,nullptr,FALSE)) throw std::runtime_error("TAG timer start failed");
-    Mmcss priority; input.start(); stats.inputPeriodMs=input.periodMs; stats.outputPeriodMs=2;
+    Mmcss priority; input.start(); stats.inputPeriodMs=input.periodMs; stats.inputChannels=input.channels; stats.outputPeriodMs=2;
     status(L"TAG ready; select its microphone in a receiving application");
     state=2;
     const unsigned target=c.bufferMs*48;
@@ -1317,12 +1322,8 @@ void Engine::tagLoop(Config c) {
             check(capture->GetBuffer(&bytes,&n,&flags,nullptr,nullptr),"TAG capture buffer");
             if(n>mono.size()){capture->ReleaseBuffer(n);throw std::runtime_error("TAG capture packet exceeds allocation");}
             if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY){++stats.discontinuities;resetEffect_=true;}
-            const auto samples=reinterpret_cast<const float*>(bytes);
-            for(unsigned i=0;i<n;++i) {
-                float v=0;
-                if(!(flags&AUDCLNT_BUFFERFLAGS_SILENT)) for(unsigned ch=0;ch<input.channels;++ch) v+=samples[i*input.channels+ch]/input.channels;
-                mono[i]=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
-            }
+            downmix.process(reinterpret_cast<const float*>(bytes),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
+            stats.inputFlipped=downmix.sign<0;
             check(capture->ReleaseBuffer(n),"TAG release capture");
             peakHold(stats.inputPeak,peak(mono.data(),n));
             if(!captured_.push(mono.data(),n)){++stats.drops;resetEffect_=true;}
@@ -1406,8 +1407,8 @@ void Engine::ioLoop(Config c) {
         check(output.client->GetService(IID_PPV_ARGS(&render)),"Render client");
         check(output.client->GetService(IID_PPV_ARGS(&clock)),"Clock drift correction");
         check(clock->SetSampleRate(rate),"Set output sample rate");
-        stats.inputPeriodMs=input.periodMs; stats.outputPeriodMs=output.periodMs;
-        std::vector<float> mono(std::max(input.capacity,output.capacity)+block);
+        stats.inputPeriodMs=input.periodMs; stats.outputPeriodMs=output.periodMs; stats.inputChannels=input.channels;
+        std::vector<float> mono(std::max(input.capacity,output.capacity)+block); Downmix downmix;
         std::vector<RoutedSample> routed(output.capacity);
         std::vector<uint8_t> sources(output.capacity);
         std::vector<uint8_t> modified(output.capacity);
@@ -1433,13 +1434,9 @@ void Engine::ioLoop(Config c) {
                 check(capture->GetBuffer(&data,&n,&flags,nullptr,nullptr),"Capture buffer");
                 if(n>mono.size()) { capture->ReleaseBuffer(n); throw std::runtime_error("Capture packet exceeds allocated capacity"); }
                 if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) { ++stats.discontinuities; resetEffect_=true; }
-                auto f=reinterpret_cast<const float*>(data);
-                for(UINT32 i=0;i<n;++i) {
-                    // QuadCast exposes two channels. Average rather than amplify correlated stereo.
-                    float value=0;
-                    if(!(flags&AUDCLNT_BUFFERFLAGS_SILENT)) for(unsigned ch=0;ch<input.channels;++ch) value+=f[i*input.channels+ch]/input.channels;
-                    mono[i]=std::isfinite(value)?std::clamp(value,-1.0f,1.0f):0;
-                }
+                // QuadCast exposes two channels: average rather than amplify correlated stereo.
+                downmix.process(reinterpret_cast<const float*>(data),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
+                stats.inputFlipped=downmix.sign<0;
                 check(capture->ReleaseBuffer(n),"Release capture buffer");
                 peakHold(stats.inputPeak,peak(mono.data(),n));
                 if(!captured_.push(mono.data(),n)) { ++stats.drops; resetEffect_=true; }

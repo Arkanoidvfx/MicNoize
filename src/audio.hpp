@@ -132,6 +132,8 @@ struct Stats {
     std::atomic<unsigned> inputQueue{0}, outputQueue{0}, renderPadding{0};
     std::atomic<unsigned> underruns{0}, drops{0}, discontinuities{0}, processed{0};
     std::atomic<float> inputPeriodMs{0}, outputPeriodMs{0}, driftPpm{0};
+    std::atomic<unsigned> inputChannels{0};
+    std::atomic<bool> inputFlipped{false}; // Downmix inverted an anti-phase second channel
     std::atomic<unsigned> tagBufferFrames{0}, tagDriverGaps{0};
     std::atomic<uint64_t> tagFrames{0};
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};

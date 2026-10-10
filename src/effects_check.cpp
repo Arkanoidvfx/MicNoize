@@ -8,6 +8,35 @@
 static void require(bool ok,const char* message){if(!ok) throw std::runtime_error(message);}
 int main() {try {
     {
+        // Anti-phase stereo microphone: plain averaging cancels the voice and keeps only the noise.
+        auto run=[](float polarity,unsigned channels,unsigned packets,float& rms,mic::Downmix& d) {
+            std::array<float,480*3> in{};std::array<float,480> out{};uint32_t seed=1;double sum=0;
+            for(unsigned p=0;p<packets;++p) {
+                for(unsigned i=0;i<480;++i) {
+                    seed=seed*1664525u+1013904223u;const float noise=((seed>>8)/16777216.0f-0.5f)*0.002f;
+                    const float voice=0.3f*std::sin((p*480+i)*0.05f);
+                    in[i*channels]=voice+noise;if(channels>1)in[i*channels+1]=polarity*voice-noise;if(channels>2)in[i*channels+2]=voice;
+                }
+                d.process(in.data(),channels,480,false,out.data());
+                if(p+1==packets){sum=0;for(float v:out)sum+=v*v;}
+            }
+            rms=static_cast<float>(std::sqrt(sum/480));
+        };
+        float rms=0;mic::Downmix inverted;run(-1,2,100,rms,inverted);
+        require(inverted.sign<0 && rms>0.2f,"Anti-phase stereo microphone still cancels the voice");
+        mic::Downmix normal;run(1,2,100,rms,normal);
+        require(normal.sign>0 && rms>0.2f && rms<0.22f,"Correlated stereo is no longer a plain average");
+        mic::Downmix single;run(1,1,10,rms,single);
+        require(single.sign>0 && rms>0.2f,"Mono microphone changed");
+        mic::Downmix three;run(-1,3,100,rms,three);
+        require(three.sign<0 && rms>0.2f,"Anti-phase second channel of a 3-channel input cancels the voice");
+        std::array<float,960> in{};in.fill(0.5f);in[3]=std::numeric_limits<float>::quiet_NaN();std::array<float,480> out{};
+        mic::Downmix bad;bad.process(in.data(),2,480,false,out.data());
+        require(out[1]==0 && bad.xx==0,"Non-finite capture poisoned the downmix");
+        bad.process(in.data(),2,480,true,out.data());
+        for(float v:out)require(v==0,"Silent capture packet is not silence");
+    }
+    {
         mic::NoiseGate gate;std::array<float,480> data{};
         data.fill(0.001f);
         require(gate.process(data.data(),data.size(),-40)==0.001f,"Gate lost its pre-gate meter");

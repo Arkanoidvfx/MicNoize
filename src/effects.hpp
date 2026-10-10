@@ -21,6 +21,33 @@ struct Ramp {
         return value;
     }
 };
+// Capture downmix to mono. Some inputs (Realtek jacks, two-capsule arrays) deliver channel 2
+// phase-inverted: in stereo they sound right, averaged to mono the voice cancels and only the
+// uncorrelated noise survives, which any denoiser (ours or RTX Voice) turns into a robotic voice.
+// Channel 2 takes channel 1's polarity, decided from the energy-weighted correlation over about
+// half a second with hysteresis. No allocation; one decision per packet.
+struct Downmix {
+    double xy=0, xx=0, yy=0;
+    float sign=1;
+    void process(const float* in,unsigned channels,unsigned n,bool silent,float* out) {
+        if(channels>=2 && !silent && n) {
+            double pxy=0, pxx=0, pyy=0;
+            for(unsigned i=0;i<n;++i) {const double l=in[i*channels], r=in[i*channels+1]; pxy+=l*r; pxx+=l*l; pyy+=r*r;}
+            if(std::isfinite(pxy+pxx+pyy)) {
+                const double keep=std::pow(0.98,n/480.0);
+                xy=xy*keep+pxy; xx=xx*keep+pxx; yy=yy*keep+pyy;
+            }
+            const double norm=std::sqrt(xx*yy);
+            if(norm>1e-9) {const double c=xy/norm; if(c<-0.5) sign=-1; else if(c>0.5) sign=1;}
+        }
+        for(unsigned i=0;i<n;++i) {
+            float v=0;
+            if(!silent) for(unsigned ch=0;ch<channels;++ch) v+=(ch==1?sign:1.0f)*in[i*channels+ch];
+            v/=static_cast<float>(channels);
+            out[i]=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
+        }
+    }
+};
 // Microphone gate: 3 dB hysteresis, 120 ms hold and the shared 10 ms gain ramp.
 // No lookahead, allocation or extra buffering. -72 dB is exact dry bypass.
 struct NoiseGate {
