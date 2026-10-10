@@ -104,8 +104,9 @@ extern "C" int32_t mnr_headphone_state(Mnr* p,char* text,uint32_t cap) {
 }
 extern "C" int32_t mnr_monitor(Mnr* p,int32_t enabled,char* error,uint32_t cap) {
     try {
-        if(enabled<0 || enabled>8)throw std::runtime_error("Invalid monitor mode");
-        if(enabled)p->monitor.start(p->outputRoute,static_cast<uint8_t>(enabled-1));else p->monitor.stop();return 1;
+        if(enabled<0 || enabled>9)throw std::runtime_error("Invalid monitor mode");
+        if(enabled==9)p->monitor.start(p->outputRoute,0,true);
+        else if(enabled)p->monitor.start(p->outputRoute,static_cast<uint8_t>(enabled-1));else p->monitor.stop();return 1;
     }
     catch(const std::exception& e){copy(e.what(),error,cap);return 0;}catch(...){copy("Monitor failed",error,cap);return 0;}
 }

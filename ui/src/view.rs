@@ -979,27 +979,30 @@ impl App {
         // From −72 dB: the raw microphone's hiss (about −60 dB) shows on «До», while what is
         // left after the denoiser (around −80 dB) reads as silence on «После».
         let level = |p: f32| ((db(p) + 72.0) / 72.0).clamp(0.0, 1.0);
+        let gate_on = self.controls.noise_gate_db > -72.0;
         let meters = card(
             column![
                 row![label("До", 12, DIM).width(56), tacho::level_meter(level(before), true, Color::from_rgb8(0x8A, 0x8B, 0x92)), container(numbers(db_text(before), 12, DIM)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
-                row![label("После", 12, INK).width(56), frame(tacho::gate_meter(level(after), if level(after) > 0.93 { ORANGE } else { GREEN }, self.controls.noise_gate_db, Msg::NoiseGate), self.ring(self.focus == NOISE_GATE)), container(numbers(db_text(after), 12, INK)).align_right(64)]
-                    .spacing(12)
-                    .align_y(iced::Center),
-                row![
-                    label(if self.controls.noise_gate_db <= -72.0 { "Гейт выключен".into() } else { format!("Гейт: {:.0} dB", self.controls.noise_gate_db) }, 12, if self.controls.noise_gate_db <= -72.0 { DIM } else { ORANGE }),
-                    caption("Порог на «После» · слева / ПКМ — выкл."),
-                ].spacing(12).align_y(iced::Center),
                 column![
-                    label("Удержание после речи", 11, DIM),
-                    frame(
-                        tacho(0.0..=1000.0, self.controls.gate_hold_ms as f32, Msg::GateHold, clock)
-                            .default(crate::GATE_HOLD_MS as f32).compact()
-                            .format(|v| format!("{v:.0} мс")),
-                        self.ring(self.focus == GATE_HOLD),
-                    ),
-                ].spacing(2),
+                    row![label("После", 12, INK).width(56), frame(tacho::gate_meter(level(after), if level(after) > 0.93 { ORANGE } else { GREEN }, self.controls.noise_gate_db, Msg::NoiseGate), self.ring(self.focus == NOISE_GATE)), container(numbers(db_text(after), 12, INK)).align_right(64)]
+                        .spacing(12)
+                        .align_y(iced::Center),
+                    // The hold tag hangs under the threshold line and rides along with it; same
+                    // 56/64 columns and 3 px frame inset as the meter so the scales match.
+                    row![
+                        Space::new().width(56),
+                        focus_target(tacho::gate_hold(self.controls.noise_gate_db, self.controls.gate_hold_ms as f32,
+                            crate::GATE_HOLD_MS as f32, self.ring(self.focus == GATE_HOLD), Msg::GateHold), self.focus == GATE_HOLD)
+                            .padding([0, 3]),
+                        Space::new().width(64),
+                    ].spacing(12),
+                ],
+                row![
+                    label(if gate_on { format!("Гейт: {:.0} dB", self.controls.noise_gate_db) } else { "Гейт выключен".into() }, 12, if gate_on { ORANGE } else { DIM }),
+                    caption("Порог на «После» · слева / ПКМ — выкл. · метка под ним — удержание"),
+                ].spacing(12).align_y(iced::Center),
                 caption("«После» показывает уровень до гейта. Не забудьте отключить гейт в Discord."),
             ]
             .spacing(10),
@@ -1374,24 +1377,35 @@ impl App {
     /// this microphone's room (a quiet sweep, then a spoken check), keeps it per microphone and
     /// puts it back when the microphone changes; «Послушать себя» turns on the full-voice monitor.
     fn tune_panel(&self) -> Element<'_, Msg> {
-        use focus::effects::{TUNE, TUNE_LISTEN, TUNE_UNDO};
+        use focus::effects::{TUNE, TUNE_LISTEN, TUNE_LISTEN_RAW, TUNE_UNDO};
         use tune::Phase;
         let now = Instant::now();
-        let listening = self.monitor_all && matches!(self.monitor, 1 | 2);
+        let monitoring = self.monitor_all && matches!(self.monitor, 1 | 2);
+        let (listening, listening_raw) = (monitoring && !self.monitor_raw, monitoring && self.monitor_raw);
         let ready = self.tune_ready();
         let running = self.tune.as_ref().is_some_and(tune::Tune::running);
         let mic = self.input.as_ref().map_or("микрофон не выбран".to_owned(), |d| d.name.clone());
         let saved = self.input.as_ref().and_then(|d| self.profile(&d.id));
 
-        let listen = action(
-            row![icon(glyph::HEADPHONES, 12, if listening { ORANGE_DARK } else { INK }), label(if listening { "Слушаю себя" } else { "Послушать себя" }, 13, if listening { ORANGE_DARK } else { INK })]
-                .spacing(8)
-                .align_y(iced::Center),
-            Msg::TuneListen,
-            self.focus == TUNE_LISTEN,
-            listening,
-        )
-        .on_press_maybe(matches!(self.snapshot.state, 2 | 3).then_some(Msg::TuneListen));
+        // Two ways to hear yourself, side by side to compare: the virtual microphone as Discord gets
+        // it, and the raw microphone. The one playing is lit; pressing it again stops.
+        let can_listen = matches!(self.snapshot.state, 2 | 3);
+        let listen_button = |text: &'static str, on: bool, msg: Msg, focused: bool| {
+            action(
+                row![icon(glyph::HEADPHONES, 12, if on { ORANGE_DARK } else { INK }), label(text, 13, if on { ORANGE_DARK } else { INK }).wrapping(iced::widget::text::Wrapping::None)]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                msg.clone(),
+                focused,
+                on,
+            )
+            .on_press_maybe(can_listen.then_some(msg))
+        };
+        let listen = row![
+            listen_button("С шумодавом", listening, Msg::TuneListen, self.focus == TUNE_LISTEN),
+            listen_button("Без шумодава", listening_raw, Msg::TuneListenRaw, self.focus == TUNE_LISTEN_RAW),
+        ]
+        .spacing(6);
         let tune_label = match &self.tune {
             Some(t) if t.running() => "Остановить",
             Some(t) if t.phase == Phase::Done => "Ещё раз",
@@ -1403,9 +1417,8 @@ impl App {
         let header = row![
             icon(glyph::MIC, 13, ORANGE),
             bold("Подбор под микрофон", 13, INK),
-            label(mic, 12, FAINT).wrapping(iced::widget::text::Wrapping::None),
-            Space::new().width(Length::Fill),
-            listen,
+            // The microphone name gives way (clipped) before the buttons do.
+            container(label(mic, 12, FAINT).wrapping(iced::widget::text::Wrapping::None)).width(Length::Fill).clip(true),
             tune_button,
         ]
         .spacing(10)
@@ -1484,7 +1497,7 @@ impl App {
                 (Err(why), _) => label(why, 12, FAINT).into(),
                 (Ok(()), Some(strength)) => column![
                     row![numbers(format!("{:.0} %", strength * 100.0), 18, ORANGE), label("подобрано для этого микрофона", 12, DIM)].spacing(10).align_y(iced::Center),
-                    caption("При смене микрофона сила ставится сама. Послушайте себя, чтобы проверить на слух."),
+                    caption("При смене микрофона сила ставится сама. Сравните на слух: с шумодавом и без."),
                 ]
                 .spacing(6)
                 .into(),
@@ -1499,8 +1512,10 @@ impl App {
             column![
                 header,
                 row![
-                    container(left).width(Length::Fill),
-                    container(tacho::tune_curve(curve, &tune::STEPS, chosen, current, tune::SILENT_DB)).width(300),
+                    // 3:2 keeps the chart near 300 px on a wide window and leaves room for both
+                    // listen buttons on one line in a narrow one.
+                    container(column![left, listen].spacing(12)).width(Length::FillPortion(3)),
+                    container(tacho::tune_curve(curve, &tune::STEPS, chosen, current, tune::SILENT_DB)).width(Length::FillPortion(2)).max_width(300),
                 ]
                 .spacing(18)
                 .align_y(iced::Center),
@@ -1796,9 +1811,11 @@ impl App {
         if self.discord_state == 3 && !self.discord_message.contains("Откройте приложение Discord") {
             rows = rows.push(label(&self.discord_message, 12, RED));
         }
-        let full_monitor = if self.monitor_all { self.monitor } else { 0 };
+        let full_monitor = if self.monitor_all && !self.monitor_raw { self.monitor } else { 0 };
         let can_monitor = !self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3);
-        let monitor_note = if self.monitor_all && matches!(self.monitor, 1 | 2) {
+        let monitor_note = if self.monitor_all && self.monitor_raw && matches!(self.monitor, 1 | 2) {
+            "Сейчас слышен микрофон без шумодава; режим эффектов сохранён."
+        } else if self.monitor_all && matches!(self.monitor, 1 | 2) {
             "Сейчас слышен весь голос; режим эффектов сохранён."
         } else if self.effect_monitoring() && self.monitor == 1 {
             "Подключение наушников…"
@@ -3939,6 +3956,10 @@ mod tests {
             render(&app, "gate-voice");
             app.noise_peak = 0.001;
             render(&app, "gate-quiet");
+            app.focus = focus::effects::GATE_HOLD;
+            render(&app, "gate-hold-focus");
+            window.set((820.0, 760.0));
+            render(&app, "gate-narrow");
             window.set((820.0, 600.0));
             scale.set(2.0);
             render(&app, "gate-small-2x");

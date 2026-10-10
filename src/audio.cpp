@@ -746,19 +746,22 @@ Monitor::Monitor(Engine& engine):engine_(engine) {
 Monitor::~Monitor(){stop();CloseHandle(stop_);}
 void Monitor::stop(){engine_.previewMask_=0;SetEvent(stop_);if(thread_.joinable())thread_.join();state=0;}
 std::wstring Monitor::message() const {std::lock_guard lock(mutex_);return message_;}
-void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
+void Monitor::start(const std::wstring& route,uint8_t effectsMask,bool raw) {
     stop();
     if(!engine_.running()) throw std::runtime_error("Start processing before listening");
+    // Raw preview captures the selected physical microphone itself: no denoiser, gate or effects,
+    // and nothing in the DSP/output path changes for Discord.
+    const std::wstring rawInput=raw?engine_.config_.input:std::wstring{};
     ResetEvent(stop_);frames=0;renderedPeak=0;state=1;
-    try {thread_=std::thread([this,route,effectsMask]{
+    try {thread_=std::thread([this,route,effectsMask,raw,rawInput]{
         const bool effectsOnly=effectsMask!=0;
         try {
             Com com;
             // Replugged headphones or a new Windows default output invalidate the stream:
             // reopen on the current default instead of ending the preview.
             for(unsigned lost=0;;) try {
-            std::wstring inputId;
-            if(route==L"TAG") {
+            std::wstring inputId=rawInput;
+            if(!raw && route==L"TAG") {
                 inputId=tagMicrophone().id;
             }
             if(inputId.empty() && (!effectsOnly || route==L"TAG")) throw std::runtime_error("Прослушивание доступно для TAG. Проверьте подключение виртуального микрофона.");
@@ -783,7 +786,7 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
             check(output.client->GetService(IID_PPV_ARGS(&render)),"Monitor render");
             check(output.client->GetService(IID_PPV_ARGS(&clock)),"Monitor clock");
             check(clock->SetSampleRate(rate),"Monitor sample rate");
-            Ring<8192> queue;std::vector<float> mono(std::max(input.capacity,output.capacity));
+            Ring<8192> queue;std::vector<float> mono(std::max(input.capacity,output.capacity));Downmix downmix;
             std::vector<RoutedSample> preview(output.capacity);
             auto queued=[&]{return effectsOnly?engine_.preview_.size():queue.size();};
             auto trim=[&](size_t keep){if(effectsOnly)engine_.preview_.trim(keep);else queue.trim(keep);};
@@ -799,19 +802,14 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
                 const auto wait=WaitForMultipleObjects(3,events,FALSE,100);
                 if(wait==WAIT_OBJECT_0)break;
                 if(wait==WAIT_FAILED)throw std::runtime_error("Monitor audio wait failed");
-                if(!effectsOnly && std::chrono::steady_clock::now()-captured>std::chrono::seconds(2))throw std::runtime_error("Виртуальный микрофон перестал подавать звук. Включите прослушивание повторно.");
+                if(!effectsOnly && std::chrono::steady_clock::now()-captured>std::chrono::seconds(2))throw std::runtime_error(raw?"Микрофон перестал подавать звук. Включите прослушивание повторно.":"Виртуальный микрофон перестал подавать звук. Включите прослушивание повторно.");
                 UINT32 n=0;if(capture)check(capture->GetNextPacketSize(&n),"Monitor packet");
                 while(n) {
                     BYTE* bytes=nullptr;DWORD flags=0;
                     check(capture->GetBuffer(&bytes,&n,&flags,nullptr,nullptr),"Monitor capture buffer");
                     if(n>mono.size()){capture->ReleaseBuffer(n);throw std::runtime_error("Monitor packet exceeds allocation");}
                     if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY){queue.trim(0);primed=false;}
-                    const auto samples=reinterpret_cast<const float*>(bytes);
-                    for(unsigned i=0;i<n;++i){
-                        float v=0;
-                        if(!(flags&AUDCLNT_BUFFERFLAGS_SILENT)) for(unsigned ch=0;ch<input.channels;++ch)v+=samples[i*input.channels+ch]/input.channels;
-                        mono[i]=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
-                    }
+                    downmix.process(reinterpret_cast<const float*>(bytes),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
                     check(capture->ReleaseBuffer(n),"Monitor capture release");
                     if(!effectsOnly && !queue.push(mono.data(),n)){queue.trim(0);primed=false;}
                     captured=std::chrono::steady_clock::now();

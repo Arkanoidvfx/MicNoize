@@ -47,7 +47,8 @@ int main(){try{
         require(!mnr_monitor(p,mode,error,sizeof(error)),"Stopped engine enabled effect preview");
         require(strstr(error,"Start processing before listening")!=nullptr,"Effect monitor mode rejected at ABI");
     }
-    require(!mnr_monitor(p,9,error,sizeof(error)) && strstr(error,"Invalid monitor mode"),"Invalid monitor mask accepted");
+    require(!mnr_monitor(p,10,error,sizeof(error)) && strstr(error,"Invalid monitor mode"),"Invalid monitor mask accepted");
+    require(!mnr_monitor(p,9,error,sizeof(error)) && strstr(error,"Start processing before listening"),"Raw microphone preview rejected at ABI");
     require(!mnr_monitor(p,8,error,sizeof(error)) && strstr(error,"Start processing before listening"),"Soundpad monitor mask rejected at ABI");
     require(mnr_headphone_state(p,error,sizeof(error))==0,"Headphones must start off");
     require(mnr_headphones(p,0,"",0,0,error,sizeof(error))==1,"Headphone stop must be idempotent");

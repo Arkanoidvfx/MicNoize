@@ -385,6 +385,7 @@ mod focus {
         /// «Подбор под микрофон»: tune, listen to yourself, undo.
         pub const TUNE: usize = 110;
         pub const TUNE_LISTEN: usize = 111;
+        pub const TUNE_LISTEN_RAW: usize = 115;
         pub const TUNE_UNDO: usize = 112;
         /// The first-run setup card: retry the download, install the virtual microphone.
         pub const SETUP_RETRY: usize = 84;
@@ -719,6 +720,8 @@ enum Msg {
     TuneStop,
     TuneUndo,
     TuneListen,
+    /// «Без шумодава»: the raw microphone, to compare with «С шумодавом».
+    TuneListenRaw,
     /// Plays the whole update hand-over for real, without installing anything.
     RehearseUpdate,
     /// The rehearsal's update window is on screen (or could not start).
@@ -941,6 +944,8 @@ struct App {
     snapshot: Snapshot,
     monitor: i32,
     monitor_all: bool,
+    /// The full monitor plays the raw physical microphone (native mode 9) instead of the virtual one.
+    monitor_raw: bool,
     effects_monitor: bool,
     boost_monitor: bool,
     monitor_message: String,
@@ -1505,6 +1510,7 @@ impl App {
                 snapshot: Snapshot::default(),
                 monitor: 0,
                 monitor_all: false,
+                monitor_raw: false,
                 effects_monitor,
                 boost_monitor,
                 monitor_message: String::new(),
@@ -1991,10 +1997,11 @@ impl App {
             self.engine.sound_seek(studio::TRACK_ID, step as f32 * 15.0 / bpm as f32);
         }
     }
-    /// Native monitor mode: 1 is the full voice, otherwise 1 + mask (1 effects, 2 boost, 4 sounds).
+    /// Native monitor mode: 1 is the full voice, 9 the raw microphone, otherwise 1 + mask
+    /// (1 effects, 2 boost, 4 sounds).
     fn monitor_mode(&self) -> i32 {
         if self.monitor_all {
-            return 1;
+            return if self.monitor_raw { 9 } else { 1 };
         }
         let mask = self.effects_monitor as i32 | (self.boost_monitor as i32) << 1
             | (self.sound_monitor as i32) << 2;
@@ -2520,7 +2527,7 @@ impl App {
                             } else {
                                 self.message.clear();
                                 if let Some((mode,full))=self.resume_monitor.take() {
-                                    self.monitor_all=full;self.engine.monitor(mode);
+                                    self.monitor_all=full;self.monitor_raw=mode==9;self.engine.monitor(mode);
                                 } else if self.effect_monitoring() { self.engine.monitor(self.monitor_mode()); }
                             }
                         }
@@ -3017,7 +3024,9 @@ impl App {
                 self.focus = focus::effects::MONITOR;
                 if !self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3) {
                     self.message.clear();
-                    self.monitor_all = !(self.monitor_all && matches!(self.monitor, 1 | 2));
+                    // From «Без шумодава» this switches straight to the processed voice.
+                    self.monitor_all = !(self.monitor_all && !self.monitor_raw && matches!(self.monitor, 1 | 2));
+                    self.monitor_raw = false;
                     self.engine.monitor(self.monitor_mode());
                 }
             }
@@ -3315,7 +3324,7 @@ impl App {
             }
             Msg::GateHold(v) => {
                 if v.is_finite() {
-                    self.controls.gate_hold_ms = v.round().clamp(0.0, 1000.0) as u32;
+                    self.controls.gate_hold_ms = ((v / 10.0).round() * 10.0).clamp(0.0, 1000.0) as u32;
                     self.focus = focus::effects::GATE_HOLD;
                     self.changed();
                 }
@@ -4658,6 +4667,16 @@ impl App {
                 self.focus = focus::effects::TUNE_LISTEN;
                 return task;
             }
+            Msg::TuneListenRaw => {
+                self.focus = focus::effects::TUNE_LISTEN_RAW;
+                if !self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3) {
+                    self.message.clear();
+                    let on = self.monitor_all && self.monitor_raw && matches!(self.monitor, 1 | 2);
+                    self.monitor_all = !on;
+                    self.monitor_raw = !on;
+                    self.engine.monitor(self.monitor_mode());
+                }
+            }
             Msg::RehearseUpdate => {
                 if !self.quitting && !self.busy && !self.driver_installing && !self.core_installing {
                     self.rehearse_after_quit = true;
@@ -4921,10 +4940,11 @@ impl App {
                         items.push(LINES);
                     }
                 }
-                items.extend([ROUTE, NOISE_GATE, GATE_HOLD, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE_LISTEN, TUNE]);
+                items.extend([ROUTE, NOISE_GATE, GATE_HOLD, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE]);
                 if self.tune.as_ref().is_some_and(|t| t.phase == tune::Phase::Done) {
                     items.push(TUNE_UNDO);
                 }
+                items.extend([TUNE_LISTEN, TUNE_LISTEN_RAW]);
                 items.extend(tabs);
                 items
             };
@@ -5231,6 +5251,7 @@ impl App {
                 SETUP_RETRY if activate => Msg::RetryCore,
                 TUNE if activate => if self.tune.as_ref().is_some_and(tune::Tune::running) { Msg::TuneStop } else { Msg::TuneStart },
                 TUNE_LISTEN if activate => Msg::TuneListen,
+                TUNE_LISTEN_RAW if activate => Msg::TuneListenRaw,
                 TUNE_UNDO if activate => Msg::TuneUndo,
                 SETUP_DRIVER if activate => Msg::InstallDriver,
                 SETUP_SETTINGS if activate => Msg::Page(2),
@@ -6299,6 +6320,23 @@ page_pixelate=0")).unwrap().unwrap();
         app.monitor_all = false;
         let _ = app.update(Msg::BoostMonitor(false));
         assert_eq!(app.monitor_mode(), 0);
+        // «Без шумодава» / «С шумодавом»: the raw microphone is native mode 9, the two switch
+        // straight between each other, and pressing the playing one stops.
+        app.snapshot.state = 3;
+        let _ = app.update(Msg::TuneListenRaw);
+        assert!(app.monitor_all && app.monitor_raw);
+        assert_eq!(app.monitor_mode(), 9);
+        app.monitor = 2;
+        let _ = app.update(Msg::TuneListen);
+        assert!(app.monitor_all && !app.monitor_raw, "processed replaces raw in one press");
+        assert_eq!(app.monitor_mode(), 1);
+        let _ = app.update(Msg::TuneListenRaw);
+        assert_eq!(app.monitor_mode(), 9, "raw replaces processed in one press");
+        let _ = app.update(Msg::TuneListenRaw);
+        assert!(!app.monitor_all, "pressing the playing one stops");
+        assert_eq!(app.monitor_mode(), 0);
+        app.monitor = 0;
+        app.snapshot.state = 0;
         let _ = app.update(Msg::EffectsMonitor(true));
         assert!(!app.boost_monitor);
         let (saved, _) = App::from_settings(Settings::for_test(
@@ -6776,8 +6814,8 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.keys = [0; 21];
         use keyboard::{Key, Modifiers, key::Named};
         // Шумодав: devices, the headphone gear, the folded route, the gate and its hold, the two strengths,
-        // then the tune panel's «Послушать себя» and «Подобрать».
-        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 114, 34, 38, 37, 111, 110, 40] {
+        // then the tune panel's «Подобрать», «С шумодавом» and «Без шумодава».
+        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 114, 34, 38, 37, 110, 111, 115, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }

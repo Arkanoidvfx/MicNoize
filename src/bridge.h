@@ -21,7 +21,8 @@ void mnr_headphone_controls(Mnr*,float intensity,float volume,int32_t pitch,int3
 // Continuous grain reverse on the headphone line (0/1; other values ignored). +200 ms while on.
 void mnr_headphone_reverse(Mnr*,int32_t enabled);
 int32_t mnr_headphone_state(Mnr*,char* text,uint32_t capacity);
-// mode: 0 off, 1 full voice, otherwise 1 + mask (1 other effects, 2 boost, 4 soundpad): 2..8.
+// mode: 0 off, 1 full voice, otherwise 1 + mask (1 other effects, 2 boost, 4 soundpad): 2..8;
+// 9 the selected physical microphone without any processing (compare with 1).
 int32_t mnr_monitor(Mnr*,int32_t mode,char* error,uint32_t capacity);
 int32_t mnr_monitor_state(Mnr*,char* text,uint32_t capacity);
 // Peak of what the monitor actually rendered since the previous call (0 when idle).

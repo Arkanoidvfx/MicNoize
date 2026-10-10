@@ -1341,6 +1341,135 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
     }
 }
 
+/// The gate hold as a small slanted tag hanging under the gate threshold on «После»: it rides the
+/// threshold line as it moves, and dragging it sideways scrubs the hold (2 ms per px, 10 ms steps).
+/// Wheel steps 10 ms, right click restores `default`. Dimmed and inert while the gate is off.
+pub fn gate_hold<'a, Message: 'a>(gate_db: f32, hold_ms: f32, default: f32, focused: bool, on_change: impl Fn(f32) -> Message + 'a) -> Element<'a, Message> {
+    Element::new(GateHold { gate_db, hold_ms, default, focused, on_change: Box::new(on_change) })
+}
+struct GateHold<'a, Message> {
+    gate_db: f32,
+    hold_ms: f32,
+    default: f32,
+    focused: bool,
+    on_change: Box<dyn Fn(f32) -> Message + 'a>,
+}
+#[derive(Default)]
+struct HoldState {
+    painted: Painted,
+    drag: bool,
+    hovered: bool,
+    anchor: (f32, f32),
+    wheel: f32,
+    mods: keyboard::Modifiers,
+}
+const HOLD_H: f32 = 26.0;
+const HOLD_TAG_H: f32 = 18.0;
+impl<Message> GateHold<'_, Message> {
+    fn on(&self) -> bool { self.gate_db > -72.0 }
+    fn text(value: f32) -> Text<String, Font> {
+        label(format!("{value:.0} мс"), 12.0, Size::new(80.0, HOLD_TAG_H), text::Alignment::Center)
+    }
+    /// The tag rectangle (without its lean) for `value`, centred under the threshold line.
+    fn tag(&self, b: Rectangle, value: f32) -> (f32, Rectangle) {
+        let line = b.x + 4.0 + (b.width - 8.0) * ((self.gate_db + 72.0) / 72.0).clamp(0.0, 1.0);
+        let w = measure(&Self::text(value)).width + 20.0;
+        let x = (line - w / 2.0).clamp(b.x, (b.x + b.width - w).max(b.x));
+        (line, Rectangle { x, y: b.y + HOLD_H - HOLD_TAG_H, width: w, height: HOLD_TAG_H })
+    }
+    fn snap(value: f32) -> f32 { ((value / 10.0).round() * 10.0).clamp(0.0, 1000.0) }
+}
+impl<Message> Widget<Message, Theme, Renderer> for GateHold<'_, Message> {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<HoldState>() }
+    fn state(&self) -> tree::State { tree::State::new(HoldState::default()) }
+    fn size(&self) -> Size<Length> { Size { width: Length::Fill, height: Length::Fixed(HOLD_H) } }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, HOLD_H)
+    }
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        let state = tree.state.downcast_mut::<HoldState>();
+        let current = self.hold_ms;
+        let (_, tag) = self.tag(layout.bounds(), current);
+        let over = self.on() && cursor.is_over(tag.expand(4.0));
+        if over != state.hovered { state.hovered = over; shell.request_redraw(); }
+        let value = match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if over => {
+                state.drag = true;
+                state.anchor = (cursor.position().map_or(0.0, |p| p.x), self.hold_ms);
+                shell.capture_event();
+                shell.request_redraw();
+                None
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => {
+                let per_px = if state.mods.shift() { 0.5 } else { 2.0 };
+                let value = Self::snap(state.anchor.1 + (position.x - state.anchor.0) * per_px);
+                shell.capture_event();
+                Some(value)
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.drag => {
+                state.drag = false;
+                shell.capture_event();
+                shell.request_redraw();
+                None
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if over => {
+                Some(Self::snap(current + 10.0 * wheel_steps(&mut state.wheel, *delta)))
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if over => {
+                state.drag = false;
+                Some(self.default)
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => { state.mods = *m; None }
+            Event::Window(window::Event::Unfocused) => {
+                state.drag = false;
+                state.wheel = 0.0;
+                state.mods = keyboard::Modifiers::default();
+                None
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            if value != self.hold_ms { shell.publish((self.on_change)(value)); }
+            shell.capture_event();
+            shell.request_redraw();
+        }
+    }
+    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, _: &Rectangle, _: &Renderer) -> mouse::Interaction {
+        let state = tree.state.downcast_ref::<HoldState>();
+        let (_, tag) = self.tag(layout.bounds(), self.hold_ms);
+        if self.on() && (state.drag || cursor.is_over(tag.expand(4.0))) {
+            mouse::Interaction::ResizingHorizontally
+        } else { mouse::Interaction::default() }
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let state = tree.state.downcast_ref::<HoldState>();
+        let b = layout.bounds();
+        let (line, tag) = self.tag(b, self.hold_ms);
+        let grey = Color::from_rgb8(0x8A, 0x8B, 0x92);
+        let hot = self.on() && (state.drag || state.hovered || self.focused);
+        let lean = 6.0;
+        let mut shapes = Vec::with_capacity(4);
+        // A stub continues the threshold line down into the tag.
+        slant(&mut shapes, line - 1.0, b.y - 4.0, 2.0, tag.y - b.y + 5.0, 0.0, if self.on() { TAG } else { grey });
+        let (fill, text) = if !self.on() {
+            slant(&mut shapes, tag.x, tag.y, tag.width - lean, tag.height, lean, OFF_EDGE);
+            slant(&mut shapes, tag.x + 1.0, tag.y + 1.0, tag.width - lean - 2.0, tag.height - 2.0, lean - 0.3, OFF);
+            (None, grey)
+        } else if hot {
+            (Some(TAG), DARK)
+        } else {
+            slant(&mut shapes, tag.x, tag.y, tag.width - lean, tag.height, lean, Color { a: 0.7, ..TAG });
+            (Some(Color::from_rgb8(0x24, 0x1B, 0x14)), TAG)
+        };
+        if let Some(fill) = fill {
+            if hot { slant(&mut shapes, tag.x, tag.y, tag.width - lean, tag.height, lean, fill); }
+            else { slant(&mut shapes, tag.x + 1.0, tag.y + 1.0, tag.width - lean - 2.0, tag.height - 2.0, lean - 0.3, fill); }
+        }
+        state.painted.draw(renderer, b.expand(4.0), shapes);
+        put(renderer, Self::text(self.hold_ms), Point::new(tag.x + tag.width / 2.0, tag.center_y()), text, b.expand(4.0));
+    }
+}
+
 #[cfg(test)]
 mod gate_tests {
     use super::*;
@@ -1362,6 +1491,46 @@ mod gate_tests {
         send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), at(364.0));
         assert_eq!(messages, [-36.0, 0.0, -72.0]);
         assert!(!tree.state.downcast_ref::<MeterState>().drag);
+    }
+    #[test]
+    fn hold_tag_rides_the_threshold_and_scrubs() {
+        let renderer = Renderer::new(Font::DEFAULT, Pixels(14.0));
+        let limits = layout::Limits::new(Size::ZERO, Size::new(728.0, HOLD_H));
+        let tag_at = |db: f32| {
+            let mut hold = gate_hold(db, 250.0, 250.0, false, |v| v);
+            let mut tree = Tree::new(hold.as_widget());
+            let node = hold.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            GateHold::<f32> { gate_db: db, hold_ms: 250.0, default: 250.0, focused: false, on_change: Box::new(|v| v) }.tag(node.bounds(), 250.0)
+        };
+        let ((low, a), (high, b)) = (tag_at(-60.0), tag_at(-12.0));
+        assert!(high > low && b.x > a.x, "the tag follows the threshold line");
+        assert!(a.x <= low && low <= a.x + a.width && b.x <= high && high <= b.x + b.width, "the line meets the tag");
+        let (_, edge) = tag_at(0.0);
+        assert!(edge.x + edge.width <= 728.0 + 0.01, "the tag stays inside at the right edge");
+
+        let mut hold = gate_hold(-36.0, 250.0, 250.0, false, |v| v);
+        let mut tree = Tree::new(hold.as_widget());
+        let node = hold.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let (line, tag) = GateHold::<f32> { gate_db: -36.0, hold_ms: 250.0, default: 250.0, focused: false, on_change: Box::new(|v| v) }.tag(node.bounds(), 250.0);
+        let bounds = node.bounds();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let y = tag.center_y();
+        let mut send = |event, x: f32| hold.as_widget_mut().update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Available(Point::new(x, y)), &renderer, &mut clipboard, &mut Shell::new(&mut messages), &bounds);
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), line);
+        send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(line + 26.0, y) }), line + 26.0);
+        send(Event::Mouse(mouse::Event::CursorMoved { position: Point::new(line + 2000.0, y) }), line + 2000.0);
+        send(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), line + 2000.0);
+        send(Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 } }), line);
+        send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), line);
+        assert_eq!(messages, [300.0, 1000.0, 240.0], "drag scrubs in 10 ms steps up to 1 s, wheel steps 10 ms; right click to the default is no change");
+
+        let mut off = gate_hold(-72.0, 250.0, 250.0, false, |v| v);
+        let mut tree = Tree::new(off.as_widget());
+        let node = off.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut messages = Vec::new();
+        off.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), Layout::new(&node), mouse::Cursor::Available(Point::new(10.0, 17.0)), &renderer, &mut clipboard, &mut Shell::new(&mut messages), &bounds);
+        assert!(messages.is_empty(), "inert while the gate is off");
     }
     #[test]
     fn gate_pickup_shift_wheel_and_batched_return() {

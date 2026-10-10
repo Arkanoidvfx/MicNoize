@@ -415,7 +415,7 @@ public:
     std::atomic<float> renderedPeak{0}; // Held maximum; the reader exchanges it back to 0.
     explicit Monitor(Engine& engine);
     ~Monitor();
-    void start(const std::wstring& route,uint8_t effectsMask=0);
+    void start(const std::wstring& route,uint8_t effectsMask=0,bool raw=false);
     void stop();
     std::wstring message() const;
 };
