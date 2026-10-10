@@ -1198,7 +1198,7 @@ impl App {
             alternate_intensity: settings.number("audio", "alternate_intensity", 10, 0, 200) as f32
                 / 100.0,
             noise_gate_db: settings.number("audio", "noise_gate_db", -72, -72, 0) as f32,
-            gate_hold_ms: settings.number("audio", "gate_hold_ms", GATE_HOLD_MS as i32, 0, 1000) as u32,
+            gate_hold_ms: settings.number("audio", "gate_hold_ms", GATE_HOLD_MS as i32, 0, tacho::GATE_HOLD_MAX as i32) as u32,
             muted: false,
             rvc: settings.number("effects", "rvc_enabled", 0, 0, 1) != 0,
             rvc_options: rvc::Options::load(&settings),
@@ -3324,7 +3324,7 @@ impl App {
             }
             Msg::GateHold(v) => {
                 if v.is_finite() {
-                    self.controls.gate_hold_ms = ((v / 10.0).round() * 10.0).clamp(0.0, 1000.0) as u32;
+                    self.controls.gate_hold_ms = ((v / 10.0).round() * 10.0).clamp(0.0, tacho::GATE_HOLD_MAX) as u32;
                     self.focus = focus::effects::GATE_HOLD;
                     self.changed();
                 }
@@ -4944,7 +4944,9 @@ impl App {
                 if self.tune.as_ref().is_some_and(|t| t.phase == tune::Phase::Done) {
                     items.push(TUNE_UNDO);
                 }
-                items.extend([TUNE_LISTEN, TUNE_LISTEN_RAW]);
+                if matches!(self.snapshot.state, 2 | 3) {
+                    items.extend([TUNE_LISTEN, TUNE_LISTEN_RAW]);
+                }
                 items.extend(tabs);
                 items
             };
@@ -5974,7 +5976,7 @@ mic-b=65")).unwrap().unwrap();
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
         assert_eq!(app.controls.gate_hold_ms, 260);
         let _ = app.update(Msg::GateHold(5000.0));
-        assert_eq!(app.controls.gate_hold_ms, 1000);
+        assert_eq!(app.controls.gate_hold_ms, 500, "hold tops out at 500 ms");
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
         assert_eq!(app.controls.gate_hold_ms, 250, "Enter restores the default hold");
         let _ = app.update(Msg::GateHold(-3.0));
@@ -6814,11 +6816,19 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.keys = [0; 21];
         use keyboard::{Key, Modifiers, key::Named};
         // Шумодав: devices, the headphone gear, the folded route, the gate and its hold, the two strengths,
-        // then the tune panel's «Подобрать», «С шумодавом» and «Без шумодава».
-        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 114, 34, 38, 37, 110, 111, 115, 40] {
+        // then the tune panel's «Подобрать»; «С шумодавом» / «Без шумодава» only while processing runs.
+        let stopped = app.snapshot.state;
+        for expected in [focus::GUIDE, 35, 50, 81, 82, 113, 114, 34, 38, 37, 110, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }
+        app.snapshot.state = 3;
+        app.focus = 110;
+        for expected in [111, 115, 40] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected, "listen buttons join the order while running");
+        }
+        app.snapshot.state = stopped;
         // The gear opens the headphone panel in place and its controls join the order.
         app.focus = 81;
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);

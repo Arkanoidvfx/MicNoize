@@ -1288,6 +1288,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
             let w = (b.width - 8.0 - gap * (n - 1) as f32) / n as f32;
             let lit = (self.level * n as f32).round() as usize;
             let dim = Color { r: self.color.r * 0.38, g: self.color.g * 0.38, b: self.color.b * 0.38, a: 1.0 };
+            // Level the gate will cut (left of an enabled threshold) is drawn grey, so the
+            // coloured part is only what actually passes.
+            let gate = if m.drag { m.anchor.1 } else { self.gate_db };
+            let cut = if self.on_change.is_some() && gate > -72.0 { (gate + 72.0) / 72.0 } else { 0.0 };
+            let (grey_low, grey_high) = (Color::from_rgb8(0x4E, 0x50, 0x56), Color::from_rgb8(0x74, 0x76, 0x7C));
             let mut shapes = Vec::with_capacity(n * 2 + 8);
             for i in 0..n {
                 let x = b.x + 4.0 + i as f32 * (w + gap);
@@ -1295,10 +1300,11 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
                 if i < lit {
                     // A calm gradient from deep to full colour; the newest segment glows.
                     let t = i as f32 / n as f32;
-                    let c = Color { r: dim.r + (self.color.r - dim.r) * t, g: dim.g + (self.color.g - dim.g) * t, b: dim.b + (self.color.b - dim.b) * t, a: 1.0 };
+                    let (low, high) = if (i as f32 + 0.5) / (n as f32) < cut { (grey_low, grey_high) } else { (dim, self.color) };
+                    let c = Color { r: low.r + (high.r - low.r) * t, g: low.g + (high.g - low.g) * t, b: low.b + (high.b - low.b) * t, a: 1.0 };
                     if i + 1 == lit {
-                        halo(&mut shapes, x, y, w, h, 6.0, Color { a: 0.55, ..self.color });
-                        segment(&mut shapes, x, y, w, h, brighten(self.color, 0.9));
+                        halo(&mut shapes, x, y, w, h, 6.0, Color { a: 0.55, ..high });
+                        segment(&mut shapes, x, y, w, h, brighten(high, 0.9));
                     } else {
                         segment(&mut shapes, x, y, w, h, c);
                     }
@@ -1342,7 +1348,7 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter<'_, Message> {
 }
 
 /// The gate hold as a small slanted tag hanging under the gate threshold on «После»: it rides the
-/// threshold line as it moves, and dragging it sideways scrubs the hold (2 ms per px, 10 ms steps).
+/// threshold line as it moves, and dragging it sideways scrubs the hold (2 ms per px, 10 ms steps, 0-500).
 /// Wheel steps 10 ms, right click restores `default`. Dimmed and inert while the gate is off.
 pub fn gate_hold<'a, Message: 'a>(gate_db: f32, hold_ms: f32, default: f32, focused: bool, on_change: impl Fn(f32) -> Message + 'a) -> Element<'a, Message> {
     Element::new(GateHold { gate_db, hold_ms, default, focused, on_change: Box::new(on_change) })
@@ -1364,6 +1370,8 @@ struct HoldState {
     mods: keyboard::Modifiers,
 }
 const HOLD_H: f32 = 26.0;
+/// Longest gate hold, ms: past half a second the tail mostly carries room noise.
+pub const GATE_HOLD_MAX: f32 = 500.0;
 const HOLD_TAG_H: f32 = 18.0;
 impl<Message> GateHold<'_, Message> {
     fn on(&self) -> bool { self.gate_db > -72.0 }
@@ -1377,7 +1385,7 @@ impl<Message> GateHold<'_, Message> {
         let x = (line - w / 2.0).clamp(b.x, (b.x + b.width - w).max(b.x));
         (line, Rectangle { x, y: b.y + HOLD_H - HOLD_TAG_H, width: w, height: HOLD_TAG_H })
     }
-    fn snap(value: f32) -> f32 { ((value / 10.0).round() * 10.0).clamp(0.0, 1000.0) }
+    fn snap(value: f32) -> f32 { ((value / 10.0).round() * 10.0).clamp(0.0, GATE_HOLD_MAX) }
 }
 impl<Message> Widget<Message, Theme, Renderer> for GateHold<'_, Message> {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<HoldState>() }
@@ -1523,7 +1531,7 @@ mod gate_tests {
         send(Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), line + 2000.0);
         send(Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 } }), line);
         send(Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), line);
-        assert_eq!(messages, [300.0, 1000.0, 240.0], "drag scrubs in 10 ms steps up to 1 s, wheel steps 10 ms; right click to the default is no change");
+        assert_eq!(messages, [300.0, 500.0, 240.0], "drag scrubs in 10 ms steps up to 500 ms, wheel steps 10 ms; right click to the default is no change");
 
         let mut off = gate_hold(-72.0, 250.0, 250.0, false, |v| v);
         let mut tree = Tree::new(off.as_widget());

@@ -9,8 +9,27 @@ use iced::{Border, Color, Length};
 
 fn guide_image() -> widget::image::Handle {
     static IMAGE: std::sync::OnceLock<widget::image::Handle> = std::sync::OnceLock::new();
-    IMAGE.get_or_init(|| {
-        let mut decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../../guide.png")));
+    IMAGE.get_or_init(|| embedded_png(include_bytes!("../../guide.png"))).clone()
+}
+/// Discord's voice settings for Mic Noize: Custom profile, sensitivity -99 dB, no Krisp.
+fn guide_discord_image() -> widget::image::Handle {
+    static IMAGE: std::sync::OnceLock<widget::image::Handle> = std::sync::OnceLock::new();
+    IMAGE.get_or_init(|| embedded_png(include_bytes!("../../guide-discord.png"))).clone()
+}
+/// A guide screenshot in a thin frame, centred, at its own size or smaller: upscaling blurs the text.
+fn guide_shot<'a>(image: widget::image::Handle) -> Element<'a, Msg> {
+    container(
+        container(widget::image(image).content_fit(iced::ContentFit::ScaleDown))
+            .padding(1)
+            .clip(true)
+            .style(|_| container::Style { border: Border { color: LINE, width: 1.0, radius: 8.0.into() }, ..Default::default() }),
+    )
+    .center_x(Length::Fill)
+    .into()
+}
+fn embedded_png(png_bytes: &'static [u8]) -> widget::image::Handle {
+    {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().expect("embedded guide PNG");
         let mut bytes = vec![0; reader.output_buffer_size().expect("guide size")];
@@ -22,7 +41,7 @@ fn guide_image() -> widget::image::Handle {
             _ => panic!("guide must be an RGB or RGBA PNG"),
         };
         widget::image::Handle::from_rgba(info.width, info.height, rgba)
-    }).clone()
+    }
 }
 
 // Keep an off-screen keyboard target mounted without mounting every row on the way to it.
@@ -629,8 +648,10 @@ impl App {
         let content: Element<'_, Msg> = if self.guide_page {
             column![
                 row![title("Как пользоваться"), action(label("Назад", 13, INK), Msg::Page(0), self.focus == focus::GUIDE, false)].spacing(14).align_y(iced::Center),
-                label("В Discord выберите Thin Audio Gateway → Mic Noize в качестве устройства ввода.", 14, DIM),
-                widget::image(guide_image()).width(Length::Fill).height(400).content_fit(iced::ContentFit::Contain),
+                label("1. В Discord выберите Thin Audio Gateway → Mic Noize в качестве устройства ввода.", 14, DIM),
+                guide_shot(guide_image()),
+                label("2. В настройках голоса Discord: профиль Custom, чувствительность -99 dB, шумоподавление Krisp выключено.", 14, DIM),
+                guide_shot(guide_discord_image()),
             ].spacing(18).into()
         } else if self.logs_page {
             self.logs_view()
@@ -1392,13 +1413,14 @@ impl App {
         let can_listen = matches!(self.snapshot.state, 2 | 3);
         let listen_button = |text: &'static str, on: bool, msg: Msg, focused: bool| {
             action(
-                row![icon(glyph::HEADPHONES, 12, if on { ORANGE_DARK } else { INK }), label(text, 13, if on { ORANGE_DARK } else { INK }).wrapping(iced::widget::text::Wrapping::None)]
-                    .spacing(8)
+                row![icon(glyph::HEADPHONES, 11, if on { ORANGE_DARK } else { INK }), label(text, 12, if on { ORANGE_DARK } else { INK }).wrapping(iced::widget::text::Wrapping::None)]
+                    .spacing(6)
                     .align_y(iced::Center),
                 msg.clone(),
                 focused,
                 on,
             )
+            .padding([4, 10])
             .on_press_maybe(can_listen.then_some(msg))
         };
         let listen = row![
@@ -1495,12 +1517,7 @@ impl App {
             .into(),
             _ => match (ready, saved) {
                 (Err(why), _) => label(why, 12, FAINT).into(),
-                (Ok(()), Some(strength)) => column![
-                    row![numbers(format!("{:.0} %", strength * 100.0), 18, ORANGE), label("подобрано для этого микрофона", 12, DIM)].spacing(10).align_y(iced::Center),
-                    caption("При смене микрофона сила ставится сама. Сравните на слух: с шумодавом и без."),
-                ]
-                .spacing(6)
-                .into(),
+                (Ok(()), Some(strength)) => row![numbers(format!("{:.0} %", strength * 100.0), 18, ORANGE), label("подобрано для этого микрофона", 12, DIM)].spacing(10).align_y(iced::Center).into(),
                 (Ok(()), None) => label("Помолчите 4 секунды, потом скажите пару слов: Mic Noize найдёт самую мягкую силу, при которой фон пропадает, и запомнит её для этого микрофона.", 12, DIM).into(),
             },
         };
@@ -1514,7 +1531,9 @@ impl App {
                 row![
                     // 3:2 keeps the chart near 300 px on a wide window and leaves room for both
                     // listen buttons on one line in a narrow one.
-                    container(column![left, listen].spacing(12)).width(Length::FillPortion(3)),
+                    // The listen pair shows only while processing runs (it cannot play otherwise),
+                    // so an idle panel stays as short as the chart.
+                    container(if can_listen { column![left, listen].spacing(8) } else { column![left] }).width(Length::FillPortion(3)),
                     container(tacho::tune_curve(curve, &tune::STEPS, chosen, current, tune::SILENT_DB)).width(Length::FillPortion(2)).max_width(300),
                 ]
                 .spacing(18)
@@ -3958,8 +3977,19 @@ mod tests {
             render(&app, "gate-quiet");
             app.focus = focus::effects::GATE_HOLD;
             render(&app, "gate-hold-focus");
+            // A tuned microphone while processing runs: the tallest everyday panel.
+            if let Some(id) = app.input.as_ref().map(|d| d.id.clone()) { app.settings.set(PROFILES, &id, "60".to_owned()); }
+            app.snapshot.state = 3;
+            app.denoiser.0 = 1;
+            render(&app, "tune-saved");
             window.set((820.0, 760.0));
             render(&app, "gate-narrow");
+            app.snapshot.state = 0;
+            window.set((1040.0, 1100.0));
+            app.guide_page = true;
+            render(&app, "guide");
+            app.guide_page = false;
+            window.set((820.0, 760.0));
             window.set((820.0, 600.0));
             scale.set(2.0);
             render(&app, "gate-small-2x");

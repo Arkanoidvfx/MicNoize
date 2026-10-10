@@ -82,8 +82,8 @@ int main(){try{
     require(mnr_noise_gate(p,-40)==1 && mnr_noise_gate(p,0)==1 && mnr_noise_gate(p,-72)==1,"Gate threshold range rejected");
     for(float db:{-73.0f,1.0f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()})
         require(mnr_noise_gate(p,db)==0,"Invalid gate threshold accepted");
-    require(mnr_gate_hold(p,0)==1 && mnr_gate_hold(p,1000)==1 && mnr_gate_hold(p,250)==1,"Gate hold range rejected");
-    require(mnr_gate_hold(p,1001)==0 && mnr_gate_hold(nullptr,250)==0,"Invalid gate hold accepted");
+    require(mnr_gate_hold(p,0)==1 && mnr_gate_hold(p,500)==1 && mnr_gate_hold(p,250)==1,"Gate hold range rejected");
+    require(mnr_gate_hold(p,501)==0 && mnr_gate_hold(nullptr,250)==0,"Invalid gate hold accepted");
     require(mnr_noise_gate(nullptr,-40)==0 && mnr_noise_peak(p)==0 && mnr_noise_peak(nullptr)==0,"Gate ABI idle/null handling");
     {
         std::vector<float> tone(48000),shifted(tone.size());

@@ -238,7 +238,7 @@ pub struct Controls {
     pub intensity: f32,
     pub alternate_intensity: f32,
     pub noise_gate_db: f32,
-    /// Gate hold after the voice drops below the threshold, 0-1000 ms.
+    /// Gate hold after the voice drops below the threshold, 0-500 ms.
     pub gate_hold_ms: u32,
     pub muted: bool,
     pub rvc: bool,

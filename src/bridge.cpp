@@ -232,7 +232,7 @@ extern "C" int32_t mnr_noise_gate(Mnr* p,float db) {
     p->engine.noiseGateDb=db;return 1;
 }
 extern "C" int32_t mnr_gate_hold(Mnr* p,uint32_t ms) {
-    if(!p || ms>1000)return 0;
+    if(!p || ms>500)return 0;
     p->engine.gateHoldMs=ms;return 1;
 }
 extern "C" float mnr_noise_peak(Mnr* p) {return p?p->engine.stats.noisePeak.exchange(0):0;}

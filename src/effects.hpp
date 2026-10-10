@@ -48,7 +48,7 @@ struct Downmix {
         }
     }
 };
-// Microphone gate: 3 dB hysteresis, an adjustable hold (0-1 s, default 250 ms) after the voice
+// Microphone gate: 3 dB hysteresis, an adjustable hold (0-500 ms, default 250 ms) after the voice
 // drops below the threshold, then the shared 10 ms gain ramp. The hold keeps word endings and
 // quick loud-to-quiet transitions. No lookahead, allocation or extra buffering. -72 dB is exact dry bypass.
 struct NoiseGate {
