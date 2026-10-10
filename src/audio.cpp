@@ -506,6 +506,13 @@ public:
             auto setU32=proc<decltype(&NvAFX_SetU32)>("NvAFX_SetU32");
             auto setString=proc<decltype(&NvAFX_SetString)>("NvAFX_SetString");
             auto getU32=proc<decltype(&NvAFX_GetU32)>("NvAFX_GetU32");
+            // A GPU-bound game otherwise shares the WDDM priority of this process, and its frames
+            // delay each 10 ms CUDA run until the voice breaks up. HIGH (4) needs no administrator
+            // rights, unlike REALTIME; the UI renders on the CPU. Best effort: failure keeps NORMAL.
+            using SchedulingClass=LONG(APIENTRY*)(HANDLE,int);
+            if(const auto gdi=LoadLibraryExW(L"gdi32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32))
+                if(const auto set=reinterpret_cast<SchedulingClass>(GetProcAddress(gdi,"D3DKMTSetProcessSchedulingPriorityClass")))
+                    set(GetCurrentProcess(),4);
             ok(create(NVAFX_EFFECT_DENOISER,&handle_),"CreateEffect");
             ok(setU32(handle_,NVAFX_PARAM_USE_DEFAULT_GPU,1),"Select GPU");
             ok(setU32(handle_,NVAFX_PARAM_INPUT_SAMPLE_RATE,rate),"Input sample rate");
