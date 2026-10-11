@@ -15,6 +15,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <memory>
 #include <future>
@@ -244,9 +245,13 @@ void checkRvc() {
     if(samples!=dry || stats.rvcState!=0)throw std::runtime_error("Disabled RVC changed audio");
     std::cout<<"RVC CHECK PASSED: priming_blocks="<<priming<<" converted="<<converted<<'/'<<steady<<" steady blocks, silent="<<silent<<"; disabled bypass\n";
 }
+// Audio threads run without the realtime boost when MMCSS refuses (service off, task edited):
+// a CPU-bound game then starves them. Reported in the session line.
+static std::atomic<unsigned> mmcssFailures{0};
 struct Mmcss {
     DWORD task = 0;
     HANDLE h = AvSetMmThreadCharacteristicsW(L"Audio", &task);
+    Mmcss() { if(!h) ++mmcssFailures; }
     ~Mmcss() { if(h) AvRevertMmThreadCharacteristics(h); }
 };
 std::string utf8(const std::wstring& s) {
@@ -664,6 +669,25 @@ public:
         SetEvent(done.h);return S_OK;
     }
 };
+std::string Engine::sessionLine() const {
+    std::ostringstream log;
+    log<<" output="<<(config_.tag?"TAG":"WASAPI")<<" version="<<config_.version<<" reserve_ms="<<config_.bufferMs
+        <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
+        <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
+        <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
+        <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":stats.denoiser==4?"input":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100
+        // What a remote report needs to tell a bad input from a bad pipeline: capture gaps, clock drift,
+        // and which device with how many channels (all of them are averaged to mono).
+        <<" capture_gaps="<<stats.discontinuities<<" drift_ppm="<<stats.driftPpm<<" input_period_ms="<<stats.inputPeriodMs
+        <<" input_channels="<<stats.inputChannels<<" input_flip="<<stats.inputFlipped
+        // Thread starvation, the whole DSP block, and gate/denoiser settings that sound like an
+        // over-eager denoiser when they cut syllables.
+        <<" wake_max_ms="<<stats.tagMaxWakeMs<<" process_max_ms="<<stats.maxProcessMs<<" mmcss_failures="<<mmcssFailures
+        <<" gate_db="<<noiseGateDb<<" gate_hold_ms="<<gateHoldMs<<" intensity="<<intensity
+        <<" cpus="<<std::thread::hardware_concurrency();
+    try {for(const auto& d:devices(true)) if(d.id==config_.input) log<<" input=\""<<utf8(d.name)<<'"';} catch(...) {}
+    return log.str();
+}
 std::wstring Engine::desktopMessage() const {std::lock_guard lock(statusMutex_);return desktopMessage_;}
 std::wstring Engine::denoiserMessage() const {std::lock_guard lock(statusMutex_);return denoiserMessage_;}
 void Engine::desktopLoop() {
@@ -972,16 +996,7 @@ void Engine::stop() {
                 return std::string(text);
             };
             SYSTEMTIME time{}; GetSystemTime(&time);
-            log<<format(time)<<" output="<<(config_.tag?"TAG":"WASAPI")<<" version="<<config_.version<<" reserve_ms="<<config_.bufferMs
-               <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
-               <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
-               <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
-               <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":stats.denoiser==4?"input":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100
-               // What a remote report needs to tell a bad input from a bad pipeline: capture gaps, clock drift,
-               // and which device with how many channels (all of them are averaged to mono).
-               <<" capture_gaps="<<stats.discontinuities<<" drift_ppm="<<stats.driftPpm<<" input_period_ms="<<stats.inputPeriodMs
-               <<" input_channels="<<stats.inputChannels<<" input_flip="<<stats.inputFlipped;
-            try {for(const auto& d:devices(true)) if(d.id==config_.input) log<<" input=\""<<utf8(d.name)<<'"';} catch(...) {}
+            log<<format(time)<<sessionLine();
             if(const auto failed=failedAt_.load()) {
                 // The line is written on the next stop(), often much later: keep when it really broke.
                 const FILETIME file{static_cast<DWORD>(failed),static_cast<DWORD>(failed>>32)};SYSTEMTIME at{};

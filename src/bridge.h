@@ -45,6 +45,8 @@ void mnr_set_cpu_denoiser(const MnrCpuDenoiser* api);
 // 0 stopped/starting, 1 NVIDIA, 2 no denoiser, 3 CPU DeepFilterNet, 4 input is RTX Voice/Broadcast
 // (no own denoiser); `text` says why NVIDIA is off, or names that input for 4.
 int32_t mnr_denoiser_state(Mnr*,char* text,uint32_t capacity);
+// Live counters of the current (or last) session, same fields as results/sessions.log.
+void mnr_session_report(Mnr*,char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);
 void mnr_snapshot(Mnr*,MnrSnapshot*,char* error,uint32_t capacity,int32_t meters);
 int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity);

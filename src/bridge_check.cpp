@@ -36,6 +36,8 @@ int main(){try{
     static_assert(sizeof(MnrSnapshot)==64);
     char error[4096]{};Mnr* p=mnr_create(error,sizeof(error));require(p!=nullptr,error);
     struct Guard{Mnr* p;~Guard(){mnr_destroy(p);}}guard{p};
+    {char report[2048]{};mnr_session_report(p,report,sizeof(report));const std::string line=report;
+     require(line.find(" underruns=0")!=std::string::npos && line.find(" mmcss_failures=")!=std::string::npos && line.find(" gate_db=")!=std::string::npos,"Live session report lacks counters");}
     MnrSnapshot s{};mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0,"Initial state");
     unsigned studioGeneration=99;
     require(!mnr_studio_record(p,1) && !mnr_studio_recording(p),"Stopped studio recorder started");

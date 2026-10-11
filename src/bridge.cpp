@@ -129,6 +129,9 @@ extern "C" int32_t mnr_denoiser_state(Mnr* p,char* text,uint32_t cap) {
     try {copy(mic::utf8(p->engine.denoiserMessage()),text,cap);} catch(...) {copy("",text,cap);}
     return p->engine.stats.denoiser;
 }
+extern "C" void mnr_session_report(Mnr* p,char* text,uint32_t cap) {
+    try {copy(p->engine.sessionLine(),text,cap);} catch(...) {copy("",text,cap);}
+}
 extern "C" void mnr_phrase_cancel(Mnr* p) {++p->engine.phraseCancel;}
 extern "C" void mnr_rvc_settings(Mnr* p,uint32_t slot,int32_t pitch,uint32_t index,uint32_t chunkMs,uint32_t gain) {
     if(slot>65535 || pitch < -24 || pitch>24 || index>100 || gain<50 || gain>300 ||

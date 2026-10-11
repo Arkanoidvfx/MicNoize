@@ -316,6 +316,8 @@ public:
     std::atomic<unsigned> effectEpoch{0};
     std::atomic<bool> desktopEnabled{false};
     std::wstring desktopMessage() const;
+    // Counters of the current (or last) session in the sessions.log format, for a live report.
+    std::string sessionLine() const;
     std::wstring denoiserMessage() const;
     std::atomic<int> state{0}; // Stopped, Loading, WaitingClient, Running, Stopping, Error
     std::atomic<float> volume{1}, boost{3};

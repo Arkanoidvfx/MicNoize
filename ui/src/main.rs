@@ -3545,6 +3545,9 @@ impl App {
                         self.device_detail,
                         self.message
                     );
+                    // Live engine counters: a stutter during a game is diagnosable without a Stop.
+                    let note = format!("{note}
+live:{}", self.engine.session_report());
                     self.report_sending = true;
                     self.message = "Отправляем логи…".into();
                     let runtime = self.runtime_root.clone();

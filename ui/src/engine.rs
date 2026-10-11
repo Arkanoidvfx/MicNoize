@@ -82,6 +82,7 @@ unsafe extern "C" {
     fn mnr_phrase_state(p: usize, seconds: *mut f32) -> i32;
     fn mnr_discord_state(p: usize, text: *mut c_char, capacity: u32, active: *mut i32) -> i32;
     fn mnr_denoiser_state(p: usize, text: *mut c_char, capacity: u32) -> i32;
+    fn mnr_session_report(p: usize, text: *mut c_char, capacity: u32);
     fn mnr_phrase_cancel(p: usize);
     fn mnr_snapshot(p: usize, s: *mut Snapshot, error: *mut c_char, cap: u32, meters: i32);
     fn mnr_devices(capture: i32, result: *mut c_char, capacity: u32) -> i32;
@@ -792,6 +793,11 @@ impl Engine {
         let mut text = [0u8; 1024];
         let state = unsafe { mnr_denoiser_state(self.p, text.as_mut_ptr().cast(), 1024) };
         (state, decoded(&text))
+    }
+    pub fn session_report(&self) -> String {
+        let mut text = [0u8; 2048];
+        unsafe { mnr_session_report(self.p, text.as_mut_ptr().cast(), 2048) };
+        decoded(&text)
     }
     pub fn phrase(&self) -> (i32, f32) {
         let mut seconds = 0.0;
