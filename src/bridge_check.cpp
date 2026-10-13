@@ -6,8 +6,26 @@
 #include <cstring>
 #include <cmath>
 #include <numbers>
+#include <exception>
 static void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 namespace mic {
+void checkStaDevices() {
+    std::exception_ptr failure;
+    std::thread([&] {
+        try {
+            require(SUCCEEDED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED)),"Initialize STA device check");
+            struct Cleanup {~Cleanup(){CoUninitialize();}} cleanup;
+            APTTYPE before;APTTYPEQUALIFIER beforeQualifier;
+            require(SUCCEEDED(CoGetApartmentType(&before,&beforeQualifier)),"Inspect STA device check");
+            char devices[65536]{};
+            for(int capture:{1,0})require(mnr_devices(capture,devices,sizeof(devices))==1,devices);
+            APTTYPE type;APTTYPEQUALIFIER qualifier;
+            require(SUCCEEDED(CoGetApartmentType(&type,&qualifier)) && type==before && qualifier==beforeQualifier,
+                "Device enumeration uninitialized the caller's STA apartment");
+        } catch(...) {failure=std::current_exception();}
+    }).join();
+    if(failure)std::rethrow_exception(failure);
+}
 void checkTagStack() {
     // Leave 64 KiB of the shipped 1 MiB stack for callers/Windows audio APIs.
     // No microphone or host is opened; mic_check has a larger test stack.
@@ -31,6 +49,7 @@ void checkTagStack() {
 }
 }
 int main(){try{
+    mic::checkStaDevices();
     mic::checkTagStack();
     mic::checkRvcIdle();
     static_assert(sizeof(MnrSnapshot)==64);

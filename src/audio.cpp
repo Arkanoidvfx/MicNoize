@@ -55,8 +55,9 @@ static void check(HRESULT hr, const char* where) {
     }
 }
 struct Com {
-    Com() { check(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM initialization"); }
-    ~Com() { CoUninitialize(); }
+    HRESULT hr=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    Com() { if(hr!=RPC_E_CHANGED_MODE) check(hr,"COM initialization"); }
+    ~Com() { if(SUCCEEDED(hr)) CoUninitialize(); }
 };
 void setEndpointProperty(IMMDevice* endpoint,REFPROPERTYKEY key,PROPVARIANT& value) {
     // PolicyConfig brokers the write for a normal user; OpenPropertyStore(STGM_READWRITE) requires elevation.
@@ -248,12 +249,9 @@ void checkRvc() {
 // Audio threads run without the realtime boost when MMCSS refuses (service off, task edited):
 // a CPU-bound game then starves them. Reported in the session line.
 static std::atomic<unsigned> mmcssFailures{0};
-struct Mmcss {
-    DWORD task = 0;
-    HANDLE h = AvSetMmThreadCharacteristicsW(L"Audio", &task);
-    Mmcss() { if(!h) ++mmcssFailures; }
-    ~Mmcss() { if(h) AvRevertMmThreadCharacteristics(h); }
-};
+AudioPriority::AudioPriority() {DWORD task=0;h=AvSetMmThreadCharacteristicsW(L"Audio",&task);if(!h)++mmcssFailures;}
+AudioPriority::~AudioPriority() {if(h)AvRevertMmThreadCharacteristics(h);}
+using Mmcss=AudioPriority;
 std::string utf8(const std::wstring& s) {
     if(s.empty()) return {};
     int n=WideCharToMultiByte(CP_UTF8,0,s.data(),static_cast<int>(s.size()),nullptr,0,nullptr,nullptr);
@@ -682,7 +680,7 @@ std::string Engine::sessionLine() const {
         <<" input_channels="<<stats.inputChannels<<" input_flip="<<stats.inputFlipped
         // Thread starvation, the whole DSP block, and gate/denoiser settings that sound like an
         // over-eager denoiser when they cut syllables.
-        <<" wake_max_ms="<<stats.tagMaxWakeMs<<" process_max_ms="<<stats.maxProcessMs<<" mmcss_failures="<<mmcssFailures
+        <<" catch_up_blocks="<<stats.catchUpBlocks<<" gpu_late_blocks="<<stats.lateBlocks<<" wake_max_ms="<<stats.tagMaxWakeMs<<" process_max_ms="<<stats.maxProcessMs<<" mmcss_failures="<<mmcssFailures
         <<" gate_db="<<noiseGateDb<<" gate_hold_ms="<<gateHoldMs<<" intensity="<<intensity
         <<" cpus="<<std::thread::hardware_concurrency();
     try {for(const auto& d:devices(true)) if(d.id==config_.input) log<<" input=\""<<utf8(d.name)<<'"';} catch(...) {}
@@ -929,7 +927,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     ResetEvent(stop_); ResetEvent(data_); ResetEvent(ready_);
     stats.outputActive=false;
     stats.inputPeak=0; stats.outputPeak=0; stats.noisePeak=0; stats.processMs=0; stats.maxProcessMs=0; stats.reconfigureMs=0;
-    stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; failedAt_=0;
+    stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; stats.catchUpBlocks=0; stats.lateBlocks=0; failedAt_=0;
     stats.inputQueue=0; stats.outputQueue=0; stats.renderPadding=0;
     stats.underruns=0; stats.drops=0; stats.discontinuities=0; stats.processed=0;
     stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0; stats.inputChannels=0; stats.inputFlipped=false;
@@ -1065,6 +1063,9 @@ void Engine::dspLoop(Config c) {
             for(unsigned i=0;i<20;++i) { if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) return; fx->process(in.data(),out.data()); }
             fx->reset();
         }
+        // From here only the worker touches the NVIDIA handle; destroyed before `fx`.
+        std::unique_ptr<DenoiseWorker<Afx>> gpu;
+        if(fx) gpu=std::make_unique<DenoiseWorker<Afx>>(*fx,stats,applied);
         soundRequest=0;soundSeekRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
         SetEvent(ready_);
         HANDLE events[]={stop_,data_};
@@ -1072,27 +1073,36 @@ void Engine::dspLoop(Config c) {
             while(WaitForSingleObject(stop_,0)!=WAIT_OBJECT_0) {
                 // Do not discard audio that can still fit within the selected output reserve.
                 const unsigned inputBudget=std::max(block*4,c.bufferMs*48+block*2);
-                if(captured_.size()>inputBudget) { captured_.trim(block*2); resetEffect_=true; ++stats.drops; }
+                // No NVIDIA reset for lag drops: under a game's GPU load the reset itself took
+                // 215 ms, overflowed the queue again and chained 5-10 s of silence.
+                if(captured_.size()>inputBudget) { captured_.trim(block*2); ++stats.drops; }
                 if(!captured_.pop(in.data(),block)) break;
+                // Still behind by a whole output reserve after a stalled run: pass these blocks dry
+                // so the queue catches up at once instead of starving the output for seconds.
+                const bool catchUp=dspBehind(captured_.size(),c.bufferMs);
+                if(catchUp) stats.catchUpBlocks.fetch_add(1,std::memory_order_relaxed);
                 auto begin=std::chrono::steady_clock::now();
-                if(resetEffect_.exchange(false) && fx) {
-                    fx->reset();
-                    stats.maxResetMs=std::max(stats.maxResetMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count());
-                }
+                const bool reset=resetEffect_.exchange(false);
                 const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
                     effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
-                if(wanted!=applied && fx) {
-                    auto start=std::chrono::steady_clock::now(); fx->strength(wanted); applied=wanted;
-                    stats.reconfigureMs=std::max(stats.reconfigureMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-start).count());
+                if(gpu) {
+                    // Wait while the output reserve lasts, keeping 10 ms of it; never under 8 ms.
+                    const auto reserve=std::chrono::microseconds(cleaned_.size()*1000/48);
+                    const auto budget=std::max<std::chrono::microseconds>(std::chrono::milliseconds(8),reserve-std::chrono::milliseconds(10));
+                    if(catchUp || !gpu->process(in.data(),out.data(),wanted,reset,budget)) {
+                        out=in;
+                        if(!catchUp) stats.lateBlocks.fetch_add(1,std::memory_order_relaxed);
+                    }
+                } else {
+                    const auto runBegin=std::chrono::steady_clock::now();
+                    if(catchUp) out=in;
+                    else if(cpu.state) {if(!cpuApi->process(cpu.state,in.data(),out.data(),wanted)) throw std::runtime_error("DeepFilterNet failed");}
+                    else out=in;
+                    const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
+                    if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
+                    if(runMs>5) stats.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
+                    if(runMs>10) stats.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
                 }
-                const auto runBegin=std::chrono::steady_clock::now();
-                if(fx) fx->process(in.data(),out.data());
-                else if(cpu.state) {if(!cpuApi->process(cpu.state,in.data(),out.data(),wanted)) throw std::runtime_error("DeepFilterNet failed");}
-                else out=in;
-                const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
-                if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
-                if(runMs>5) stats.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
-                if(runMs>10) stats.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 stats.processMs=ms; stats.maxProcessMs=std::max(stats.maxProcessMs.load(),ms);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
@@ -1346,7 +1356,7 @@ void Engine::tagLoop(Config c) {
             stats.inputFlipped=downmix.sign<0;
             check(capture->ReleaseBuffer(n),"TAG release capture");
             peakHold(stats.inputPeak,peak(mono.data(),n));
-            if(!captured_.push(mono.data(),n)){++stats.drops;resetEffect_=true;}
+            if(!captured_.push(mono.data(),n))++stats.drops;
             SetEvent(data_); lastCapture=std::chrono::steady_clock::now();
             check(capture->GetNextPacketSize(&n),"TAG next capture packet");
         }
@@ -1459,7 +1469,7 @@ void Engine::ioLoop(Config c) {
                 stats.inputFlipped=downmix.sign<0;
                 check(capture->ReleaseBuffer(n),"Release capture buffer");
                 peakHold(stats.inputPeak,peak(mono.data(),n));
-                if(!captured_.push(mono.data(),n)) { ++stats.drops; resetEffect_=true; }
+                if(!captured_.push(mono.data(),n)) ++stats.drops;
                 SetEvent(data_); lastCapture=std::chrono::steady_clock::now();
                 check(capture->GetNextPacketSize(&available),"Next capture packet");
             }

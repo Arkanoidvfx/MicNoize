@@ -704,6 +704,8 @@ enum Msg {
     DecayGeometry(Option<iced::Point>, Size),
     /// The window's native handle: colour-key it for a morph.
     Keyed(u64),
+    /// Window, HWND, late: after a tray Show, check that Windows really draws the window.
+    ShowCheck(window::Id, u64, bool),
     /// A point in the running morph's timeline.
     MorphStep(MorphStep),
     /// After an update: the hidden window is keyed and shown as the update window; then it grows.
@@ -2886,19 +2888,34 @@ impl App {
             }
             Msg::Show => {
                 self.shown_at = Some(Instant::now());
+                self.own_minimize = false;
                 if let Some(id) = self.window {
                     // An in-flight hide/Opened callback may leave a tracked window hidden.
                     return window::set_mode(id,window::Mode::Windowed)
-                        .chain(Task::batch([window::minimize(id,false),window::gain_focus(id)]));
+                        .chain(Task::batch([window::minimize(id,false),window::gain_focus(id)]))
+                        .chain(window::raw_id::<Msg>(id).map(move |hwnd| Msg::ShowCheck(id, hwnd, false)));
                 }
                 if let Some(id) = self.hidden_window.take() {
                     self.window = Some(id);
                     return window::set_mode(id, window::Mode::Windowed)
-                        .chain(Task::batch([window::minimize(id, false),window::gain_focus(id)]));
+                        .chain(Task::batch([window::minimize(id, false),window::gain_focus(id)]))
+                        .chain(window::raw_id::<Msg>(id).map(move |hwnd| Msg::ShowCheck(id, hwnd, false)));
                 }
                 let (id, t) = Self::open(self.qa_scale, None);
                 self.window = Some(id);
                 return t;
+            }
+            Msg::ShowCheck(id, hwnd, late) => {
+                // Skip a window hidden again on purpose and the update morph's deliberate keying.
+                if self.window == Some(id) && self.morph.is_none() && !self.own_minimize {
+                    if let Some(wrong) = update_window::force_visible(hwnd) {
+                        logs::note(&self.runtime_root, &format!("Окно из трея не показалось ({wrong}{}); восстановлено", if late { ", через 1,6 с" } else { "" }));
+                    }
+                    if !late {
+                        // Once more after the restore guard: a late hide must not leave a ghost window.
+                        return perform(async { std::thread::sleep(Duration::from_millis(1600)) }, move |_| Msg::ShowCheck(id, hwnd, true));
+                    }
+                }
             }
             Msg::Minimize => {
                 self.window_focused = false;

@@ -3,6 +3,9 @@
 #include <mmdeviceapi.h>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +19,9 @@
 
 namespace mic {
 constexpr unsigned rate = 48000, block = 480;
+// Input still queued after taking a block: beyond a whole output reserve (never under 40 ms, so
+// 30 ms capture packets stay denoised), the DSP stalled and passes blocks dry to catch up.
+constexpr bool dspBehind(size_t queued, unsigned bufferMs) { return queued > std::max<size_t>(block * 4, size_t{bufferMs} * 48); }
 struct RvcSettings {
     unsigned slot=0, chunkMs=200, index=0, gain=100;
     int pitch=0;
@@ -125,6 +131,8 @@ struct Stats {
     std::atomic<float> maxRunMs{0}, maxResetMs{0};
     // NVIDIA run time distribution: a lone max and a steady overload look the same otherwise.
     std::atomic<unsigned> runsOver5Ms{0}, runsOver10Ms{0}, maxRunBlock{0};
+    std::atomic<unsigned> catchUpBlocks{0}; // Blocks passed dry while the DSP caught up after a stall.
+    std::atomic<unsigned> lateBlocks{0}; // Blocks passed dry because the GPU denoiser was busy or late.
     std::atomic<float> inputPeak{0}, outputPeak{0}, processMs{0}, maxProcessMs{0};
     std::atomic<float> noisePeak{0}; // Cleaned microphone before the gate, independent of output effects.
     std::atomic<int> rvcState{0}; // Off, Starting, Ready, Bypass
@@ -138,6 +146,79 @@ struct Stats {
     std::atomic<uint64_t> tagFrames{0};
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};
     std::atomic<float> tagMaxWakeMs{0};
+};
+// MMCSS "Audio" for the calling thread while alive; a refusal is counted in the session line.
+struct AudioPriority {
+    HANDLE h=nullptr;
+    AudioPriority();
+    ~AudioPriority();
+    AudioPriority(const AudioPriority&)=delete;
+    AudioPriority& operator=(const AudioPriority&)=delete;
+};
+// Runs the GPU denoiser beside the DSP thread. A game's graphics held one NVIDIA run for up to
+// 263 ms; waiting for it starved the output and the voice chopped on and off. The DSP waits only
+// as long as its output reserve allows, then passes that block dry; the late result is discarded
+// and the next block goes to the model once it is free. `Fx` needs process/reset/strength.
+template<class Fx> class DenoiseWorker {
+public:
+    DenoiseWorker(Fx& fx,Stats& stats,float strength):fx_(fx),stats_(stats),applied_(strength),thread_([this]{run();}) {}
+    ~DenoiseWorker() {{std::lock_guard lock(mutex_);stop_=true;}wake_.notify_all();thread_.join();}
+    DenoiseWorker(const DenoiseWorker&)=delete;
+    DenoiseWorker& operator=(const DenoiseWorker&)=delete;
+    // True with the denoised block in `out`; false while the model is busy or past `budget`.
+    bool process(const float* in,float* out,float strength,bool reset,std::chrono::microseconds budget) {
+        std::unique_lock lock(mutex_);
+        if(error_) std::rethrow_exception(error_);
+        resetPending_|=reset;
+        if(busy_) return false;
+        std::copy_n(in,block,input_.begin());strength_=strength;busy_=true;
+        const uint64_t mine=++submitted_;
+        wake_.notify_all();
+        if(!wake_.wait_for(lock,budget,[&]{return finished_==mine || error_;}) || finished_!=mine) return false;
+        std::copy_n(output_.begin(),block,out);
+        return true;
+    }
+private:
+    void run() {
+        AudioPriority priority;
+        std::array<float,block> input{},output{};
+        std::unique_lock lock(mutex_);
+        for(;;) {
+            wake_.wait(lock,[&]{return stop_ || (busy_ && started_!=submitted_);});
+            if(stop_) return;
+            started_=submitted_;input=input_;
+            const float strength=strength_;const bool reset=std::exchange(resetPending_,false);
+            lock.unlock();
+            try {
+                using Clock=std::chrono::steady_clock;
+                auto ms=[](Clock::time_point since){return std::chrono::duration<float,std::milli>(Clock::now()-since).count();};
+                if(reset) {const auto begin=Clock::now();fx_.reset();stats_.maxResetMs=std::max(stats_.maxResetMs.load(),ms(begin));}
+                if(strength!=applied_) {const auto begin=Clock::now();fx_.strength(strength);applied_=strength;stats_.reconfigureMs=std::max(stats_.reconfigureMs.load(),ms(begin));}
+                const auto begin=Clock::now();
+                fx_.process(input.data(),output.data());
+                const float run=ms(begin);
+                if(run>stats_.maxRunMs.load(std::memory_order_relaxed)){stats_.maxRunMs=run;stats_.maxRunBlock=stats_.processed.load(std::memory_order_relaxed);}
+                if(run>5) stats_.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
+                if(run>10) stats_.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
+            } catch(...) {
+                lock.lock();error_=std::current_exception();busy_=false;wake_.notify_all();return;
+            }
+            lock.lock();
+            output_=output;finished_=started_;busy_=false;
+            wake_.notify_all();
+        }
+    }
+    Fx& fx_;
+    Stats& stats_;
+    float applied_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::array<float,block> input_{},output_{};
+    float strength_=1;
+    bool busy_=false,stop_=false,resetPending_=false;
+    uint64_t submitted_=0,started_=0,finished_=0;
+    std::exception_ptr error_;
+    std::thread thread_; // Last: the worker starts once every member above exists.
 };
 struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;float sound=0;uint8_t recording=0;float echoMic=0,echoDiscord=0;};
 // Soundpad clip: decoded by the UI to 48 kHz mono, owned here so playback never touches files.

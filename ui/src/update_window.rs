@@ -175,6 +175,68 @@ pub fn set_region(hwnd: u64, card: Option<(iced::Rectangle, f32)>) {
         }
     }
 }
+/// Brings a window the app considers shown into a state Windows actually draws: restored,
+/// visible, opaque, without a clip region, on a monitor. The tray once "opened" a window that
+/// Windows kept invisible, with an empty taskbar preview. Returns what was wrong, if anything.
+pub fn force_visible(hwnd: u64) -> Option<String> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn IsWindow(window: isize) -> i32;
+        fn IsWindowVisible(window: isize) -> i32;
+        fn IsIconic(window: isize) -> i32;
+        fn GetWindowLongPtrW(window: isize, index: i32) -> isize;
+        fn GetLayeredWindowAttributes(window: isize, key: *mut u32, alpha: *mut u8, flags: *mut u32) -> i32;
+        fn GetWindowRgnBox(window: isize, rect: *mut [i32; 4]) -> i32;
+        fn MonitorFromWindow(window: isize, flags: u32) -> isize;
+        fn ShowWindow(window: isize, command: i32) -> i32;
+        fn SetWindowPos(window: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+        fn RedrawWindow(window: isize, rect: *const [i32; 4], region: isize, flags: u32) -> i32;
+    }
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_LAYERED: isize = 0x0008_0000;
+    const LWA_ALPHA: u32 = 2;
+    const NULLREGION: i32 = 1;
+    const ERROR: i32 = 0;
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+    const SWP_NOSIZE_NOZORDER_NOACTIVATE: u32 = 0x0001 | 0x0004 | 0x0010;
+    const RDW_INVALIDATE_FRAME_UPDATENOW_ALLCHILDREN: u32 = 0x0001 | 0x0400 | 0x0100 | 0x0080;
+    let window = hwnd as isize;
+    let mut wrong = Vec::new();
+    unsafe {
+        if IsWindow(window) == 0 {
+            return Some("окно уничтожено".into());
+        }
+        let mut rect = [0i32; 4];
+        let region = GetWindowRgnBox(window, &mut rect);
+        if region != ERROR {
+            wrong.push(format!("регион {}", if region == NULLREGION { "пустой".into() } else { format!("{rect:?}") }));
+            set_region(hwnd, None);
+        }
+        if GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_LAYERED != 0 {
+            let (mut key, mut alpha, mut flags) = (0u32, 0u8, 0u32);
+            GetLayeredWindowAttributes(window, &mut key, &mut alpha, &mut flags);
+            // A layered window with no attributes, a colour key or partial alpha is not drawn as the UI.
+            if flags != LWA_ALPHA || alpha != 255 {
+                wrong.push(format!("слой alpha={alpha} flags={flags}"));
+                color_key(hwnd, false, 255);
+            }
+        }
+        let (iconic, hidden) = (IsIconic(window) != 0, IsWindowVisible(window) == 0);
+        if iconic { wrong.push("свёрнуто".into()); }
+        if hidden { wrong.push("скрыто".into()); }
+        // SW_RESTORE also shows a hidden window.
+        if iconic { ShowWindow(window, SW_RESTORE); } else if hidden { ShowWindow(window, SW_SHOW); }
+        if MonitorFromWindow(window, 0) == 0 {
+            // MONITOR_DEFAULTTONULL: the window lies outside every monitor (one was unplugged).
+            wrong.push("вне мониторов".into());
+            SetWindowPos(window, 0, 64, 64, 0, 0, SWP_NOSIZE_NOZORDER_NOACTIVATE);
+        }
+        // Always: a shown window that skipped its paint keeps an empty taskbar preview.
+        RedrawWindow(window, std::ptr::null(), 0, RDW_INVALIDATE_FRAME_UPDATENOW_ALLCHILDREN);
+    }
+    (!wrong.is_empty()).then(|| wrong.join(", "))
+}
 /// The update card's corner radius, as drawn by [`view::update_card`].
 const CARD_RADIUS: f32 = 12.0;
 
@@ -202,6 +264,39 @@ mod tests {
             assert_ne!(style & 0x00080000,0,"unkey discarded the composed surface");
             assert_ne!(got,0);
             assert_eq!((alpha,flags),(255,2),"opaque surface kept its colour key");
+        }
+    }
+    #[test]
+    fn force_visible_repairs_an_invisible_window() {
+        #[link(name="user32")]
+        unsafe extern "system" {
+            fn CreateWindowExW(ex:u32,class:*const u16,title:*const u16,style:u32,x:i32,y:i32,w:i32,h:i32,parent:isize,menu:isize,instance:isize,param:*const std::ffi::c_void)->isize;
+            fn DestroyWindow(hwnd:isize)->i32;
+            fn ShowWindow(hwnd:isize,command:i32)->i32;
+            fn IsWindowVisible(hwnd:isize)->i32;
+            fn IsIconic(hwnd:isize)->i32;
+            fn GetLayeredWindowAttributes(hwnd:isize,key:*mut u32,alpha:*mut u8,flags:*mut u32)->i32;
+        }
+        let class:Vec<u16>="STATIC ".encode_utf16().collect();
+        unsafe {
+            // Popup, initially hidden: a transparent, minimized, clipped window like the reported one.
+            let hwnd=CreateWindowExW(0,class.as_ptr(),class.as_ptr(),0x80000000,100,100,64,64,0,0,0,std::ptr::null());
+            assert_ne!(hwnd,0);
+            super::color_key(hwnd as u64,true,0);
+            super::set_region(hwnd as u64,Some((iced::Rectangle::new(iced::Point::ORIGIN,iced::Size::new(32.0,32.0)),64.0)));
+            ShowWindow(hwnd,7); // SW_SHOWMINNOACTIVE
+            ShowWindow(hwnd,0);
+            let report=super::force_visible(hwnd as u64);
+            let again=super::force_visible(hwnd as u64);
+            let (visible,iconic)=(IsWindowVisible(hwnd),IsIconic(hwnd));
+            let (mut key,mut alpha,mut flags)=(0,0,0);
+            GetLayeredWindowAttributes(hwnd,&mut key,&mut alpha,&mut flags);
+            DestroyWindow(hwnd);
+            let report=report.expect("broken window reported");
+            for part in ["слой alpha=0","регион","свёрнуто","скрыто"] { assert!(report.contains(part),"{report}"); }
+            assert_eq!((visible!=0,iconic!=0,alpha,flags),(true,false,255,2));
+            assert_eq!(again,None,"a repaired window needs no second repair");
+            assert_eq!(super::force_visible(hwnd as u64).as_deref(),Some("окно уничтожено"));
         }
     }
 }

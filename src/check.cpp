@@ -142,11 +142,39 @@ static void probeCable(const mic::Device& output,const mic::Device& input,const 
     report<<"render_capacity_frames="<<capacity<<" padding_min="<<minPadding<<" padding_max="<<maxPadding<<"\n";
     std::cout<<"PROBE SAVED; render capacity="<<capacity<<" queued frames="<<minPadding<<".."<<maxPadding<<"\n";
 }
+// A game's graphics stalling one NVIDIA run must cost one dry block, never output time.
+static void denoiseWorkerTest() {
+    struct SlowFx {
+        std::atomic<int> delayMs{0};std::atomic<int> resets{0};
+        void process(const float* in,float* out){std::this_thread::sleep_for(std::chrono::milliseconds(delayMs.load()));for(unsigned i=0;i<mic::block;++i)out[i]=in[i]*0.5f;}
+        void reset(){++resets;}
+        void strength(float){}
+    } fx;
+    mic::Stats stats;
+    std::array<float,mic::block> in{},out{};in.fill(0.8f);
+    using Clock=std::chrono::steady_clock;using std::chrono::milliseconds;
+    mic::DenoiseWorker<SlowFx> worker(fx,stats,1);
+    require(worker.process(in.data(),out.data(),1,false,milliseconds(200)) && out[0]==0.4f,"Idle GPU worker denoises the block");
+    fx.delayMs=200;
+    auto begin=Clock::now();
+    require(!worker.process(in.data(),out.data(),1,false,milliseconds(20)),"A stalled GPU run reports a late block");
+    require(Clock::now()-begin<milliseconds(120),"A stalled GPU run held the DSP past its budget");
+    begin=Clock::now();
+    require(!worker.process(in.data(),out.data(),1,true,milliseconds(20)) && Clock::now()-begin<milliseconds(15),"A busy GPU worker must not make the DSP wait");
+    fx.delayMs=0;
+    std::this_thread::sleep_for(milliseconds(300));
+    out.fill(0);
+    require(worker.process(in.data(),out.data(),1,true,milliseconds(200)) && out[0]==0.4f,"GPU worker recovers after a stall");
+    require(fx.resets.load()==1,"Resets requested while busy collapse into one, run on the worker");
+    require(stats.maxRunMs>150,"Worker records the stalled run");
+}
 static void selfTest() {
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
     require(mic::preferredDevice(choices,L"two",L"HyperX")==1,"Saved endpoint wins over name hint");
     require(mic::preferredDevice(choices,L"missing",L"HyperX")==-1,"Missing endpoint must not switch microphones");
     require(mic::preferredDevice(choices,L"",L"HyperX")==0,"First-run device suggestion");
+    require(!mic::dspBehind(mic::block*3,40) && !mic::dspBehind(mic::block*4,10),"Ordinary capture bursts stay denoised");
+    require(mic::dspBehind(mic::block*5,40) && mic::dspBehind(mic::block*26,40) && !mic::dspBehind(mic::block*8,80),"A stalled denoiser catches up dry");
     mic::TagClock clock;
     unsigned frames=clock.take(0.014,0,480);
     require(frames==480 && clock.pending>191.9,"TAG late wake retains clock debt");
@@ -293,7 +321,7 @@ int main(int argc,char** argv) {
             mic::checkHeadphones(outputs[index].id,std::stoi(argv[3])!=0);return 0;
         }
         if(argc==2 && std::string(argv[1])=="--discord-capture") { mic::checkDiscordCapture(5); return 0; }
-        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); protocolTest(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoiseWorkerTest(); protocolTest(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }
