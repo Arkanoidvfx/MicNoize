@@ -2,6 +2,7 @@ use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::Path,
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -41,29 +42,102 @@ pub fn record_blocking(data: &Path, name: &str, details: serde_json::Value) {
     }
 }
 
-/// The tail of every runtime log plus the user's own note, sent as `error` events so they land
-/// in the same operator dashboard as crashes. One request: the ingest limits batches, not fields.
-pub fn report(data: &Path, runtime: &Path, note: &str) -> Result<String, String> {
+/// Field limit of the worker's error schema, in UTF-16 units.
+const PART: usize = 2000;
+/// The ingest rejects bodies over 256 KB; the oldest log parts give way first.
+const BODY_LIMIT: usize = 240 * 1024;
+
+/// Long log tails, the engine's 15-minute timeline and a system snapshot plus the user's own
+/// note, sent as `error` events so they land in the same operator dashboard as crashes. Each
+/// text is split into numbered parts, so nothing is cut to its last 2000 characters. Runs off
+/// the UI thread; the system snapshot takes about a second, the audio path is not touched.
+pub fn report(data: &Path, runtime: &Path, note: &str, perf: &str) -> Result<String, String> {
     if !enabled() {
         return Err("Отправка отчётов доступна только в установленной версии".into());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut events = report_events(data, runtime, exe.parent().ok_or("Нет папки приложения")?, note);
-    events.push(error_event("report-environment", &format!(
-        "Windows: {}\ntar: {}",
+    push_text(&mut events, "engine-perf", perf);
+    push_text(&mut events, "system", &format!(
+        "{}\nWindows: {}\ntar: {}\nnvidia-smi: {}\nnvidia-smi throttle: {}\npower: {}",
+        crate::engine::system_report(),
         crate::logs::command("cmd.exe", &["/d", "/c", "ver"]),
         crate::logs::command(crate::components::tar(), &["--version"]),
-    )));
+        crate::logs::command("nvidia-smi", &["--query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.width.current", "--format=csv"]),
+        crate::logs::command("nvidia-smi", &["--query-gpu=clocks_throttle_reasons.active", "--format=csv,noheader"]),
+        crate::logs::command("powercfg", &["/getactivescheme"]),
+    ));
+    let dropped = fit(&mut events);
     let count = events.len();
-    send(data, events, Duration::from_secs(15))?;
-    Ok(format!("Отчёт отправлен ({count})"))
+    send(data, events, Duration::from_secs(20))?;
+    Ok(if dropped == 0 { format!("Отчёт отправлен ({count})") } else { format!("Отчёт отправлен ({count}, без {dropped} старейших частей логов)") })
+}
+
+/// Parts of at most `PART` UTF-16 units, broken at line ends where a line fits.
+fn split_parts(text: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut units = 0;
+    for line in text.split_inclusive('\n') {
+        if units > 0 && units + line.encode_utf16().count() > PART {
+            parts.push(String::new());
+            units = 0;
+        }
+        for ch in line.chars() {
+            if units + ch.len_utf16() > PART {
+                parts.push(String::new());
+                units = 0;
+            }
+            parts.last_mut().unwrap().push(ch);
+            units += ch.len_utf16();
+        }
+    }
+    parts.retain(|part| !part.trim().is_empty());
+    parts
+}
+
+/// One event per part, named `name k/n` when the text needs more than one.
+fn push_text(events: &mut Vec<serde_json::Value>, name: &str, text: &str) {
+    let parts = split_parts(text);
+    let count = parts.len();
+    for (index, part) in parts.iter().enumerate() {
+        if count == 1 {
+            events.push(error_event(name, part));
+        } else {
+            let label = format!("{name} {}/{count}", index + 1);
+            events.push(error_with(&label, part, &label));
+        }
+    }
+}
+
+/// Drops the oldest part of whichever text has the most parts until the body fits the ingest.
+fn fit(events: &mut Vec<serde_json::Value>) -> usize {
+    let size = |event: &serde_json::Value| serde_json::to_vec(event).map_or(0, |b| b.len() + 1);
+    let mut total: usize = 1024 + events.iter().map(size).sum::<usize>();
+    let text = |event: &serde_json::Value| event["name"].as_str()
+        .and_then(|name| name.rsplit_once(' '))
+        .filter(|(_, part)| part.contains('/'))
+        .map(|(text, _)| text.to_owned());
+    let mut dropped = 0;
+    while total > BODY_LIMIT {
+        let mut parts: HashMap<String, usize> = HashMap::new();
+        for event in events.iter() {
+            if let Some(name) = text(event) { *parts.entry(name).or_default() += 1; }
+        }
+        let Some(largest) = parts.into_iter().max_by_key(|(_, count)| *count).map(|(name, _)| name) else { break };
+        let Some(index) = events.iter().position(|event| text(event).as_deref() == Some(largest.as_str())) else { break };
+        total -= size(&events.remove(index));
+        dropped += 1;
+    }
+    dropped
 }
 
 pub fn startup_failure(data: &Path, runtime: &Path, error: &str) -> Result<(), String> {
     if !enabled() { return Err("Автоматический отчёт недоступен в этой сборке".into()); }
     let exe = std::env::current_exe().map_err(|e| format!("Путь приложения: {e}"))?;
     let app = exe.parent().ok_or("Нет папки приложения")?;
-    send(data, startup_events(data, runtime, app, error), Duration::from_secs(3))
+    let mut events = startup_events(data, runtime, app, error);
+    fit(&mut events);
+    send(data, events, Duration::from_secs(3))
 }
 
 fn startup_events(data: &Path, runtime: &Path, app: &Path, error: &str) -> Vec<serde_json::Value> {
@@ -90,36 +164,55 @@ fn startup_events(data: &Path, runtime: &Path, app: &Path, error: &str) -> Vec<s
 
 fn report_events(data: &Path, runtime: &Path, app: &Path, note: &str) -> Vec<serde_json::Value> {
     let mut events = vec![error_event("user-report", note)];
-    let mut files: Vec<_> = [
-        "app.log", "nvafx.log", "tag-host.log", "tag-host.previous.log",
-        "tag-endpoint.log", "sessions.log", "tag-headphones.log",
-    ].into_iter().map(|name| (name, runtime.join("results").join(name))).collect();
-    files.push(("component-unpack.log", runtime.join(".download-rvc/rvc-runtime.tar.log")));
-    files.push(("rust-ui-error.log", data.join("Logs/rust-ui-error.log")));
-    files.push(("rust-ui-panic.log", data.join("Logs/rust-ui-panic.log")));
-    files.push(("startup-report.log", data.join("Logs/startup-report.log")));
+    let results = |name: &str| runtime.join("results").join(name);
+    // Newest bytes of each file; `fit` trims the oldest parts if they all exceed the ingest.
+    let mut files = vec![
+        ("app.log", results("app.log"), 48 << 10),
+        ("sessions.log", results("sessions.log"), 32 << 10),
+        ("perf-last.log", results("perf-last.log"), 40 << 10),
+        ("nvafx.log", results("nvafx.log"), 12 << 10),
+        ("tag-host.log", results("tag-host.log"), 16 << 10),
+        ("tag-host.previous.log", results("tag-host.previous.log"), 8 << 10),
+        ("tag-endpoint.log", results("tag-endpoint.log"), 8 << 10),
+        ("tag-headphones.log", results("tag-headphones.log"), 4 << 10),
+        ("settings.ini", data.join("settings.ini"), 16 << 10),
+        ("update-journal.json", runtime.join(".update/journal.json"), 8 << 10),
+        ("component-unpack.log", runtime.join(".download-rvc/rvc-runtime.tar.log"), 8 << 10),
+        ("rust-ui-error.log", data.join("Logs/rust-ui-error.log"), 8 << 10),
+        ("rust-ui-panic.log", data.join("Logs/rust-ui-panic.log"), 16 << 10),
+        ("startup-report.log", data.join("Logs/startup-report.log"), 8 << 10),
+    ];
     // Before Components/vendor exists, the scheduled host's projectRoot() falls back to
     // the installation parent. Keep these early failures even after core has been installed.
     if let Some(parent) = app.parent().filter(|p| *p != runtime) {
-        files.push(("startup/tag-host.log", parent.join("results/tag-host.log")));
-        files.push(("startup/tag-host.previous.log", parent.join("results/tag-host.previous.log")));
-        files.push(("startup/tag-endpoint.log", parent.join("results/tag-endpoint.log")));
+        files.push(("startup/tag-host.log", parent.join("results/tag-host.log"), 8 << 10));
+        files.push(("startup/tag-host.previous.log", parent.join("results/tag-host.previous.log"), 8 << 10));
+        files.push(("startup/tag-endpoint.log", parent.join("results/tag-endpoint.log"), 8 << 10));
     }
     let mut inventory = Vec::new();
-    for (name, path) in files {
-        let status = match crate::logs::read_tail(&path, 8192) {
+    for (name, path, limit) in files {
+        let length = path.metadata().map_or(0, |m| m.len());
+        let status = match crate::logs::read_tail(&path, limit) {
             Ok(text) if text.trim().is_empty() => "empty".to_owned(),
             Ok(text) => {
-                events.push(error_event(name, &text));
+                // A tail that starts mid-line would open the part with a fragment.
+                let text = if length > limit as u64 { text.split_once('\n').map_or(text.as_str(), |(_, rest)| rest) } else { &text };
+                push_text(&mut events, name, text);
                 let modified = path.metadata().and_then(|m| m.modified()).ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| format!("{}Z", chrono_free_utc(d.as_secs())))
                     .unwrap_or_else(|| "unknown".into());
-                format!("included; modified={modified}")
+                format!("included; bytes={length}; sent={}; modified={modified}", text.len())
             }
             Err(e) => format!("unavailable: {:?}; os={:?}", e.kind(), e.raw_os_error()),
         };
         inventory.push(format!("{name}: {status}"));
+    }
+    // Every launch writes its version; the whole app.log says which versions ran and when.
+    if let Ok(text) = std::fs::read_to_string(results("app.log")) {
+        let launches: Vec<&str> = text.lines().filter(|line| line.contains("Запуск Mic Noize")).collect();
+        let recent = &launches[launches.len().saturating_sub(30)..];
+        if !recent.is_empty() { push_text(&mut events, "version-history", &recent.join("\n")); }
     }
     events.push(error_event("report-files", &inventory.join("\n")));
     events
@@ -127,16 +220,20 @@ fn report_events(data: &Path, runtime: &Path, app: &Path, note: &str) -> Vec<ser
 
 /// The worker's JS schema limits UTF-16 units, not Unicode scalar values or UTF-8 bytes.
 fn error_event(name: &str, text: &str) -> serde_json::Value {
+    error_with(name, text, text.lines().next_back().unwrap_or(""))
+}
+
+fn error_with(name: &str, text: &str, message: &str) -> serde_json::Value {
     let tail: String = text.chars().rev().scan(0, |len, ch| {
         *len += ch.len_utf16();
-        (*len <= 2000).then_some(ch)
+        (*len <= PART).then_some(ch)
     }).collect::<Vec<_>>().into_iter().rev().collect();
     event(
         "error",
         name,
         json!({
             "exception_type": name,
-            "message": text.lines().next_back().unwrap_or("").chars().scan(0, |len, ch| {
+            "message": message.chars().scan(0, |len, ch| {
                 *len += ch.len_utf16();
                 (*len <= 1000).then_some(ch)
             }).collect::<String>(),
@@ -274,13 +371,19 @@ mod tests {
         assert!(tail.len() <= 8192 && tail.ends_with("last failure 😀"));
         let events = report_events(&root, &runtime, &app, "state=0 driver=false core=false");
         let get = |name| events.iter().find(|e| e["name"] == name).unwrap()["data"]["stack_top"].as_str().unwrap();
-        assert!(get("app.log").ends_with("last failure 😀"));
+        // 48 KB of app.log arrives whole, in numbered parts, oldest first.
+        let app_parts: Vec<&str> = events.iter().filter(|e| e["name"].as_str().unwrap().starts_with("app.log "))
+            .map(|e| e["data"]["stack_top"].as_str().unwrap()).collect();
+        assert!(app_parts.len() > 20 && app_parts.last().unwrap().ends_with("last failure 😀"));
+        assert!(app_parts.iter().all(|part| part.encode_utf16().count() <= PART && part.starts_with("old log")));
+        assert!(app_parts.concat().len() > 40_000);
         assert!(get("startup/tag-host.log").contains("TAG API missing"));
         assert!(get("component-unpack.log").contains("Access denied"));
         assert!(get("rust-ui-error.log").contains("waiting for driver"));
         assert!(get("report-files").contains("tag-host.log: unavailable:"));
         assert!(get("report-files").contains("nvafx.log: empty"));
-        assert!(get("report-files").contains("startup/tag-host.log: included; modified="));
+        assert!(get("report-files").contains("startup/tag-host.log: included; bytes=35; sent=35; modified="));
+        assert!(get("report-files").contains("app.log: included; bytes=80018; sent="));
         assert_eq!(get("user-report"), "state=0 driver=false core=false");
         std::fs::create_dir_all(runtime.join(".update")).unwrap();
         std::fs::write(runtime.join(".update/journal.json"), r#"{"phase":"Complete","before":{"version":"0.4.17"},"after":{"version":"0.4.20"},"install":"fixture"}"#).unwrap();
@@ -293,6 +396,25 @@ mod tests {
         std::fs::write(runtime.join(".update/journal.json"), b"{torn").unwrap();
         assert!(startup_events(&root, &runtime, &app, "corrupt journal").len() <= 50);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_parts_keep_lines_and_fit_the_ingest() {
+        let parts = split_parts(&format!("{}\n{}", "a".repeat(1990), "😀".repeat(1500)));
+        assert_eq!(parts[0], format!("{}\n", "a".repeat(1990)));
+        assert!(parts.iter().all(|part| part.encode_utf16().count() <= PART) && parts.len() == 3);
+        let mut events = vec![error_event("user-report", "note")];
+        push_text(&mut events, "app.log", &"line of log\n".repeat(30_000));
+        push_text(&mut events, "engine-perf", &"12:00:00 run=1.0\n".repeat(2_000));
+        let parts = |events: &[serde_json::Value], text: &str| events.iter()
+            .filter(|e| e["name"].as_str().unwrap().starts_with(text)).count();
+        let (app, perf) = (parts(&events, "app.log "), parts(&events, "engine-perf "));
+        let dropped = fit(&mut events);
+        assert!(dropped > 0 && serde_json::to_vec(&events).unwrap().len() + 1024 <= BODY_LIMIT);
+        assert_eq!(events[0]["name"], "user-report");
+        assert_eq!(parts(&events, "app.log ") + parts(&events, "engine-perf ") + dropped, app + perf);
+        let last = events.iter().rev().find(|e| e["name"].as_str().unwrap().starts_with("app.log ")).unwrap();
+        assert_eq!(last["name"].as_str().unwrap(), format!("app.log {app}/{app}"));
     }
 
     #[test]

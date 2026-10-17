@@ -20,6 +20,12 @@
 #include <memory>
 #include <future>
 #include <xmmintrin.h>
+#include <iomanip>
+#include <map>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <psapi.h>
+#pragma comment(lib,"pdh.lib")
 #include "tag_link.hpp"
 #include "tag_endpoint.hpp"
 #include "tag.hpp"
@@ -451,6 +457,9 @@ std::string gpuArch(std::string& name) {
 
 static std::atomic<const CpuDenoiserApi*> cpuDenoiser{nullptr};
 void setCpuDenoiser(const CpuDenoiserApi* api) {cpuDenoiser=api;}
+// NTSTATUS of the last D3DKMTSetProcessSchedulingPriorityClass call; unsetPriority until tried.
+constexpr LONG unsetPriority=0x7fffffff;
+static std::atomic<LONG> gpuPriorityStatus{unsetPriority};
 
 class Afx {
     unsigned version_=2;
@@ -516,7 +525,7 @@ public:
             using SchedulingClass=LONG(APIENTRY*)(HANDLE,int);
             if(const auto gdi=LoadLibraryExW(L"gdi32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32))
                 if(const auto set=reinterpret_cast<SchedulingClass>(GetProcAddress(gdi,"D3DKMTSetProcessSchedulingPriorityClass")))
-                    set(GetCurrentProcess(),4);
+                    gpuPriorityStatus=set(GetCurrentProcess(),4);
             ok(create(NVAFX_EFFECT_DENOISER,&handle_),"CreateEffect");
             ok(setU32(handle_,NVAFX_PARAM_USE_DEFAULT_GPU,1),"Select GPU");
             ok(setU32(handle_,NVAFX_PARAM_INPUT_SAMPLE_RATE,rate),"Input sample rate");
@@ -586,7 +595,7 @@ void checkDenoiseContinuity(Config config) {
     }
 }
 
-void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigned seconds,const std::filesystem::path& csv,bool churn) {
+void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigned seconds,const std::filesystem::path& csv,bool churn,unsigned resetEvery) {
     if(samples.size()<block || samples.size()>rate*600 || !seconds || seconds>600 || config.cudaGraphs < -1 || config.cudaGraphs>1)
         throw std::runtime_error("Invalid benchmark input");
     for(float v:samples) if(!std::isfinite(v) || std::abs(v)>1) throw std::runtime_error("Invalid PCM sample");
@@ -605,6 +614,7 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
     for(unsigned i=0;i<20;++i) fx.process(samples.data()+(i%(samples.size()/block))*block,out.data());
     fx.reset();
     using Clock=std::chrono::steady_clock;
+    double resetMs=0,resetMax=0;unsigned resets=0;
     HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     if(!timer) throw std::runtime_error("Benchmark timer creation failed");
     struct Timer {HANDLE h; ~Timer(){CloseHandle(h);}} closeTimer{timer};
@@ -621,7 +631,10 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
         else std::copy_n(samples.data()+((frame%500)%(samples.size()/block))*block,block,in.data());
         // Churn: what the alternate-intensity hold and capture discontinuities do in a session;
         // the next block's run time shows whether the SDK rebuilds state after them.
-        if(churn && frame && frame%250==0) fx.reset();
+        if(churn && frame && frame%resetEvery==0) {
+            const auto begin=Clock::now();fx.reset();++resets;
+            const double ms=std::chrono::duration<double,std::milli>(Clock::now()-begin).count();resetMs+=ms;resetMax=std::max(resetMax,ms);
+        }
         else if(churn && frame && frame%100==0) fx.strength((frame/100)%2?0.5f:config.intensity);
         const auto beforeCpu=cpu(); const auto begin=Clock::now();
         fx.process(in.data(),out.data());
@@ -637,6 +650,7 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
     std::ofstream pcm(csv.wstring()+L".f32",std::ios::binary);
     pcm.write(reinterpret_cast<const char*>(rendered.data()),rendered.size()*sizeof(float));
     if(!report || !pcm) throw std::runtime_error("Benchmark report write failed");
+    if(resets) std::cout<<"version="<<config.version<<" resets="<<resets<<" reset_avg_ms="<<resetMs/resets<<" reset_max_ms="<<resetMax<<"\n";
 }
 
 struct Stream {
@@ -724,7 +738,10 @@ std::string Engine::sessionLine() const {
         // over-eager denoiser when they cut syllables.
         <<" catch_up_blocks="<<stats.catchUpBlocks<<" gpu_late_blocks="<<stats.lateBlocks<<" wake_max_ms="<<stats.tagMaxWakeMs<<" process_max_ms="<<stats.maxProcessMs<<" mmcss_failures="<<mmcssFailures
         <<" gate_db="<<noiseGateDb<<" gate_hold_ms="<<gateHoldMs<<" intensity="<<intensity
-        <<" cpus="<<std::thread::hardware_concurrency();
+        <<" cpus="<<std::thread::hardware_concurrency()<<" resets="<<stats.resets;
+    if(const LONG priority=gpuPriorityStatus;priority==unsetPriority) log<<" gpu_priority=unset";
+    else if(priority==0) log<<" gpu_priority=high";
+    else log<<" gpu_priority=failed:0x"<<std::hex<<static_cast<unsigned long>(priority)<<std::dec;
     try {for(const auto& d:devices(true)) if(d.id==config_.input) log<<" input=\""<<utf8(d.name)<<'"';} catch(...) {}
     return log.str();
 }
@@ -969,6 +986,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     ResetEvent(stop_); ResetEvent(data_); ResetEvent(ready_);
     stats.outputActive=false;
     stats.inputPeak=0; stats.outputPeak=0; stats.noisePeak=0; stats.processMs=0; stats.maxProcessMs=0; stats.reconfigureMs=0;
+    perf.clear(); stats.resets=0; stats.secondRunMaxMs=0; stats.secondWakeMaxMs=0;
     stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; stats.catchUpBlocks=0; stats.lateBlocks=0; failedAt_=0;
     stats.inputQueue=0; stats.outputQueue=0; stats.renderPadding=0;
     stats.underruns=0; stats.drops=0; stats.discontinuities=0; stats.processed=0;
@@ -1044,6 +1062,8 @@ void Engine::stop() {
             }
             log<<" status="<<utf8(status())<<'\n';
             if(!log) OutputDebugStringW(L"Mic Noize: could not write results/sessions.log\n");
+            // The stopped session's timeline stays reportable after a restart; overwritten each stop.
+            std::ofstream(folder/L"perf-last.log",std::ios::trunc)<<format(time)<<sessionLine()<<'\n'<<formatPerf(perf.copy());
         } catch(...) {OutputDebugStringW(L"Mic Noize: session log unavailable\n");}
     }
     stats.outputActive=false;
@@ -1114,6 +1134,12 @@ void Engine::dspLoop(Config c) {
         std::unique_ptr<DenoiseWorker<Afx>> gpu;
         if(fx) gpu=std::make_unique<DenoiseWorker<Afx>>(*fx,stats,applied);
         soundRequest=0;soundSeekRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
+        // Developer-report history: cumulative counters become per-second deltas every 100 blocks.
+        struct Totals {unsigned late,catchUp,gaps,underruns,drops,resets,tagGaps,lateTicks,reconnects;};
+        const auto totals=[&]{return Totals{stats.lateBlocks.load(),stats.catchUpBlocks.load(),stats.discontinuities.load(),
+            stats.underruns.load(),stats.drops.load(),stats.resets.load(),stats.tagDriverGaps.load(),stats.tagLateTicks.load(),stats.tagReconnects.load()};};
+        const auto delta=[](unsigned now,unsigned before){return static_cast<uint16_t>(std::min<unsigned>(now-before,0xffff));};
+        Totals perfBefore=totals();PerfSecond second{};second.outMinMs=1e9f;unsigned perfBlocks=0;
         SetEvent(ready_);
         HANDLE events[]={stop_,data_};
         while(WaitForMultipleObjects(2,events,FALSE,INFINITE)==WAIT_OBJECT_0+1) {
@@ -1129,7 +1155,10 @@ void Engine::dspLoop(Config c) {
                 const bool catchUp=dspBehind(captured_.size(),c.bufferMs);
                 if(catchUp) stats.catchUpBlocks.fetch_add(1,std::memory_order_relaxed);
                 auto begin=std::chrono::steady_clock::now();
-                const bool reset=resetEffect_.exchange(false);
+                // v1 has no cheap reset (SDK Reset adds 10 ms each; the flush is 20 GPU runs). Capture
+                // gaps come in hundreds per session and more under a game: per-gap flushes made 0.4.34
+                // load the GPU and stutter games. Its history clears itself within the model delay.
+                const bool reset=resetEffect_.exchange(false) && !(gpu && c.version==1);
                 const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
                     effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
                 bool denoised=false;
@@ -1154,9 +1183,13 @@ void Engine::dspLoop(Config c) {
                     if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
                     if(runMs>5) stats.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
                     if(runMs>10) stats.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
+                    if(runMs>stats.secondRunMaxMs.load(std::memory_order_relaxed)) stats.secondRunMaxMs.store(runMs,std::memory_order_relaxed);
                 }
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 stats.processMs=ms; stats.maxProcessMs=std::max(stats.maxProcessMs.load(),ms);
+                second.processMaxMs=std::max(second.processMaxMs,ms);
+                second.inMaxMs=std::max(second.inMaxMs,captured_.size()/48.0f);
+                second.outMinMs=std::min(second.outMinMs,cleaned_.size()/48.0f);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
                 if(gpu || cpu.state) denoisePlayout.process(in.data(),out.data(),denoised,reset);
                 for(float& v:out) v=std::clamp(v,-1.0f,1.0f);
@@ -1282,6 +1315,17 @@ void Engine::dspLoop(Config c) {
                 if(!cleaned_.push(routed.data(),block)) ++stats.drops;
                 ++stats.processed;
                 stats.inputQueue=static_cast<unsigned>(captured_.size());
+                if(++perfBlocks==100) {
+                    const Totals now=totals();FILETIME utc{};GetSystemTimeAsFileTime(&utc);
+                    second.utc=(static_cast<uint64_t>(utc.dwHighDateTime)<<32)|utc.dwLowDateTime;
+                    second.runMaxMs=stats.secondRunMaxMs.exchange(0);second.wakeMaxMs=stats.secondWakeMaxMs.exchange(0);
+                    second.late=delta(now.late,perfBefore.late);second.catchUp=delta(now.catchUp,perfBefore.catchUp);
+                    second.gaps=delta(now.gaps,perfBefore.gaps);second.underruns=delta(now.underruns,perfBefore.underruns);
+                    second.drops=delta(now.drops,perfBefore.drops);second.resets=delta(now.resets,perfBefore.resets);
+                    second.tagGaps=delta(now.tagGaps,perfBefore.tagGaps);second.lateTicks=delta(now.lateTicks,perfBefore.lateTicks);
+                    second.reconnects=delta(now.reconnects,perfBefore.reconnects);
+                    perf.push(second);perfBefore=now;second={};second.outMinMs=1e9f;perfBlocks=0;
+                }
             }
         }
         // Preserve a recording when processing stops before the next audio block publishes it.
@@ -1429,6 +1473,7 @@ void Engine::tagLoop(Config c) {
             const unsigned maxFrames=std::min(tag.capacity()/2,static_cast<unsigned>(output.size()));
             const double elapsed=std::chrono::duration<double>(now-last).count();
             stats.tagMaxWakeMs=std::max(stats.tagMaxWakeMs.load(),static_cast<float>(elapsed*1000));
+            if(elapsed*1000>stats.secondWakeMaxMs.load(std::memory_order_relaxed)) stats.secondWakeMaxMs.store(static_cast<float>(elapsed*1000),std::memory_order_relaxed);
             if(elapsed*rate>maxFrames) ++stats.tagLateTicks;
             // Keep overdue frames for the next tick. A late wake must neither lose
             // device-clock time nor discard/re-prime already processed audio.
@@ -1765,5 +1810,154 @@ void checkHeadphones(const std::wstring& output,bool denoise) {
     h.stop();if(h.state!=0 || blocks<100)throw std::runtime_error("Headphone pipeline did not process enough blocks");
     const unsigned stopped=h.processed;Sleep(100);if(h.processed!=stopped)throw std::runtime_error("Headphone DSP still running after stop");
     std::cout<<"HEADPHONES CHECK PASSED: stereo synthetic input, physical output muted, TAG feedback rejected by identity; denoise="<<denoise<<", blocks="<<blocks<<", drops="<<dropped<<"; stopped\n";
+}
+static std::string utcText(uint64_t filetime,bool timeOnly) {
+    const FILETIME file{static_cast<DWORD>(filetime),static_cast<DWORD>(filetime>>32)};SYSTEMTIME t{};
+    if(!FileTimeToSystemTime(&file,&t)) return "?";
+    char text[32];
+    if(timeOnly) sprintf_s(text,"%02u:%02u:%02u",t.wHour,t.wMinute,t.wSecond);
+    else sprintf_s(text,"%04u-%02u-%02uT%02u:%02uZ",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute);
+    return text;
+}
+static void perfCounts(std::ostream& out,const PerfSecond& s) {
+    const std::pair<const char*,unsigned> counts[]={{"late",s.late},{"catch_up",s.catchUp},{"capture_gaps",s.gaps},{"underruns",s.underruns},
+        {"drops",s.drops},{"resets",s.resets},{"tag_gaps",s.tagGaps},{"late_ticks",s.lateTicks},{"reconnects",s.reconnects}};
+    for(const auto& [name,value]:counts) if(value) out<<' '<<name<<'='<<value;
+}
+std::string formatPerf(const std::vector<PerfSecond>& seconds) {
+    if(seconds.empty()) return "perf: no processed audio seconds\n";
+    std::ostringstream out;out<<std::fixed<<std::setprecision(1);
+    out<<"perf: seconds="<<seconds.size()<<" from="<<utcText(seconds.front().utc,false)<<" to="<<utcText(seconds.back().utc,false)
+       <<" UTC; one entry per 100 processed blocks. run=max NVIDIA/DFN run, proc=max DSP block, wake=max TAG wake,"
+       <<" out=min output reserve, in=max input queue (all ms); counters are per period.\n";
+    constexpr uint64_t minute=600000000ull;
+    for(size_t i=0;i<seconds.size();) {
+        const uint64_t bucket=seconds[i].utc/minute;PerfSecond m{};m.outMinMs=1e9f;unsigned n=0;
+        for(;i<seconds.size() && seconds[i].utc/minute==bucket;++i,++n) {
+            const auto& s=seconds[i];
+            m.runMaxMs=std::max(m.runMaxMs,s.runMaxMs);m.processMaxMs=std::max(m.processMaxMs,s.processMaxMs);
+            m.wakeMaxMs=std::max(m.wakeMaxMs,s.wakeMaxMs);m.outMinMs=std::min(m.outMinMs,s.outMinMs);m.inMaxMs=std::max(m.inMaxMs,s.inMaxMs);
+            const auto add=[](uint16_t& total,uint16_t value){total=static_cast<uint16_t>(std::min(total+value,0xffff));};
+            add(m.late,s.late);add(m.catchUp,s.catchUp);add(m.gaps,s.gaps);add(m.underruns,s.underruns);add(m.drops,s.drops);
+            add(m.resets,s.resets);add(m.tagGaps,s.tagGaps);add(m.lateTicks,s.lateTicks);add(m.reconnects,s.reconnects);
+        }
+        out<<"minute "<<utcText(bucket*minute,false)<<" n="<<n<<" run="<<m.runMaxMs<<" proc="<<m.processMaxMs<<" wake="<<m.wakeMaxMs
+           <<" out="<<m.outMinMs<<" in="<<m.inMaxMs;perfCounts(out,m);out<<'\n';
+    }
+    std::vector<std::string> lines;
+    for(size_t i=0;i<seconds.size();++i) {
+        const auto& s=seconds[i];
+        if(i && s.utc>seconds[i-1].utc+30000000ull)
+            lines.push_back(utcText(s.utc,true)+" no processed audio for "+std::to_string((s.utc-seconds[i-1].utc)/10000000)+" s");
+        const bool counted=s.late||s.catchUp||s.gaps||s.underruns||s.drops||s.resets||s.tagGaps||s.lateTicks||s.reconnects;
+        if(!counted && s.runMaxMs<=5 && s.processMaxMs<=10 && s.wakeMaxMs<=10 && s.outMinMs>=5) continue;
+        std::ostringstream line;line<<std::fixed<<std::setprecision(1)<<utcText(s.utc,true)<<" run="<<s.runMaxMs<<" proc="<<s.processMaxMs
+            <<" wake="<<s.wakeMaxMs<<" out="<<s.outMinMs<<" in="<<s.inMaxMs;
+        perfCounts(line,s);lines.push_back(line.str());
+    }
+    constexpr size_t keep=400;
+    out<<"incidents="<<lines.size()<<" (run>5, proc>10, wake>10, out<5 or any counter)";
+    if(lines.size()>keep) {out<<", oldest "<<lines.size()-keep<<" omitted";lines.erase(lines.begin(),lines.end()-keep);}
+    out<<'\n';
+    for(const auto& line:lines) out<<line<<'\n';
+    return out.str();
+}
+
+static std::wstring registryText(HKEY root,const wchar_t* key,const wchar_t* value) {
+    wchar_t text[256]{};DWORD size=sizeof(text);
+    return RegGetValueW(root,key,value,RRF_RT_REG_SZ,nullptr,text,&size)==ERROR_SUCCESS?text:L"";
+}
+static std::string registryNumber(HKEY root,const wchar_t* key,const wchar_t* value) {
+    DWORD number=0,size=sizeof(number);
+    return RegGetValueW(root,key,value,RRF_RT_REG_DWORD,nullptr,&number,&size)==ERROR_SUCCESS?std::to_string(number):"absent";
+}
+static uint64_t fileTicks(const FILETIME& time) {return (static_cast<uint64_t>(time.dwHighDateTime)<<32)|time.dwLowDateTime;}
+// Executable name only: a full path carries the Windows user name and adds nothing.
+static std::string processName(DWORD pid) {
+    std::string name="pid "+std::to_string(pid);
+    if(HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid)) {
+        wchar_t path[MAX_PATH];DWORD size=MAX_PATH;
+        if(QueryFullProcessImageNameW(process,0,path,&size)) name=utf8(std::filesystem::path(path).filename().wstring())+" ("+std::to_string(pid)+")";
+        CloseHandle(process);
+    }
+    return name;
+}
+static std::vector<std::pair<std::wstring,double>> counterRows(PDH_HCOUNTER counter) {
+    std::vector<std::pair<std::wstring,double>> rows;
+    DWORD bytes=0,count=0;
+    if(!counter || PdhGetFormattedCounterArrayW(counter,PDH_FMT_DOUBLE|PDH_FMT_NOCAP100,&bytes,&count,nullptr)!=static_cast<PDH_STATUS>(PDH_MORE_DATA)) return rows;
+    std::vector<BYTE> buffer(bytes);auto* items=reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    if(PdhGetFormattedCounterArrayW(counter,PDH_FMT_DOUBLE|PDH_FMT_NOCAP100,&bytes,&count,items)!=ERROR_SUCCESS) return rows;
+    for(DWORD i=0;i<count;++i) if(items[i].FmtValue.CStatus==PDH_CSTATUS_VALID_DATA || items[i].FmtValue.CStatus==PDH_CSTATUS_NEW_DATA)
+        rows.emplace_back(items[i].szName,items[i].FmtValue.doubleValue);
+    return rows;
+}
+std::string systemReport() {
+    std::ostringstream out;out<<std::fixed<<std::setprecision(1);
+    const wchar_t* nt=L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    out<<"windows build="<<utf8(registryText(HKEY_LOCAL_MACHINE,nt,L"CurrentBuild"))<<'.'<<registryNumber(HKEY_LOCAL_MACHINE,nt,L"UBR")
+       <<" display="<<utf8(registryText(HKEY_LOCAL_MACHINE,nt,L"DisplayVersion"))<<" edition="<<utf8(registryText(HKEY_LOCAL_MACHINE,nt,L"EditionID"))
+       <<" uptime_h="<<GetTickCount64()/3600000.0<<'\n';
+    auto cpu=utf8(registryText(HKEY_LOCAL_MACHINE,L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",L"ProcessorNameString"));
+    cpu.erase(cpu.find_last_not_of(' ')+1);
+    out<<"cpu=\""<<cpu<<"\" logical="<<std::thread::hardware_concurrency();
+    MEMORYSTATUSEX memory{sizeof(memory)};
+    if(GlobalMemoryStatusEx(&memory)) out<<" ram_gb="<<memory.ullTotalPhys/1073741824.0<<" ram_free_gb="<<memory.ullAvailPhys/1073741824.0<<" memory_load="<<memory.dwMemoryLoad<<'%';
+    out<<'\n';
+    // Settings that change how a game and this process share the GPU and the CPU.
+    out<<"hags="<<registryNumber(HKEY_LOCAL_MACHINE,L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",L"HwSchMode")<<" (2 on, 1 off)"
+       <<" game_mode="<<registryNumber(HKEY_CURRENT_USER,L"Software\\Microsoft\\GameBar",L"AutoGameModeEnabled")<<" (absent = on)"
+       <<" game_dvr="<<registryNumber(HKEY_CURRENT_USER,L"System\\GameConfigStore",L"GameDVR_Enabled");
+    using GetClass=LONG(APIENTRY*)(HANDLE,int*);
+    int scheduling=-1;
+    if(const auto gdi=GetModuleHandleW(L"gdi32.dll"))
+        if(const auto get=reinterpret_cast<GetClass>(GetProcAddress(gdi,"D3DKMTGetProcessSchedulingPriorityClass")))
+            if(get(GetCurrentProcess(),&scheduling)!=0) scheduling=-1;
+    out<<" gpu_class="<<scheduling<<" (2 normal, 4 high, -1 unknown) cpu_class=0x"<<std::hex<<GetPriorityClass(GetCurrentProcess())<<std::dec<<'\n';
+    // One second window: GPU engines by process (English counter names work on any Windows language).
+    PDH_HQUERY query=nullptr;PDH_HCOUNTER engines=nullptr,dedicated=nullptr;
+    const bool pdh=PdhOpenQueryW(nullptr,0,&query)==ERROR_SUCCESS;
+    if(pdh) {
+        if(PdhAddEnglishCounterW(query,L"\\GPU Engine(*)\\Utilization Percentage",0,&engines)!=ERROR_SUCCESS) engines=nullptr;
+        if(PdhAddEnglishCounterW(query,L"\\GPU Process Memory(*)\\Dedicated Usage",0,&dedicated)!=ERROR_SUCCESS) dedicated=nullptr;
+        PdhCollectQueryData(query);
+    }
+    FILETIME idle0{},kernel0{},user0{},idle1{},kernel1{},user1{},created{},ended{},ownKernel0{},ownUser0{},ownKernel1{},ownUser1{};
+    GetSystemTimes(&idle0,&kernel0,&user0);GetProcessTimes(GetCurrentProcess(),&created,&ended,&ownKernel0,&ownUser0);
+    const auto begin=std::chrono::steady_clock::now();
+    Sleep(1000);
+    if(pdh) PdhCollectQueryData(query);
+    GetSystemTimes(&idle1,&kernel1,&user1);GetProcessTimes(GetCurrentProcess(),&created,&ended,&ownKernel1,&ownUser1);
+    const double window=std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()*1e7;
+    const double all=static_cast<double>(fileTicks(kernel1)-fileTicks(kernel0)+fileTicks(user1)-fileTicks(user0)); // kernel includes idle
+    const double own=static_cast<double>(fileTicks(ownKernel1)-fileTicks(ownKernel0)+fileTicks(ownUser1)-fileTicks(ownUser0));
+    out<<"cpu_total="<<(all>0?100*(all-static_cast<double>(fileTicks(idle1)-fileTicks(idle0)))/all:0)<<"% own_cpu="
+       <<100*own/window/std::max(1u,std::thread::hardware_concurrency())<<"% of all cores ("<<100*own/window<<"% of one core)";
+    PROCESS_MEMORY_COUNTERS_EX ownMemory{};
+    if(K32GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&ownMemory),sizeof(ownMemory)))
+        out<<" own_working_set_mb="<<ownMemory.WorkingSetSize/1048576.0<<" own_private_mb="<<ownMemory.PrivateUsage/1048576.0;
+    out<<'\n';
+    if(!pdh) {out<<"gpu counters unavailable\n";return out.str();}
+    std::map<DWORD,std::map<std::string,double>> byProcess;std::map<std::string,double> total;
+    for(const auto& [name,value]:counterRows(engines)) {
+        DWORD pid=0;const auto type=name.find(L"engtype_");
+        if(swscanf_s(name.c_str(),L"pid_%lu",&pid)!=1 || type==std::wstring::npos) continue;
+        const auto engine=utf8(name.substr(type+8));byProcess[pid][engine]+=value;total[engine]+=value;
+    }
+    std::map<DWORD,double> vram;
+    for(const auto& [name,value]:counterRows(dedicated)) {DWORD pid=0;if(swscanf_s(name.c_str(),L"pid_%lu",&pid)==1) vram[pid]+=value;}
+    PdhCloseQuery(query);
+    const auto use=[](std::ostream& o,const std::map<std::string,double>& engines){for(const auto& [engine,value]:engines) if(value>=0.1) o<<' '<<engine<<'='<<value<<'%';};
+    out<<"gpu_engines_total (sum over processes, 1 s):";use(out,total);out<<'\n';
+    const DWORD self=GetCurrentProcessId();
+    out<<"gpu_own:";use(out,byProcess[self]);out<<" vram_mb="<<vram[self]/1048576.0<<'\n';
+    std::vector<std::pair<double,DWORD>> busiest;
+    for(const auto& [pid,used]:byProcess) {double peak=0;for(const auto& [engine,value]:used) peak=std::max(peak,value);if(peak>=0.5) busiest.emplace_back(peak,pid);}
+    std::sort(busiest.rbegin(),busiest.rend());
+    for(size_t i=0;i<busiest.size() && i<8;++i) {
+        const DWORD pid=busiest[i].second;
+        out<<"gpu_process "<<processName(pid)<<':';use(out,byProcess[pid]);out<<" vram_mb="<<vram[pid]/1048576.0<<'\n';
+    }
+    return out.str();
 }
 }

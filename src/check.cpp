@@ -230,7 +230,25 @@ static void denoiseWorkerTest() {
     catch(const std::runtime_error&) {threw=true;}
     require(threw,"Inference errors must propagate on the waiting call");
 }
+// Developer-report timeline: minute summaries, incident seconds only, silent gaps named.
+static void perfFormatTest() {
+    std::vector<mic::PerfSecond> seconds;
+    const uint64_t start=133000000000000000ull/600000000ull*600000000ull; // a whole UTC minute
+    for(unsigned i=0;i<130;++i) {
+        mic::PerfSecond s;s.utc=start+(i<120?i:i+40)*10000000ull;s.runMaxMs=1;s.processMaxMs=2;s.outMinMs=30;s.inMaxMs=10;
+        if(i==5){s.late=3;s.runMaxMs=42;}
+        if(i==70) s.gaps=1;
+        seconds.push_back(s);
+    }
+    const auto text=mic::formatPerf(seconds);
+    const auto lines=[&](const std::string& part){size_t n=0;for(size_t at=text.find(part);at!=std::string::npos;at=text.find(part,at+1))++n;return n;};
+    if(text.rfind("perf: seconds=130 ",0)!=0 || lines("\nminute ")!=3 || lines(" run=42.0 ")!=2 || text.find(" late=3")==std::string::npos
+        || text.find(" capture_gaps=1")==std::string::npos || text.find("incidents=3 ")==std::string::npos
+        || text.find("no processed audio for 41 s")==std::string::npos) throw std::runtime_error("Perf timeline format:\n"+text);
+    require(mic::formatPerf({})=="perf: no processed audio seconds\n","Empty perf");
+}
 static void selfTest() {
+    perfFormatTest();
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
     require(mic::preferredDevice(choices,L"two",L"HyperX")==1,"Saved endpoint wins over name hint");
     require(mic::preferredDevice(choices,L"missing",L"HyperX")==-1,"Missing endpoint must not switch microphones");
@@ -391,7 +409,8 @@ int main(int argc,char** argv) {
             mic::Config config;config.sdk=mic::projectRoot()/L"vendor/nvidia-afx-3.0.0";
             mic::checkDenoiseContinuity(config);return 0;
         }
-        if((argc==6 || argc==7) && std::string(argv[1])=="--bench-afx") {
+        if(argc>=6 && argc<=8 && std::string(argv[1])=="--bench-afx") {
+            const auto option=[&](const char* name){for(int i=6;i<argc;++i) if(std::string(argv[i])==name) return true;return false;};
             std::ifstream input(mic::wide(argv[2]),std::ios::binary);
             require(static_cast<bool>(input),"Cannot open PCM packet recording");
             std::vector<float> samples;
@@ -404,8 +423,9 @@ int main(int argc,char** argv) {
                 require(static_cast<bool>(input),"Truncated PCM packet");
             }
             const int seconds=std::stoi(argv[3]); require(seconds>0 && seconds<=600,"Benchmark duration");
-            mic::Config config; config.version=2; config.sdk=mic::projectRoot()/L"vendor/nvidia-afx-3.0.0"; config.cudaGraphs=std::stoi(argv[4]);
-            mic::benchmarkAfx(config,samples,seconds,mic::wide(argv[5]),argc==7 && std::string(argv[6])=="churn");
+            mic::Config config; config.version=option("v1")?1:2; config.sdk=mic::projectRoot()/L"vendor/nvidia-afx-3.0.0"; config.cudaGraphs=std::stoi(argv[4]);
+            // storm: a reset every 100 ms, the upper bound of a capture-gap burst under a game.
+            mic::benchmarkAfx(config,samples,seconds,mic::wide(argv[5]),option("churn") || option("storm"),option("storm")?10:250);
             std::cout<<"Benchmark saved\n"; return 0;
         }
         auto inputs=mic::devices(true), outputs=mic::devices(false);

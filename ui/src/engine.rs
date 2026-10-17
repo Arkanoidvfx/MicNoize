@@ -83,6 +83,8 @@ unsafe extern "C" {
     fn mnr_discord_state(p: usize, text: *mut c_char, capacity: u32, active: *mut i32) -> i32;
     fn mnr_denoiser_state(p: usize, text: *mut c_char, capacity: u32) -> i32;
     fn mnr_session_report(p: usize, text: *mut c_char, capacity: u32);
+    fn mnr_perf_report(p: usize, text: *mut c_char, capacity: u32);
+    fn mnr_system_report(text: *mut c_char, capacity: u32);
     fn mnr_phrase_cancel(p: usize);
     fn mnr_snapshot(p: usize, s: *mut Snapshot, error: *mut c_char, cap: u32, meters: i32);
     fn mnr_devices(capture: i32, result: *mut c_char, capacity: u32) -> i32;
@@ -163,6 +165,12 @@ pub fn usage() -> (u64, u64) {
     let (mut cpu, mut memory) = (0, 0);
     unsafe { mnr_usage(&mut cpu, &mut memory) };
     (cpu, memory)
+}
+/// Report-time snapshot: GPU/CPU use per process, scheduling, memory. Blocks about 1 s.
+pub fn system_report() -> String {
+    let mut text = vec![0u8; 16384];
+    unsafe { mnr_system_report(text.as_mut_ptr().cast(), text.len() as u32) };
+    decoded(&text)
 }
 fn decoded(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())])
@@ -795,8 +803,14 @@ impl Engine {
         (state, decoded(&text))
     }
     pub fn session_report(&self) -> String {
-        let mut text = [0u8; 2048];
-        unsafe { mnr_session_report(self.p, text.as_mut_ptr().cast(), 2048) };
+        let mut text = [0u8; 4096];
+        unsafe { mnr_session_report(self.p, text.as_mut_ptr().cast(), 4096) };
+        decoded(&text)
+    }
+    /// Last 15 minutes of per-second audio health, for the developer report.
+    pub fn perf_report(&self) -> String {
+        let mut text = vec![0u8; 65536];
+        unsafe { mnr_perf_report(self.p, text.as_mut_ptr().cast(), text.len() as u32) };
         decoded(&text)
     }
     pub fn phrase(&self) -> (i32, f32) {

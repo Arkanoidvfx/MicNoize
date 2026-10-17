@@ -110,7 +110,7 @@ struct Config {
     std::filesystem::path tagSdk;
     int cudaGraphs = -1; // -1: SDK default, 0: disabled, 1: enabled.
 };
-void benchmarkAfx(const Config&, const std::vector<float>&, unsigned seconds, const std::filesystem::path& csv, bool churn = false);
+void benchmarkAfx(const Config&, const std::vector<float>&, unsigned seconds, const std::filesystem::path& csv, bool churn = false, unsigned resetEvery = 250);
 void checkDenoiseContinuity(Config);
 struct TagClock {
     double pending = 0;
@@ -150,7 +150,40 @@ struct Stats {
     std::atomic<uint64_t> tagFrames{0};
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};
     std::atomic<float> tagMaxWakeMs{0};
+    // Per-second maxima for PerfHistory: writers raise them, the DSP takes them once a second.
+    std::atomic<float> secondRunMaxMs{0}, secondWakeMaxMs{0};
+    std::atomic<unsigned> resets{0};
 };
+// One second of audio-path health for the developer report: counter deltas and maxima.
+struct PerfSecond {
+    uint64_t utc=0; // FILETIME when the second's 100th block finished
+    float runMaxMs=0, processMaxMs=0, wakeMaxMs=0, outMinMs=0, inMaxMs=0;
+    uint16_t late=0, catchUp=0, gaps=0, underruns=0, drops=0, resets=0, tagGaps=0, lateTicks=0, reconnects=0;
+};
+// Last 15 minutes, allocated once. The DSP thread only try-locks: a second that meets a
+// report copy is skipped, the audio path never waits.
+class PerfHistory {
+    mutable std::mutex mutex_;
+    std::array<PerfSecond,900> ring_{};
+    size_t next_=0,count_=0;
+public:
+    void clear() {std::lock_guard lock(mutex_);next_=count_=0;}
+    void push(const PerfSecond& second) {
+        std::unique_lock lock(mutex_,std::try_to_lock);
+        if(!lock) return;
+        ring_[next_]=second;next_=(next_+1)%ring_.size();count_=std::min(count_+1,ring_.size());
+    }
+    std::vector<PerfSecond> copy() const {
+        std::lock_guard lock(mutex_);
+        std::vector<PerfSecond> out;out.reserve(count_);
+        for(size_t i=0;i<count_;++i) out.push_back(ring_[(next_+ring_.size()-count_+i)%ring_.size()]);
+        return out;
+    }
+};
+// Minute summaries plus every second with an incident, newest last; bounded text.
+std::string formatPerf(const std::vector<PerfSecond>& seconds);
+// Report-time snapshot (blocks ~1 s): GPU/CPU use per process, scheduling, memory, OS settings.
+std::string systemReport();
 // MMCSS "Audio" for the calling thread while alive; a refusal is counted in the session line.
 struct AudioPriority {
     HANDLE h=nullptr;
@@ -246,7 +279,7 @@ private:
             try {
                 using Clock=std::chrono::steady_clock;
                 auto ms=[](Clock::time_point since){return std::chrono::duration<float,std::milli>(Clock::now()-since).count();};
-                if(reset) {const auto begin=Clock::now();fx_.reset();stats_.maxResetMs=std::max(stats_.maxResetMs.load(),ms(begin));}
+                if(reset) {const auto begin=Clock::now();fx_.reset();stats_.maxResetMs=std::max(stats_.maxResetMs.load(),ms(begin));stats_.resets.fetch_add(1,std::memory_order_relaxed);}
                 if(strength!=applied_) {const auto begin=Clock::now();fx_.strength(strength);applied_=strength;stats_.reconfigureMs=std::max(stats_.reconfigureMs.load(),ms(begin));}
                 const auto begin=Clock::now();
                 fx_.process(input.data(),output.data());
@@ -254,6 +287,7 @@ private:
                 if(run>stats_.maxRunMs.load(std::memory_order_relaxed)){stats_.maxRunMs=run;stats_.maxRunBlock=stats_.processed.load(std::memory_order_relaxed);}
                 if(run>5) stats_.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
                 if(run>10) stats_.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
+                if(run>stats_.secondRunMaxMs.load(std::memory_order_relaxed)) stats_.secondRunMaxMs.store(run,std::memory_order_relaxed);
             } catch(...) {
                 lock.lock();error_=std::current_exception();busy_=false;wake_.notify_all();return;
             }
@@ -453,6 +487,7 @@ public:
     std::wstring desktopMessage() const;
     // Counters of the current (or last) session in the sessions.log format, for a live report.
     std::string sessionLine() const;
+    PerfHistory perf;
     std::wstring denoiserMessage() const;
     std::atomic<int> state{0}; // Stopped, Loading, WaitingClient, Running, Stopping, Error
     std::atomic<float> volume{1}, boost{3};

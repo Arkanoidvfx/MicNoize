@@ -47,6 +47,10 @@ void mnr_set_cpu_denoiser(const MnrCpuDenoiser* api);
 int32_t mnr_denoiser_state(Mnr*,char* text,uint32_t capacity);
 // Live counters of the current (or last) session, same fields as results/sessions.log.
 void mnr_session_report(Mnr*,char* text,uint32_t capacity);
+// Last 15 minutes of per-second audio health (minute summaries plus incident seconds).
+void mnr_perf_report(Mnr*,char* text,uint32_t capacity);
+// Report-time system snapshot; blocks about one second, call off the UI thread.
+void mnr_system_report(char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);
 void mnr_snapshot(Mnr*,MnrSnapshot*,char* error,uint32_t capacity,int32_t meters);
 int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity);

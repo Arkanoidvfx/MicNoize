@@ -56,7 +56,13 @@ int main(){try{
     char error[4096]{};Mnr* p=mnr_create(error,sizeof(error));require(p!=nullptr,error);
     struct Guard{Mnr* p;~Guard(){mnr_destroy(p);}}guard{p};
     {char report[2048]{};mnr_session_report(p,report,sizeof(report));const std::string line=report;
-     require(line.find(" underruns=0")!=std::string::npos && line.find(" mmcss_failures=")!=std::string::npos && line.find(" gate_db=")!=std::string::npos,"Live session report lacks counters");}
+     require(line.find(" underruns=0")!=std::string::npos && line.find(" mmcss_failures=")!=std::string::npos && line.find(" gate_db=")!=std::string::npos
+         && line.find(" resets=0")!=std::string::npos && line.find(" gpu_priority=")!=std::string::npos,"Live session report lacks counters");}
+    {char report[512]{};mnr_perf_report(p,report,sizeof(report));require(std::string(report)=="perf: no processed audio seconds\n","Stopped engine perf history");}
+    {std::string report(16384,0);mnr_system_report(report.data(),static_cast<uint32_t>(report.size()));report.resize(strlen(report.c_str()));
+     if(report.find("windows build=")!=0 || report.find(" logical=")==std::string::npos || report.find("hags=")==std::string::npos
+         || report.find("own_cpu=")==std::string::npos || report.find("gpu_own:")==std::string::npos) throw std::runtime_error("System report fields:\n"+report);
+     std::cout<<report;}
     MnrSnapshot s{};mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0,"Initial state");
     unsigned studioGeneration=99;
     require(!mnr_studio_record(p,1) && !mnr_studio_recording(p),"Stopped studio recorder started");

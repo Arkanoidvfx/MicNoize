@@ -3565,12 +3565,13 @@ impl App {
                     // Live engine counters: a stutter during a game is diagnosable without a Stop.
                     let note = format!("{note}
 live:{}", self.engine.session_report());
+                    let perf = self.engine.perf_report();
                     self.report_sending = true;
                     self.message = "Отправляем логи…".into();
                     let runtime = self.runtime_root.clone();
                     return perform(
                         async move {
-                            telemetry::report(&paths::Paths::resolve()?.data, &runtime, &note)
+                            telemetry::report(&paths::Paths::resolve()?.data, &runtime, &note, &perf)
                         },
                         Msg::ReportSent,
                     );
