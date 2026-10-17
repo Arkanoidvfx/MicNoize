@@ -6,6 +6,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <exception>
+#include <cmath>
+#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -109,6 +111,7 @@ struct Config {
     int cudaGraphs = -1; // -1: SDK default, 0: disabled, 1: enabled.
 };
 void benchmarkAfx(const Config&, const std::vector<float>&, unsigned seconds, const std::filesystem::path& csv, bool churn = false);
+void checkDenoiseContinuity(Config);
 struct TagClock {
     double pending = 0;
     unsigned take(double elapsed, double correction, unsigned maximum) {
@@ -121,6 +124,7 @@ struct TagClock {
 struct Stats {
     std::atomic<int> desktopState{0}; // Off, Starting, Ready, Error
     std::atomic<int> denoiser{0}; // Stopped, NVIDIA, bypass, CPU (DeepFilterNet), input already denoised
+    std::atomic<unsigned> denoiseDelaySamples{0};
     std::atomic<bool> desktopSource{false};
     std::atomic<int> phraseState{0};
     std::atomic<float> phraseSeconds{0};
@@ -155,6 +159,54 @@ struct AudioPriority {
     AudioPriority(const AudioPriority&)=delete;
     AudioPriority& operator=(const AudioPriority&)=delete;
 };
+// Probe before opening the streams: dry fallback must use the loaded model's actual delay.
+template<class Fx> unsigned measureDenoiseDelay(Fx& fx,float strength) {
+    std::array<float,block> in{},out{};
+    unsigned delay=0;float peak=0,energy=0;
+    fx.strength(0);
+    in[0]=0.5f;
+    for(unsigned frame=0;frame<20;++frame) {
+        fx.process(in.data(),out.data());
+        for(unsigned i=0;i<block;++i) {
+            if(!std::isfinite(out[i])) throw std::runtime_error("Invalid denoiser delay probe");
+            energy+=out[i]*out[i];
+            if(std::abs(out[i])>peak) {peak=std::abs(out[i]);delay=frame*block+i;}
+        }
+        in.fill(0);
+    }
+    if(std::abs(peak-0.5f)>0.001f || energy-peak*peak>0.0001f || delay%block || delay>=block*19)
+        throw std::runtime_error("Cannot align NVIDIA denoiser and dry audio");
+    fx.strength(strength);
+    return delay;
+}
+
+// Keep dry and processed speech on one timeline; skipped model inputs leave stale delayed output.
+class DenoisePlayout {
+    std::vector<float> dry_;
+    size_t position_=0;
+    unsigned warming_=0,fade_=0;
+    bool wet_=false;
+    float last_=0,offset_=0;
+public:
+    explicit DenoisePlayout(unsigned delay):dry_(delay),warming_(delay) {}
+    void process(const float* in,float* out,bool processed,bool reset=false) {
+        if(reset) {std::fill(dry_.begin(),dry_.end(),0.0f);warming_=static_cast<unsigned>(dry_.size());}
+        const bool wet=processed && warming_==0;
+        if(!processed) warming_=static_cast<unsigned>(dry_.size());
+        else warming_-=std::min(warming_,block);
+        for(unsigned i=0;i<block;++i) {
+            float dry=in[i];
+            if(!dry_.empty()) {dry=dry_[position_];dry_[position_]=in[i];position_=(position_+1)%dry_.size();}
+            float value=wet?out[i]:dry;
+            // The missing wet block cannot be crossfaded; decay its boundary offset over 5 ms.
+            if(i==0 && (wet!=wet_ || reset)) {offset_=last_-value;fade_=rate/200;}
+            if(fade_) value+=offset_*static_cast<float>(--fade_)/(rate/200);
+            out[i]=last_=std::clamp(value,-1.0f,1.0f);
+        }
+        wet_=wet;
+    }
+};
+
 // Runs the GPU denoiser beside the DSP thread. A game's graphics held one NVIDIA run for up to
 // 263 ms; waiting for it starved the output and the voice chopped on and off. The DSP waits only
 // as long as its output reserve allows, then passes that block dry; the late result is discarded
@@ -166,15 +218,17 @@ public:
     DenoiseWorker(const DenoiseWorker&)=delete;
     DenoiseWorker& operator=(const DenoiseWorker&)=delete;
     // True with the denoised block in `out`; false while the model is busy or past `budget`.
-    bool process(const float* in,float* out,float strength,bool reset,std::chrono::microseconds budget) {
+    bool process(const float* in,float* out,float strength,bool reset,std::chrono::microseconds budget,bool skip=false) {
         std::unique_lock lock(mutex_);
         if(error_) std::rethrow_exception(error_);
         resetPending_|=reset;
-        if(busy_) return false;
+        if(busy_ || skip) return false;
         std::copy_n(in,block,input_.begin());strength_=strength;busy_=true;
         const uint64_t mine=++submitted_;
         wake_.notify_all();
-        if(!wake_.wait_for(lock,budget,[&]{return finished_==mine || error_;}) || finished_!=mine) return false;
+        const bool ready=wake_.wait_for(lock,budget,[&]{return finished_==mine || error_;});
+        if(error_) std::rethrow_exception(error_);
+        if(!ready || finished_!=mine) return false;
         std::copy_n(output_.begin(),block,out);
         return true;
     }

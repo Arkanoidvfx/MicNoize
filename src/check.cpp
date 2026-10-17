@@ -142,7 +142,57 @@ static void probeCable(const mic::Device& output,const mic::Device& input,const 
     report<<"render_capacity_frames="<<capacity<<" padding_min="<<minPadding<<" padding_max="<<maxPadding<<"\n";
     std::cout<<"PROBE SAVED; render capacity="<<capacity<<" queued frames="<<minPadding<<".."<<maxPadding<<"\n";
 }
-// A game's graphics stalling one NVIDIA run must cost one dry block, never output time.
+// Missing model inputs must neither jump forward to live speech nor replay its delayed history.
+static void denoisePlayoutTest() {
+    struct DelayedFx {
+        std::vector<float> history;size_t position=0;
+        explicit DelayedFx(unsigned delay):history(delay) {}
+        void strength(float) {}
+        void reset() {std::fill(history.begin(),history.end(),0.0f);position=0;}
+        void process(const float* in,float* out) {
+            for(unsigned i=0;i<mic::block;++i) {
+                out[i]=history[position];history[position]=in[i];position=(position+1)%history.size();
+            }
+        }
+    };
+    for(unsigned delay:{1440u,3360u}) {
+        DelayedFx fx(delay);
+        require(mic::measureDenoiseDelay(fx,1)==delay,"Probe finds CPU/NVIDIA-sized delay");
+        fx.reset();mic::DenoisePlayout playout(delay);
+        std::array<float,mic::block> in{},out{};
+        unsigned unaligned=0;
+        for(unsigned frame=0;frame<90;++frame) {
+            for(unsigned i=0;i<mic::block;++i) in[i]=0.1f+(frame*mic::block+i)*0.00001f;
+            const bool processed=!(frame>=18 && frame<=22) && frame!=55;
+            if(processed) fx.process(in.data(),out.data());else out=in;
+            const unsigned index=(frame+1)*mic::block-1;
+            const float expected=index<delay?0:0.1f+(index-delay)*0.00001f;
+            if(std::abs(out.back()-expected)>0.001f) ++unaligned;
+            playout.process(in.data(),out.data(),processed);
+            // Past the 5 ms transition, every sample must retain its original capture time.
+            for(unsigned i=mic::block/2;i<mic::block;++i) {
+                const unsigned sample=frame*mic::block+i;
+                const float want=sample<delay?0:0.1f+(sample-delay)*0.00001f;
+                require(std::abs(out[i]-want)<0.000001f,"Denoiser fallback/recovery moved speech in time");
+            }
+        }
+        require(unaligned>6,"Regression exercises raw jumps and stale delayed model output");
+        // Reset after speech must drain both histories, not leak the pre-reset voice.
+        fx.reset();in.fill(0);
+        for(unsigned frame=0;frame<10;++frame) {
+            fx.process(in.data(),out.data());playout.process(in.data(),out.data(),true,frame==0);
+            for(unsigned i=mic::block/2;i<mic::block;++i) require(out[i]==0,"Reset replayed old dry speech");
+        }
+    }
+    mic::DenoisePlayout transition(0);
+    std::array<float,mic::block> in{},out{};in.fill(0.8f);out.fill(0.2f);
+    transition.process(in.data(),out.data(),true);
+    transition.process(in.data(),out.data(),false);
+    require(std::abs(out.front()-0.2f)<0.003f && out.back()==0.8f,"Fallback boundary is smoothed without a persistent gain change");
+    out.fill(0.2f);transition.process(in.data(),out.data(),true);
+    require(std::abs(out.front()-0.8f)<0.003f && out.back()==0.2f,"Denoiser recovery boundary is smoothed");
+}
+
 static void denoiseWorkerTest() {
     struct SlowFx {
         std::atomic<int> delayMs{0};std::atomic<int> resets{0};
@@ -167,6 +217,18 @@ static void denoiseWorkerTest() {
     require(worker.process(in.data(),out.data(),1,true,milliseconds(200)) && out[0]==0.4f,"GPU worker recovers after a stall");
     require(fx.resets.load()==1,"Resets requested while busy collapse into one, run on the worker");
     require(stats.maxRunMs>150,"Worker records the stalled run");
+    require(!worker.process(in.data(),out.data(),1,true,milliseconds(200),true),"Catch-up defers model work");
+    require(worker.process(in.data(),out.data(),1,false,milliseconds(200)),"Worker processes after catch-up");
+    require(fx.resets.load()==2,"Catch-up must retain a pending model reset");
+    struct FailingFx {
+        void process(const float*,float*) {throw std::runtime_error("fake inference failure");}
+        void reset() {} void strength(float) {}
+    } failing;
+    mic::DenoiseWorker<FailingFx> failed(failing,stats,1);
+    bool threw=false;
+    try {failed.process(in.data(),out.data(),1,false,milliseconds(200));}
+    catch(const std::runtime_error&) {threw=true;}
+    require(threw,"Inference errors must propagate on the waiting call");
 }
 static void selfTest() {
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
@@ -321,10 +383,14 @@ int main(int argc,char** argv) {
             mic::checkHeadphones(outputs[index].id,std::stoi(argv[3])!=0);return 0;
         }
         if(argc==2 && std::string(argv[1])=="--discord-capture") { mic::checkDiscordCapture(5); return 0; }
-        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoiseWorkerTest(); protocolTest(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoisePlayoutTest(); denoiseWorkerTest(); protocolTest(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--denoise-continuity") {
+            mic::Config config;config.sdk=mic::projectRoot()/L"vendor/nvidia-afx-3.0.0";
+            mic::checkDenoiseContinuity(config);return 0;
+        }
         if((argc==6 || argc==7) && std::string(argv[1])=="--bench-afx") {
             std::ifstream input(mic::wide(argv[2]),std::ios::binary);
             require(static_cast<bool>(input),"Cannot open PCM packet recording");

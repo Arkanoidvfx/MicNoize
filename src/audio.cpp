@@ -453,6 +453,7 @@ static std::atomic<const CpuDenoiserApi*> cpuDenoiser{nullptr};
 void setCpuDenoiser(const CpuDenoiserApi* api) {cpuDenoiser=api;}
 
 class Afx {
+    unsigned version_=2;
     HMODULE dll_=nullptr;
     std::vector<DLL_DIRECTORY_COOKIE> dirs_;
     NvAFX_Handle handle_=nullptr;
@@ -474,7 +475,7 @@ class Afx {
         for(auto d:dirs_) RemoveDllDirectory(d);
     }
 public:
-    explicit Afx(const Config& c) {
+    explicit Afx(const Config& c):version_(c.version) {
         try {
             if(!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32|LOAD_LIBRARY_SEARCH_USER_DIRS))
                 throw std::runtime_error("Cannot configure Windows DLL search path");
@@ -541,9 +542,49 @@ public:
     }
     ~Afx() { release(); }
     void strength(float f) { ok(setFloat_(handle_,NVAFX_PARAM_INTENSITY_RATIO,f),f>1?"NVIDIA rejected experimental intensity above 100%; return to 100%":"Intensity"); }
-    void reset() { ok(reset_(handle_),"Reset effect"); }
+    void reset() {
+        if(version_!=1) {ok(reset_(handle_),"Reset effect");return;}
+        // SDK 3.0 v1 adds 10 ms of delay on each live Reset; flush its audio history instead.
+        std::array<float,block> silence{},discard{};
+        for(unsigned i=0;i<20;++i) process(silence.data(),discard.data());
+    }
     void process(const float* in,float* out) { ok(run_(handle_,&in,&out,block,1),"Process audio"); }
 };
+
+void checkDenoiseContinuity(Config config) {
+    for(unsigned version:{1u,2u}) {
+        config.version=version;config.intensity=0;
+        Afx fx(config);
+        const unsigned delay=measureDenoiseDelay(fx,0);
+        for(unsigned reset=0;reset<3;++reset) {
+            fx.reset();
+            if(measureDenoiseDelay(fx,0)!=delay) throw std::runtime_error("NVIDIA reset changed the model delay");
+        }
+        fx.reset();DenoisePlayout playout(delay);
+        std::array<float,block> in{},out{};
+        unsigned misaligned=0;
+        for(unsigned frame=0;frame<90;++frame) {
+            for(unsigned i=0;i<block;++i) in[i]=0.1f+(frame*block+i)*0.00001f;
+            const bool processed=!(frame>=18 && frame<=22) && frame!=55;
+            if(processed) fx.process(in.data(),out.data());else out=in;
+            const unsigned index=(frame+1)*block-1;
+            const float expected=index<delay?0:0.1f+(index-delay)*0.00001f;
+            if(std::abs(out.back()-expected)>0.001f) ++misaligned;
+            playout.process(in.data(),out.data(),processed);
+            for(unsigned i=block/2;i<block;++i) {
+                const unsigned sample=frame*block+i;
+                const float want=sample<delay?0:0.1f+(sample-delay)*0.00001f;
+                if(!std::isfinite(out[i]) || std::abs(out[i]-want)>0.0001f)
+                    throw std::runtime_error("NVIDIA fallback/recovery changed the audio timeline: version="+std::to_string(version)+
+                        " delay="+std::to_string(delay)+" frame="+std::to_string(frame)+" sample="+std::to_string(i)+
+                        " got="+std::to_string(out[i])+" expected="+std::to_string(want));
+            }
+        }
+        if(misaligned<6) throw std::runtime_error("Continuity check did not exercise delayed fallback");
+        std::cout<<"NVIDIA v"<<version<<" delay_ms="<<delay/48.0f<<" unaligned_blocks_before="<<misaligned
+                 <<" aligned_after=PASS (synthetic, zero suppression, no devices opened)\n";
+    }
+}
 
 void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigned seconds,const std::filesystem::path& csv,bool churn) {
     if(samples.size()<block || samples.size()>rate*600 || !seconds || seconds>600 || config.cudaGraphs < -1 || config.cudaGraphs>1)
@@ -671,6 +712,7 @@ std::string Engine::sessionLine() const {
     std::ostringstream log;
     log<<" output="<<(config_.tag?"TAG":"WASAPI")<<" version="<<config_.version<<" reserve_ms="<<config_.bufferMs
         <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
+        <<" denoise_delay_ms="<<stats.denoiseDelaySamples.load()/48.0f
         <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
         <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
         <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":stats.denoiser==4?"input":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100
@@ -934,7 +976,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     stats.tagBufferFrames=0; stats.tagDriverGaps=0; stats.tagFrames=0;
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
     stats.pitchActive=false; stats.boostActive=false; stats.pitchDelayMs=0; stats.pitchMaxMs=0;stats.phraseState=0;stats.phraseSeconds=0;
-    stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;
+    stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;stats.denoiseDelaySamples=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
     try {
         if(expectedOperation && operation!=expectedOperation)throw std::runtime_error("Audio operation cancelled");
@@ -1031,9 +1073,12 @@ void Engine::dspLoop(Config c) {
             // MNR_DENOISER=cpu tests the CPU path on an RTX machine (and frees the GPU for games).
             if(_wcsicmp(environment(L"MNR_DENOISER").c_str(),L"cpu")==0)
                 throw std::runtime_error("выбран процессор (MNR_DENOISER=cpu)");
-            fx=std::make_unique<Afx>(c);stats.denoiser=1;
+            fx=std::make_unique<Afx>(c);
+            stats.denoiseDelaySamples=measureDenoiseDelay(*fx,c.intensity);
+            stats.denoiser=1;
         }
         catch(const std::exception& e) {
+            fx.reset();
             // No usable NVIDIA: DeepFilterNet on the CPU when the host supplied it, else no denoiser.
             {std::lock_guard lock(statusMutex_);denoiserMessage_=wide(e.what());}
             cpuApi=cpuDenoiser.load();
@@ -1041,7 +1086,9 @@ void Engine::dspLoop(Config c) {
             // quiet input, and older CPUs take a large penalty per denormal operation.
             if(cpuApi) {_mm_setcsr(_mm_getcsr()|0x8040);cpu.state=cpuApi->create();}
             stats.denoiser=cpu.state?3:2;
+            stats.denoiseDelaySamples=cpu.state?1440:0; // DeepFilterNet's fixed 30 ms lookahead.
         }
+        DenoisePlayout denoisePlayout(stats.denoiseDelaySamples.load());
         PitchEffect pitchEffect; AutoTunePitch autoTune; StutterEffect stutterMic,stutterDiscord;
         EchoEffect echoMic,echoDiscord; PhraseEffect phraseEffect; NoiseGate noiseGate;
         auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
@@ -1085,18 +1132,23 @@ void Engine::dspLoop(Config c) {
                 const bool reset=resetEffect_.exchange(false);
                 const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
                     effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
+                bool denoised=false;
                 if(gpu) {
                     // Wait while the output reserve lasts, keeping 10 ms of it; never under 8 ms.
                     const auto reserve=std::chrono::microseconds(cleaned_.size()*1000/48);
                     const auto budget=std::max<std::chrono::microseconds>(std::chrono::milliseconds(8),reserve-std::chrono::milliseconds(10));
-                    if(catchUp || !gpu->process(in.data(),out.data(),wanted,reset,budget)) {
+                    denoised=gpu->process(in.data(),out.data(),wanted,reset,budget,catchUp);
+                    if(!denoised) {
                         out=in;
                         if(!catchUp) stats.lateBlocks.fetch_add(1,std::memory_order_relaxed);
                     }
                 } else {
                     const auto runBegin=std::chrono::steady_clock::now();
                     if(catchUp) out=in;
-                    else if(cpu.state) {if(!cpuApi->process(cpu.state,in.data(),out.data(),wanted)) throw std::runtime_error("DeepFilterNet failed");}
+                    else if(cpu.state) {
+                        if(!cpuApi->process(cpu.state,in.data(),out.data(),wanted)) throw std::runtime_error("DeepFilterNet failed");
+                        denoised=true;
+                    }
                     else out=in;
                     const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
                     if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
@@ -1106,6 +1158,7 @@ void Engine::dspLoop(Config c) {
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 stats.processMs=ms; stats.maxProcessMs=std::max(stats.maxProcessMs.load(),ms);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
+                if(gpu || cpu.state) denoisePlayout.process(in.data(),out.data(),denoised,reset);
                 for(float& v:out) v=std::clamp(v,-1.0f,1.0f);
                 // RVC belongs to the microphone path only: it runs before the Discord source switch, so
                 // the converted voice also feeds the background mix while a Discord effect is held.
