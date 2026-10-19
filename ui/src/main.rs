@@ -397,6 +397,8 @@ mod focus {
         pub const TUNE_LISTEN: usize = 111;
         pub const TUNE_LISTEN_RAW: usize = 115;
         pub const TUNE_UNDO: usize = 112;
+        /// The tune result's gate advice: «Включить гейт» / «Вернуть гейт».
+        pub const TUNE_GATE: usize = 116;
         /// The first-run setup card: retry the download, install the virtual microphone.
         pub const SETUP_RETRY: usize = 84;
         pub const SETUP_DRIVER: usize = 85;
@@ -731,6 +733,8 @@ enum Msg {
     TuneStart,
     TuneStop,
     TuneUndo,
+    /// Applies the tune's gate advice, or puts the gate back when it is applied.
+    TuneGate,
     TuneListen,
     /// «Без шумодава»: the raw microphone, to compare with «С шумодавом».
     TuneListenRaw,
@@ -909,6 +913,8 @@ struct App {
     glitch: Option<Instant>,
     glitch_mosaic: Option<(Instant, iced::Size, Arc<tacho::Mosaic>)>,
     tune_profile_before: Option<String>,
+    /// The gate threshold before «Включить гейт» applied the tune's advice.
+    tune_gate_before: Option<f32>,
     core_present: bool,
     /// This GPU's denoiser models are on disk, or it has none to download.
     models_present: bool,
@@ -1486,6 +1492,7 @@ impl App {
                 glitch: None,
                 glitch_mosaic: None,
                 tune_profile_before: None,
+                tune_gate_before: None,
                 core_present,
                 models_present,
                 setup_error: String::new(),
@@ -1855,7 +1862,12 @@ impl App {
             self.engine.controls(self.controls);
             return;
         }
-        tune.feed(Instant::now(), input, output);
+        let now = Instant::now();
+        if let Some(need) = tune.feed(now, input, output) {
+            // The window just measured, from the engine's own before/after audio.
+            let (raw, processed, delay) = self.engine.trace_latest(need.samples);
+            tune.analyze(now, need, &raw, &processed, delay);
+        }
         let strength = f32::from(tune.strength()) / 100.0;
         let done = tune.phase == tune::Phase::Done;
         if matches!(tune.phase, tune::Phase::Failed(_)) {
@@ -3363,6 +3375,8 @@ impl App {
             Msg::NoiseGate(v) => {
                 if v.is_finite() {
                     self.controls.noise_gate_db = v.round().clamp(-72.0, 0.0);
+                    // A hand on the gate owns it now: «Вернуть гейт» no longer applies.
+                    self.tune_gate_before = None;
                     self.focus = focus::effects::NOISE_GATE;
                     self.changed();
                 }
@@ -4707,6 +4721,7 @@ live:{}", self.engine.session_report());
                     let id = self.input.as_ref().map(|d| d.id.clone()).unwrap_or_default();
                     self.tune_profile_before = self.settings.get(PROFILES, &id).map(str::to_owned);
                     let tune = tune::Tune::new(self.controls.intensity, Instant::now());
+                    self.tune_gate_before = None;
                     self.controls.intensity = f32::from(tune.strength()) / 100.0;
                     self.engine.controls(self.controls);
                     self.tune = Some(tune);
@@ -4723,9 +4738,24 @@ live:{}", self.engine.session_report());
                 if let Some(tune) = self.tune.take().filter(|t| t.phase == tune::Phase::Done) {
                     self.focus = focus::effects::TUNE;
                     self.controls.intensity = tune.previous;
+                    if let Some(gate) = self.tune_gate_before.take() {
+                        self.controls.noise_gate_db = gate;
+                    }
                     if let Some(id) = self.input.as_ref().map(|d| d.id.clone()) {
                         self.settings.set(PROFILES, &id, self.tune_profile_before.take().unwrap_or_default());
                     }
+                    self.changed();
+                }
+            }
+            Msg::TuneGate => {
+                self.focus = focus::effects::TUNE_GATE;
+                let advice = self.tune.as_ref().filter(|t| t.phase == tune::Phase::Done).and_then(|t| t.gate);
+                if let Some(gate) = self.tune_gate_before.take() {
+                    self.controls.noise_gate_db = gate;
+                    self.changed();
+                } else if let Some(advice) = advice {
+                    self.tune_gate_before = Some(self.controls.noise_gate_db);
+                    self.controls.noise_gate_db = advice;
                     self.changed();
                 }
             }
@@ -5009,8 +5039,11 @@ live:{}", self.engine.session_report());
                     }
                 }
                 items.extend([ROUTE, NOISE_GATE, GATE_HOLD, INTENSITY, NOISE_BIND, ALT_INTENSITY, TUNE]);
-                if self.tune.as_ref().is_some_and(|t| t.phase == tune::Phase::Done) {
+                if let Some(t) = self.tune.as_ref().filter(|t| t.phase == tune::Phase::Done) {
                     items.push(TUNE_UNDO);
+                    if t.gate.is_some() || self.tune_gate_before.is_some() {
+                        items.push(TUNE_GATE);
+                    }
                 }
                 if matches!(self.snapshot.state, 2 | 3) {
                     items.extend([TUNE_LISTEN, TUNE_LISTEN_RAW]);
@@ -5323,6 +5356,7 @@ live:{}", self.engine.session_report());
                 TUNE_LISTEN if activate => Msg::TuneListen,
                 TUNE_LISTEN_RAW if activate => Msg::TuneListenRaw,
                 TUNE_UNDO if activate => Msg::TuneUndo,
+                TUNE_GATE if activate => Msg::TuneGate,
                 SETUP_DRIVER if activate => Msg::InstallDriver,
                 SETUP_SETTINGS if activate => Msg::Page(2),
                 REVERSE_WORD if activate && !self.reverse_edit => Msg::ReverseEdit(true),
@@ -6028,6 +6062,30 @@ mic-b=65")).unwrap().unwrap();
         let _ = app.update(Msg::Intensity(55.0));
         assert!(app.tune.is_none());
         assert_eq!(app.tune_ready(), Err("Подбор работает, когда обработка голоса запущена."));
+    }
+    #[test]
+    fn tune_gate_advice_is_applied_only_on_request() {
+        let (mut app, _) = App::from_settings(Settings::for_test("[audio]\nnoise_gate_db=-72")).unwrap().unwrap();
+        let mut done = tune::Tune::new(0.4, Instant::now());
+        (done.phase, done.chosen, done.gate) = (tune::Phase::Done, 30, Some(-58.0));
+        app.tune = Some(done);
+        assert_eq!(app.controls.noise_gate_db, -72.0, "the tune itself never touches the gate");
+        let _ = app.update(Msg::TuneGate);
+        assert_eq!((app.controls.noise_gate_db, app.focus), (-58.0, focus::effects::TUNE_GATE));
+        let _ = app.update(Msg::TuneGate);
+        assert_eq!(app.controls.noise_gate_db, -72.0, "pressed again, the old gate comes back");
+        // «Вернуть» undoes an applied gate together with the strength.
+        let _ = app.update(Msg::TuneGate);
+        let _ = app.update(Msg::TuneUndo);
+        assert!(app.controls.noise_gate_db == -72.0 && app.tune.is_none());
+        // A hand on the gate slider owns the gate: the advice no longer restores anything.
+        let mut done = tune::Tune::new(0.4, Instant::now());
+        (done.phase, done.gate) = (tune::Phase::Done, Some(-58.0));
+        app.tune = Some(done);
+        let _ = app.update(Msg::TuneGate);
+        let _ = app.update(Msg::NoiseGate(-40.0));
+        let _ = app.update(Msg::TuneUndo);
+        assert_eq!(app.controls.noise_gate_db, -40.0);
     }
     #[test]
     fn noise_presets_and_hotkey_roundtrip() {

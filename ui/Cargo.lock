@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "micnoize"
-version = "0.4.36"
+version = "0.4.37"
 dependencies = [
  "base64 0.22.1",
  "deep_filter",
@@ -1831,6 +1831,7 @@ dependencies = [
  "iced_tiny_skia",
  "ndarray",
  "png",
+ "realfft",
  "ruzstd",
  "serde",
  "serde_json",

@@ -1412,7 +1412,7 @@ impl App {
     /// this microphone's room (a quiet sweep, then a spoken check), keeps it per microphone and
     /// puts it back when the microphone changes; «Послушать себя» turns on the full-voice monitor.
     fn tune_panel(&self) -> Element<'_, Msg> {
-        use focus::effects::{TUNE, TUNE_LISTEN, TUNE_LISTEN_RAW, TUNE_UNDO};
+        use focus::effects::{TUNE, TUNE_GATE, TUNE_LISTEN, TUNE_LISTEN_RAW, TUNE_UNDO};
         use tune::Phase;
         let now = Instant::now();
         let monitoring = self.monitor_all && matches!(self.monitor, 1 | 2);
@@ -1486,42 +1486,85 @@ impl App {
             }
             chips.into()
         };
+        // The live input level during the tune: the same ragged «До» bars as the meter above.
+        let live = |t: &tune::Tune, color: Color| tacho::level_meter(((t.level + 72.0) / 72.0).clamp(0.0, 1.0), true, color);
         let left: Element<'_, Msg> = match &self.tune {
-            Some(t) if t.phase == Phase::Quiet => column![
-                steps(0, false),
-                row![bold("Помолчите", 15, INK), numbers(format!("{} с", t.left(now)), 15, ORANGE)].spacing(8).align_y(iced::Center),
-                label("Фон как обычно: вентилятор, комната. Ползунок сам проходит силы.", 12, DIM),
-            ]
-            .spacing(6)
-            .into(),
+            Some(t) if t.phase == Phase::Quiet => {
+                // Sound in the silence does not fail the tune: the step waits and repeats.
+                let hint = if t.hearing_sound(now) {
+                    label("Слышу звук. Этот шаг повторится, когда станет тихо.", 12, ORANGE)
+                } else {
+                    label("Фон как обычно: вентилятор, комната. Ползунок сам проходит силы.", 12, DIM)
+                };
+                column![
+                    steps(0, false),
+                    row![bold("Помолчите", 17, INK), numbers(format!("{} с", t.left(now)), 15, ORANGE)].spacing(8).align_y(iced::Center),
+                    live(t, Color::from_rgb8(0x8A, 0x8B, 0x92)),
+                    hint,
+                ]
+                .spacing(6)
+                .into()
+            }
             Some(t) if t.phase == Phase::Voice => column![
                 steps(1, false),
-                row![bold("Скажите пару слов", 15, INK), numbers(format!("{} с", t.left(now)), 15, ORANGE)].spacing(8).align_y(iced::Center),
-                label("Обычным голосом, например: «раз, два, три, проверка».", 12, DIM),
+                row![bold("Скажите вслух", 17, INK), numbers(format!("{} с", t.left(now)), 15, ORANGE)].spacing(8).align_y(iced::Center),
+                medium(format!("«{}»", tune::PHRASE), 14, INK),
+                live(t, if t.hearing_voice() { ORANGE } else { Color::from_rgb8(0x8A, 0x8B, 0x92) }),
+                if t.hearing_voice() { label("Слышу голос. Можно повторять до конца отсчёта.", 12, DIM) } else { label("Обычным голосом, как говорите в Discord.", 12, DIM) },
             ]
             .spacing(6)
             .into(),
             Some(t) if t.phase == Phase::Done => {
-                let residual = t.chosen_residual().map_or(String::new(), |r| format!(", на {} % стал {:.0} dB", t.chosen, r));
-                let voice = match (t.voice_drop, t.backed_off) {
-                    (_, true) => "Голос подсаживался, поэтому на шаг мягче.",
-                    (Some(_), false) => "Голос проходит без потерь.",
-                    (None, _) => "Голоса не было слышно: подобрано по тишине.",
+                let residual = t.chosen_residual().map_or(String::new(), |r| format!(" После шумодава {r:.0} dB."));
+                let room = format!("Фон {:.0} dB: {}.{residual}", t.noise_db, t.kinds.join(", "));
+                let voice = match t.voice().filter(tune::Voice::heard) {
+                    None => "Голоса не было слышно: сила подобрана по тишине.".to_owned(),
+                    Some(v) => {
+                        let level = format!("Голос {:.0} dB, на {:.0} dB громче фона.", v.level, v.level - t.noise_db);
+                        // What the stronger step did to the voice, in plain words.
+                        let harmed = t.voices.iter().find(|w| w.strength > t.chosen && w.damaged()).map(|w| {
+                            let mut what = Vec::new();
+                            if w.drop > 6.0 { what.push("громкость"); }
+                            if w.sibilants > 6.0 { what.push("шипящие"); }
+                            if w.hash > 3.0 { what.push("чистоту"); }
+                            if w.pulse > 0.5 { what.push("ровность"); }
+                            format!(" На {} % он терял {}, поэтому на шаг мягче.", w.strength, what.join(" и "))
+                        });
+                        format!("{level}{}", harmed.unwrap_or_else(|| " Проходит без потерь.".to_owned()))
+                    }
                 };
-                column![
+                let mut result = column![
                     steps(2, false),
                     row![
                         numbers(format!("{} %", t.chosen), 18, GREEN),
-                        label(format!("фон {:.0} dB{residual}", t.noise_db), 12, DIM),
+                        label("подобрано и сохранено для этого микрофона", 12, DIM),
                         Space::new().width(Length::Fill),
                         action(medium(format!("Вернуть {:.0} %", t.previous * 100.0), 12, INK), Msg::TuneUndo, self.focus == TUNE_UNDO, false).padding([3, 10]),
                     ]
                     .spacing(10)
                     .align_y(iced::Center),
-                    caption(format!("{voice} Сила сохранена для этого микрофона.")),
+                    label(room, 12, DIM),
+                    label(voice, 12, DIM),
                 ]
-                .spacing(6)
-                .into()
+                .spacing(6);
+                for warning in t.warnings() {
+                    result = result.push(label(warning, 12, ORANGE));
+                }
+                // The gate is separate: only advice and a button, never changed by the tune itself.
+                let applied = self.tune_gate_before.is_some();
+                if let Some(gate) = t.gate.filter(|_| !applied).or(applied.then_some(self.controls.noise_gate_db)) {
+                    let text = if applied { format!("Гейт включён: порог {gate:.0} dB.") } else { format!("Гейт по желанию: порог {gate:.0} dB уберёт остаток между словами.") };
+                    result = result.push(
+                        row![
+                            label(text, 12, DIM),
+                            Space::new().width(Length::Fill),
+                            action(medium(if applied { "Вернуть гейт" } else { "Включить гейт" }, 12, INK), Msg::TuneGate, self.focus == TUNE_GATE, false).padding([3, 10]),
+                        ]
+                        .spacing(10)
+                        .align_y(iced::Center),
+                    );
+                }
+                result.into()
             }
             Some(tune::Tune { phase: Phase::Failed(reason), .. }) => column![
                 steps(if reason.contains("тишины") { 0 } else { 1 }, true),
@@ -1532,7 +1575,7 @@ impl App {
             _ => match (ready, saved) {
                 (Err(why), _) => label(why, 12, FAINT).into(),
                 (Ok(()), Some(strength)) => row![numbers(format!("{:.0} %", strength * 100.0), 18, ORANGE), label("подобрано для этого микрофона", 12, DIM)].spacing(10).align_y(iced::Center).into(),
-                (Ok(()), None) => label("Помолчите 4 секунды, потом скажите пару слов: Mic Noize найдёт самую мягкую силу, при которой фон пропадает, и запомнит её для этого микрофона.", 12, DIM).into(),
+                (Ok(()), None) => label("Помолчите 4 секунды, потом скажите «раз, два, три, проверка связи»: Mic Noize найдёт самую мягкую силу, при которой фон пропадает, а голос не страдает, и запомнит её для этого микрофона.", 12, DIM).into(),
             },
         };
         let (curve, chosen, current) = match &self.tune {
@@ -4072,34 +4115,57 @@ mod tests {
             app.snapshot.state = 2;
             app.denoiser.0 = 1;
             render(&app, "tune-idle");
+            let residual = |s: u8| [-52.0_f32, -58.0, -63.0, -67.0, -71.0, -74.0, -76.0, -78.0, -80.0, -82.0][tune::STEPS.iter().position(|&x| x == s).unwrap()];
+            let amp = |db: f32| 10f32.powf(db / 20.0);
+            // A pretend engine for the snapshots: a −50 dB room, the residual per strength, and a
+            // clean 220 Hz voice that the denoiser passes untouched.
+            let pretend = |tune: &mut tune::Tune, t: Instant, speaking: bool| {
+                let level = if speaking { amp(-20.0) } else { amp(-50.0) };
+                if let Some(need) = tune.feed(t, level, level) {
+                    let (input, processed): (Vec<f32>, Vec<f32>) = (0..need.samples)
+                        .map(|i| {
+                            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                            if speaking {
+                                let v = 0.1 * (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin() + sign * amp(-50.0);
+                                (v, v)
+                            } else {
+                                (sign * amp(-50.0), sign * amp(residual(need.strength)))
+                            }
+                        })
+                        .unzip();
+                    tune.analyze(t, need, &input, &processed, 0);
+                }
+            };
             let start = Instant::now() - Duration::from_millis(1600);
             let mut sweep = tune::Tune::new(0.4, start);
             let mut t = start;
-            let residual = |s: u8| [-52.0_f32, -58.0, -63.0, -67.0, -71.0, -74.0, -76.0, -78.0, -80.0, -82.0][tune::STEPS.iter().position(|&x| x == s).unwrap()];
-            let amp = |db: f32| 10f32.powf(db / 20.0);
             while sweep.phase == tune::Phase::Quiet && t < Instant::now() {
                 t += Duration::from_millis(50);
-                let r = residual(sweep.strength());
-                sweep.feed(t, amp(-50.0), amp(r));
+                pretend(&mut sweep, t, false);
             }
             app.tune = Some(sweep);
             render(&app, "tune-quiet");
+            if let Some(sweep) = app.tune.as_mut() {
+                sweep.heard_at = Some(Instant::now());
+                sweep.level = -24.0;
+            }
+            render(&app, "tune-quiet-sound");
             let mut voice = tune::Tune::new(0.4, Instant::now() - Duration::from_secs(10));
             let mut t = Instant::now() - Duration::from_secs(10);
             while voice.phase == tune::Phase::Quiet {
                 t += Duration::from_millis(50);
-                let r = residual(voice.strength());
-                voice.feed(t, amp(-50.0), amp(r));
+                pretend(&mut voice, t, false);
             }
             voice.phase_started = Instant::now() - Duration::from_millis(1200);
+            voice.level = -20.0;
             app.tune = Some(voice);
             render(&app, "tune-voice");
-            let mut done = tune::Tune::new(0.4, Instant::now() - Duration::from_secs(10));
-            let mut t = Instant::now() - Duration::from_secs(10);
+            let mut done = tune::Tune::new(0.4, Instant::now() - Duration::from_secs(20));
+            let mut t = Instant::now() - Duration::from_secs(20);
             while done.running() {
                 t += Duration::from_millis(50);
-                let (i, o) = if done.phase == tune::Phase::Quiet { (amp(-50.0), amp(residual(done.strength()))) } else { (amp(-20.0), amp(-20.5)) };
-                done.feed(t, i, o);
+                let speaking = done.phase == tune::Phase::Voice;
+                pretend(&mut done, t, speaking);
             }
             app.tune = Some(done);
             render(&app, "tune-done");

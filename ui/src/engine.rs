@@ -86,6 +86,7 @@ unsafe extern "C" {
     fn mnr_session_report(p: usize, text: *mut c_char, capacity: u32);
     fn mnr_perf_report(p: usize, text: *mut c_char, capacity: u32);
     fn mnr_trace_save(p: usize, path: *const u16, text: *mut c_char, capacity: u32) -> i32;
+    fn mnr_trace_latest(p: usize, count: u32, input: *mut f32, processed: *mut f32, delay: *mut u32) -> u32;
     fn mnr_system_report(text: *mut c_char, capacity: u32);
     fn mnr_phrase_cancel(p: usize);
     fn mnr_snapshot(p: usize, s: *mut Snapshot, error: *mut c_char, cap: u32, meters: i32);
@@ -826,6 +827,15 @@ impl Engine {
         let mut text = vec![0u8; 65536];
         unsafe { mnr_perf_report(self.p, text.as_mut_ptr().cast(), text.len() as u32) };
         decoded(&text)
+    }
+    /// The newest `count` samples before the denoiser and after it, on one timeline, and the
+    /// denoiser's delay in samples (the processed copy lags by it).
+    pub fn trace_latest(&self, count: usize) -> (Vec<f32>, Vec<f32>, usize) {
+        let (mut input, mut processed, mut delay) = (vec![0.0; count], vec![0.0; count], 0u32);
+        let n = unsafe { mnr_trace_latest(self.p, count as u32, input.as_mut_ptr(), processed.as_mut_ptr(), &mut delay) } as usize;
+        input.truncate(n);
+        processed.truncate(n);
+        (input, processed, delay as usize)
     }
     /// The last 30 s of sound at five chain points to `path` (WAV) and `path`.csv: the summary
     /// line for the report, or the error.

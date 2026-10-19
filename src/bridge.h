@@ -54,6 +54,9 @@ void mnr_perf_report(Mnr*,char* text,uint32_t capacity);
 // Writes the last 30 s of sound at five chain points to `path` (WAV) and `path`.csv. Returns 1 with
 // a one-line summary in `text`, or 0 with the error.
 int32_t mnr_trace_save(Mnr*,const uint16_t* path,char* text,uint32_t capacity);
+// Newest `count` samples (oldest first) before the denoiser and after it (DenoisePlayout) on one
+// timeline; the processed copy lags by `delay` samples. Returns how many samples were copied.
+uint32_t mnr_trace_latest(Mnr*,uint32_t count,float* input,float* processed,uint32_t* delay);
 // Report-time system snapshot; blocks about one second, call off the UI thread.
 void mnr_system_report(char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);

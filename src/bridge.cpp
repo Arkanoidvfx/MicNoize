@@ -173,6 +173,11 @@ extern "C" int32_t mnr_trace_save(Mnr* p,const uint16_t* wide16,char* text,uint3
         copy(p->engine.trace.save(path),text,cap);return 1;
     } catch(const std::exception& e) {copy(std::string("sound trace failed: ")+e.what(),text,cap);return 0;}
 }
+extern "C" uint32_t mnr_trace_latest(Mnr* p,uint32_t count,float* input,float* processed,uint32_t* delay) {
+    if(!input || !processed) return 0;
+    if(delay) *delay=p->engine.stats.denoiseDelaySamples.load();
+    return static_cast<uint32_t>(p->engine.trace.latest(mic::AudioTrace::Input,input,mic::AudioTrace::Playout,processed,count));
+}
 extern "C" void mnr_system_report(char* text,uint32_t cap) {
     try {copy(mic::systemReport(),text,cap);} catch(const std::exception& e) {copy(std::string("system report failed: ")+e.what(),text,cap);}
 }

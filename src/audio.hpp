@@ -471,6 +471,18 @@ public:
         if(!lock.owns_lock()){missed_.fetch_add(1,std::memory_order_relaxed);return;}
         blocks_[marked_++%blocks]=b;
     }
+    // Copies the same newest `count` samples (oldest first) of two taps: both end at the sample
+    // both already hold, so a block written to one tap only does not shift the pair.
+    size_t latest(Tap a,float* outA,Tap b,float* outB,size_t count) const {
+        std::lock_guard lock(mutex_);
+        const uint64_t end=std::min(written_[a],written_[b]);
+        count=static_cast<size_t>(std::min<uint64_t>({count,end,length-block}));
+        for(size_t i=0;i<count;++i){
+            const size_t at=(end-count+i)%length;
+            outA[i]=samples_[size_t{a}*length+at]/32768.0f;outB[i]=samples_[size_t{b}*length+at]/32768.0f;
+        }
+        return count;
+    }
     // Writes `wav` (5 channels, 16-bit) and `wav`.csv; returns a one-line summary for the report.
     std::string save(const std::filesystem::path& wav) const;
     // Per-tap numbers for the report line, from the newest `length` samples of each tap.

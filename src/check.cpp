@@ -414,6 +414,9 @@ static void audioTraceTest() {
         if(b+100>=total) trace->write(mic::AudioTrace::Denoiser,x.data(),mic::block);
         trace->mark({static_cast<uint8_t>(b%2?mic::AudioTrace::Denoised:mic::AudioTrace::CatchUp),static_cast<uint16_t>(b%1000),1,2});
     }
+    std::vector<float> a(mic::block),b(mic::block);
+    require(trace->latest(mic::AudioTrace::Input,a.data(),mic::AudioTrace::Output,b.data(),mic::block)==mic::block,"Trace pair copies the newest block");
+    require(std::abs(a.back()-16384/32768.0f)<1e-4f && std::abs(b[0]-a[0]-0.3f)<1e-3f && std::abs(b[1]-a[1])<1e-4f,"Trace pair stays on one block timeline");
     const auto wav=std::filesystem::temp_directory_path()/("mnr-trace-"+std::to_string(GetCurrentProcessId())+".wav");
     const auto csvPath=std::filesystem::path(wav.wstring()+L".csv");
     const auto summary=trace->save(wav);
