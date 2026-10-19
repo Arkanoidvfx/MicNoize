@@ -6,7 +6,37 @@
 #include <chrono>
 #include <limits>
 static void require(bool ok,const char* message){if(!ok) throw std::runtime_error(message);}
+namespace mic {
+void checkPreviewMix() {
+    auto engine=std::make_unique<Engine>();engine->effectEpoch=7;
+    auto mix=[&](float effect,float echo,float sound,uint8_t mask,uint8_t category=ModifiedEffects,unsigned epoch=7,bool recording=false,bool muted=false,bool active=true){
+        engine->previewMask_=mask;engine->muted=muted;engine->stats.outputActive=active;
+        RoutedSample routed{0,0,category,epoch};routed.sound=sound;routed.recording=recording;
+        engine->preview(&effect,&echo,&routed,&category,1);
+        RoutedSample queued;const bool have=engine->preview_.pop(&queued,1);
+        require(have==(mask!=0),"Final preview queue ignored its mask");
+        const float value=have?queued.value:0;
+        require(std::isfinite(value)&&std::abs(value)<=1,"Final preview exceeded the valid sample range");
+        if(have)require(previewSample(queued,mask,7,true)==value,"Final preview lost its monitor category or epoch");
+        return value;
+    };
+    require(mix(1,1,1,5)==1 && mix(-1,-1,-1,5)==-1,"Final preview mix did not limit both polarities");
+    require(mix(1,-1,1,5)==1,"Preview limited stems before their cancellation");
+    require(mix(1,1,0.75f,4)==0.75f,"Sound-only preview leaked effects or echo");
+    require(mix(0.75f,1,1,2,ModifiedBoost)==0.75f,"Boost-only preview leaked other categories");
+    require(mix(1,0,0,1,ModifiedBoost)==0,"Effect preview included boost-only audio");
+    require(mix(1,1,0,5,ModifiedEffects,6)==0,"Old effects or echo survived an epoch change");
+    require(mix(1,1,0.5f,5,ModifiedEffects,6)==0.5f,"Epoch reset incorrectly discarded a soundpad clip");
+    require(mix(0.25f,0,0.5f,1,ModifiedEffects,7,true)==0.75f && mix(0.25f,0,0.5f,5,ModifiedEffects,7,true)==0.75f,
+        "Recent recording was omitted or doubled in the final preview");
+    require(mix(1,1,1,5,ModifiedEffects,7,false,true)==0,"Mute leaked into the final preview");
+    require(mix(1,1,1,5,ModifiedEffects,7,false,false,false)==0,"Inactive output leaked into the final preview");
+    require(mix(1,1,1,0)==0,"Disabled preview queued audio");
+    std::cout<<"final_preview_mix=passed bounds_cancellation_categories_mute_epoch=passed\n";
+}
+}
 int main() {try {
+    mic::checkPreviewMix();
     {
         // Anti-phase stereo microphone: plain averaging cancels the voice and keeps only the noise.
         auto run=[](float polarity,unsigned channels,unsigned packets,float& rms,mic::Downmix& d) {

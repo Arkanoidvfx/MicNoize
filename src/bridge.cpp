@@ -32,11 +32,13 @@ struct Mnr {
     std::mutex iconMutex;
     HICON wantedIcon=nullptr,customIcon=nullptr;
     bool iconPending=false;
-    ~Mnr() {
+    void shutdown() {
         if(shell.joinable()) {shell.request_stop(); if(auto w=window.load()) PostMessageW(w,WM_APP+4,0,0); shell.join();}
-        if(instance) CloseHandle(instance);
-        if(wantedIcon) DestroyIcon(wantedIcon);
+        monitor.stop();headphones.stop();engine.stop();
+        if(instance) {CloseHandle(instance);instance=nullptr;}
+        if(wantedIcon) {DestroyIcon(wantedIcon);wantedIcon=nullptr;}
     }
+    ~Mnr() {shutdown();}
 };
 static void copy(const std::string& text,char* out,uint32_t capacity) {
     if(!out || !capacity) return;
@@ -51,6 +53,35 @@ extern "C" Mnr* mnr_create(char* error,uint32_t capacity) {
     try {return new Mnr;} catch(const std::exception& e) {copy(e.what(),error,capacity);return nullptr;} catch(...) {copy("Engine creation failed",error,capacity);return nullptr;}
 }
 extern "C" void mnr_destroy(Mnr* p) {try {delete p;} catch(...) {}}
+extern "C" void mnr_shutdown(Mnr* p) {try {if(p)p->shutdown();} catch(...) {}}
+namespace mic {
+void checkNativeShutdown() {
+    GUID id{};wchar_t suffix[40]{};
+    if(FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id,suffix,40))throw std::runtime_error("Create shutdown check namespace");
+    const std::wstring name=L"Local\\MicNoize.ShutdownCheck."+std::wstring(suffix);
+    std::atomic<bool> stopped{false};
+    auto p=std::make_unique<Mnr>();
+    p->instance=CreateMutexW(nullptr,FALSE,name.c_str());
+    if(!p->instance || GetLastError()==ERROR_ALREADY_EXISTS)throw std::runtime_error("Create isolated shutdown mutex");
+    // Exercise the real owner without starting the production shell or persistent TAG host.
+    p->shell=std::jthread([&](std::stop_token stop) {
+        while(!stop.stop_requested())std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        stopped=true;
+    });
+    mnr_shutdown(p.get());mnr_shutdown(p.get());
+    if(p->shell.joinable() || !stopped || p->instance)throw std::runtime_error("Shutdown retained native resources");
+    HANDLE instance=CreateMutexW(nullptr,FALSE,name.c_str());
+    if(!instance)throw std::runtime_error("Recreate isolated shutdown mutex");
+    const bool released=GetLastError()!=ERROR_ALREADY_EXISTS;
+    CloseHandle(instance);
+    if(!released)throw std::runtime_error("Shutdown retained the instance mutex");
+    const float samples[]={0.125f,0.25f};
+    if(!mnr_sound_load(p.get(),1,samples,2,1))throw std::runtime_error("Decoder storage rejected a load after shutdown");
+    const auto clip=p->engine.soundClip(1);
+    if(!clip || clip->samples!=std::vector<float>(std::begin(samples),std::end(samples)))throw std::runtime_error("Decoder storage changed after shutdown");
+    p.reset();
+}
+}
 extern "C" int32_t mnr_tag_autostart(int32_t mode,char* error,uint32_t cap) {
     try {return mode==-1?mic::tagTaskAutostart():mic::configureTagTask(mode);}
     catch(const std::exception& e){copy(e.what(),error,cap);return -1;}
@@ -134,6 +165,13 @@ extern "C" void mnr_session_report(Mnr* p,char* text,uint32_t cap) {
 }
 extern "C" void mnr_perf_report(Mnr* p,char* text,uint32_t cap) {
     try {copy(mic::formatPerf(p->engine.perf.copy()),text,cap);} catch(...) {copy("",text,cap);}
+}
+extern "C" int32_t mnr_trace_save(Mnr* p,const uint16_t* wide16,char* text,uint32_t cap) {
+    const auto* path=reinterpret_cast<const wchar_t*>(wide16); // UTF-16, zero-terminated
+    try {
+        if(!path || !*path) throw std::runtime_error("empty sound trace path");
+        copy(p->engine.trace.save(path),text,cap);return 1;
+    } catch(const std::exception& e) {copy(std::string("sound trace failed: ")+e.what(),text,cap);return 0;}
 }
 extern "C" void mnr_system_report(char* text,uint32_t cap) {
     try {copy(mic::systemReport(),text,cap);} catch(const std::exception& e) {copy(std::string("system report failed: ")+e.what(),text,cap);}

@@ -557,10 +557,10 @@ impl App {
     /// layer is always there so the app's widgets keep their state when a morph starts.
     pub fn view(&self, _: window::Id) -> Element<'_, Msg> {
         let (base, anim): (Element<'_, Msg>, _) = match &self.morph {
-            None => (self.root(), None),
+            None => (self.taken_root(), None),
             Some(m) => (
                 match m.base {
-                    MorphBase::Root => self.root(),
+                    MorphBase::Root => self.taken_root(),
                     MorphBase::Card(stage) => update_card_on_key(stage, &m.from_version, &m.to_version),
                     MorphBase::Key => container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style { background: Some(tacho::KEY.into()), ..Default::default() }).into(),
                 },
@@ -577,16 +577,23 @@ impl App {
             if self.ready_clock().present() {
                 layers = layers.push(tacho::celebrate(self.ready_clock()));
             }
-            // The restart's air stops where the morph takes over: under its colour key it
+            // The falling button stops where the morph takes over: under its colour key it
             // would float over the desktop.
             if self.restart.is_some() {
-                layers = layers.push(tacho::restart_wind(self.restart,self.restart_mosaic.clone()));
+                layers = layers.push(tacho::restart_wind(self.restart));
             }
         }
         if anim.is_some() {
             layers = layers.push(tacho::morph(anim));
         }
         layers.into()
+    }
+
+    /// The app with the update's takeover of its controls: seized while the restart is
+    /// prepared, rebuilt after it. Always wrapped, so the controls keep their state.
+    pub fn taken_root(&self) -> Element<'_, Msg> {
+        let takeover = self.restart.map(tacho::Takeover::Seize).or(self.rebuild.map(tacho::Takeover::Release));
+        tacho::capture(self.root(), takeover, self.restart_mosaic.clone())
     }
 
     /// The whole app window without any morph.
@@ -3657,23 +3664,26 @@ mod tests {
         app.glitch = None;
         let (gone, _) = frame(&app);
         assert!(gone > 0.0, "leaving repaints the last pattern away");
-        // The restart's air: one frame of it after another, 16 ms apart.
+        // The restart's takeover of the controls: one frame after another, 16 ms apart, through
+        // the whole capture.
         app.update_ready = true;
         let _ = frame(&app);
         app.restart_mosaic=app.window_mosaic(App::window_size());
         let mut worst = (0.0_f32, 0.0_f64, 0.0_f64);
         let mut times=Vec::new();
+        let start = Instant::now() - Duration::from_millis(600);
+        let mut restart = tacho::Restart::new(start, tacho::Fall::KnockOut);
+        restart.advance(1, start);
+        tacho::restart::DOWNLOADED.store(100, std::sync::atomic::Ordering::Relaxed);
         for i in 0..200u64 {
-            let mut restart = tacho::Restart::new(Instant::now() - Duration::from_millis(850 + 16 * i), tacho::Fall::KnockOut);
-            restart.advance(1, Instant::now() - Duration::from_millis(800));
-            app.restart = Some(restart);
+            app.restart = Some(tacho::Restart { start: restart.start - Duration::from_millis(16 * i), step_at: restart.step_at - Duration::from_millis(16 * i), ..restart });
             let (a, t) = frame(&app);
             worst = (worst.0.max(a), worst.1.max(t), worst.2 + t / 200.0);
             times.push(t);
         }
         times.sort_by(f64::total_cmp);
-        eprintln!("restart air: worst {:.0} % of the window, worst {:.1} ms, mean {:.1} ms", worst.0 * 100.0, worst.1, worst.2);
-        eprintln!("restart air/debris p95: {:.1} ms",times[190]);
+        eprintln!("restart takeover: worst {:.0} % of the window, worst {:.1} ms, mean {:.1} ms", worst.0 * 100.0, worst.1, worst.2);
+        eprintln!("restart takeover p95: {:.1} ms",times[190]);
         assert!(worst.2<16.0 && times[190]<24.0,"restart animation fell below the frame budget");
         // The ready card's confetti over the window, frame after frame.
         (app.restart, app.update_ready) = (None, false);
@@ -4043,13 +4053,21 @@ mod tests {
                     render(&app, &format!("restart-{fall:?}-{ms}").to_lowercase());
                 }
             }
-            for (ms, step) in [(1500u64, 0u8), (2200,0), (2800,1), (3200, 1), (5000, 2)] {
+            // The controls captured as the preparation really goes: download percent, then steps.
+            for (ms, step, percent) in [(1000u64, 0u8, 10u8), (1500, 0, 60), (2000, 0, 100), (2400, 1, 100), (2800, 1, 100), (3200, 2, 100), (5000, 2, 100)] {
+                tacho::restart::DOWNLOADED.store(percent, std::sync::atomic::Ordering::Relaxed);
                 let mut restart = tacho::Restart::new(ago(ms), tacho::Fall::KnockOut);
-                restart.advance(step, ago(600));
+                restart.advance(step, ago(400));
                 app.restart = Some(restart);
-                render(&app, &format!("restart-wind-{ms}"));
+                render(&app, &format!("takeover-{ms}"));
             }
-            (app.restart, app.update_ready) = (None, ready);
+            // The new version grown back captured, then rebuilding out of the update window.
+            (app.restart, app.update_ready) = (None, false);
+            for ms in [0u64, 400, 800, 1200, 1600, 2000, 2600] {
+                app.rebuild = Some(ago(ms));
+                render(&app, &format!("rebuild-{ms:04}"));
+            }
+            (app.rebuild, app.update_ready) = (None, ready);
             // «Подбор под микрофон»: idle, the quiet sweep half way, the spoken check, the result.
             app.snapshot.state = 2;
             app.denoiser.0 = 1;

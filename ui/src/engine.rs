@@ -30,6 +30,7 @@ pub struct Snapshot {
 unsafe extern "C" {
     fn mnr_create(error: *mut c_char, capacity: u32) -> usize;
     fn mnr_destroy(p: usize);
+    fn mnr_shutdown(p: usize);
     fn mnr_begin_operation(p: usize) -> u64;
     fn mnr_start_generation(
         p: usize,
@@ -84,6 +85,7 @@ unsafe extern "C" {
     fn mnr_denoiser_state(p: usize, text: *mut c_char, capacity: u32) -> i32;
     fn mnr_session_report(p: usize, text: *mut c_char, capacity: u32);
     fn mnr_perf_report(p: usize, text: *mut c_char, capacity: u32);
+    fn mnr_trace_save(p: usize, path: *const u16, text: *mut c_char, capacity: u32) -> i32;
     fn mnr_system_report(text: *mut c_char, capacity: u32);
     fn mnr_phrase_cancel(p: usize);
     fn mnr_snapshot(p: usize, s: *mut Snapshot, error: *mut c_char, cap: u32, meters: i32);
@@ -135,9 +137,18 @@ pub fn pick_paths(folder: bool) -> Result<Vec<std::path::PathBuf>, String> {
         _ => Err(decoded(&b)),
     }
 }
-/// Send-able handle for loading clips from a decode task without holding the controller.
-#[derive(Clone, Copy)]
-pub struct SoundLoader(usize);
+struct NativeOwner(usize);
+impl Drop for NativeOwner {
+    fn drop(&mut self) {
+        unsafe { mnr_destroy(self.0) }
+        if !cfg!(test) && let Some(root)=std::env::var_os("MNR_RUNTIME_ROOT") {
+            crate::logs::note(std::path::Path::new(&root),"Выход: native-движок освобождён");
+        }
+    }
+}
+/// Decode tasks can finish after the controller; their handle keeps native storage alive.
+#[derive(Clone)]
+pub struct SoundLoader(Arc<NativeOwner>);
 pub fn studio_pitch(input: &[f32], scale: f32) -> Result<Vec<f32>, String> {
     if input.is_empty() || input.len() > 20 * 48_000 { return Err("Неверная длина звука".into()); }
     let mut output = vec![0.0; input.len()];
@@ -148,14 +159,14 @@ pub fn studio_pitch(input: &[f32], scale: f32) -> Result<Vec<f32>, String> {
 }
 impl SoundLoader {
     pub fn load(&self, id: u32, samples: &[f32], gain: f32) -> Result<(), String> {
-        if unsafe { mnr_sound_load(self.0, id, samples.as_ptr(), samples.len() as u32, gain) } == 0 {
+        if unsafe { mnr_sound_load(self.0.0, id, samples.as_ptr(), samples.len() as u32, gain) } == 0 {
             return Err("Движок отклонил звук".into());
         }
         Ok(())
     }
     pub fn load_studio(&self, id: u32, samples: &[f32], gain: f32, loop_range: Option<(usize, usize)>) -> Result<(), String> {
         let (start, end) = loop_range.unwrap_or((0, 0));
-        if unsafe { mnr_studio_load(self.0, id, samples.as_ptr(), samples.len() as u32, gain, start as u32, end as u32) } == 0 {
+        if unsafe { mnr_studio_load(self.0.0, id, samples.as_ptr(), samples.len() as u32, gain, start as u32, end as u32) } == 0 {
             return Err("Движок отклонил трек".into());
         }
         Ok(())
@@ -430,6 +441,7 @@ fn report_rvc_stop(child: &mut Option<Child>, replies: &mpsc::Sender<Reply>) {
 }
 pub struct Engine {
     p: usize,
+    native: Arc<NativeOwner>,
     tx: mpsc::Sender<Command>,
     rx: mpsc::Receiver<Reply>,
     worker: Option<thread::JoinHandle<()>>,
@@ -459,6 +471,7 @@ impl Engine {
                 Err(decoded(&error))
             };
         }
+        let native=Arc::new(NativeOwner(p));
         let (tx, requests) = mpsc::channel();
         let (replies, rx) = mpsc::channel();
         unsafe {
@@ -611,6 +624,7 @@ impl Engine {
         });
         Ok(Some(Self {
             p,
+            native,
             tx,
             rx,
             worker: Some(worker),
@@ -722,7 +736,7 @@ impl Engine {
         unsafe { mnr_bindings(self.p, keys.as_ptr(), keys.len() as u32) }
     }
     pub fn sound_loader(&self) -> SoundLoader {
-        SoundLoader(self.p)
+        SoundLoader(self.native.clone())
     }
     pub fn sound_gain(&self, id: u32, gain: f32) -> bool {
         unsafe { mnr_sound_gain(self.p, id, gain) != 0 }
@@ -813,6 +827,15 @@ impl Engine {
         unsafe { mnr_perf_report(self.p, text.as_mut_ptr().cast(), text.len() as u32) };
         decoded(&text)
     }
+    /// The last 30 s of sound at five chain points to `path` (WAV) and `path`.csv: the summary
+    /// line for the report, or the error.
+    pub fn save_trace(&self, path: &std::path::Path) -> Result<String, String> {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut text = vec![0u8; 4096];
+        let ok = unsafe { mnr_trace_save(self.p, wide.as_ptr(), text.as_mut_ptr().cast(), text.len() as u32) };
+        if ok == 1 { Ok(decoded(&text)) } else { Err(decoded(&text)) }
+    }
     pub fn phrase(&self) -> (i32, f32) {
         let mut seconds = 0.0;
         let state = unsafe { mnr_phrase_state(self.p, &mut seconds) };
@@ -856,8 +879,8 @@ impl Drop for Engine {
             let _ = worker.join();
         }
         note("Выход: управляющий поток завершён");
-        unsafe { mnr_destroy(self.p) }
-        note("Выход: native-движок освобождён");
+        unsafe { mnr_shutdown(self.p) };
+        note("Выход: native-сессия остановлена");
     }
 }
 
@@ -893,6 +916,21 @@ pub fn atomic_save(path: &std::path::Path, contents: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_loaders_keep_native_storage_until_the_last_handle() {
+        let (app,initial)=crate::App::from_settings(crate::settings::Settings::for_test("")).unwrap().unwrap();
+        drop(initial);
+        let loader=app.engine.sound_loader();
+        let studio=loader.clone();
+        let owner=Arc::downgrade(&loader.0);
+        drop(app);
+        assert_eq!(owner.strong_count(),2,"controller shutdown must retain outstanding loaders");
+        std::thread::spawn(move || loader.load(1,&[0.125;480],1.0).unwrap()).join().unwrap();
+        assert_eq!(owner.strong_count(),1);
+        std::thread::spawn(move || studio.load_studio(2,&[0.25;480],1.0,Some((0,480))).unwrap()).join().unwrap();
+        assert!(owner.upgrade().is_none(),"the last loader must release native storage");
+    }
 
     #[test]
     fn device_state_coalesces_and_rejects_cancelled_generation() {

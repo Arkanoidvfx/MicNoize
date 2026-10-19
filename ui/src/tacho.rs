@@ -2234,18 +2234,21 @@ const CONFETTI_DRAG: f32 = 380.0;
 const CONFETTI_FALL: f32 = 0.11;
 
 /// «Перезапустить» clicked: the button sinks into its slot and falls out one of four ways, then
-/// air from all over the window rushes into the hole it left while the restart is prepared. The
-/// window itself never moves: its own morph into the update window follows. Milliseconds from
-/// the click.
+/// the window's own controls are captured into the hole it left while the restart is prepared
+/// ([`capture`]). The window itself never moves: its own morph into the update window follows.
+/// Milliseconds from the click.
 pub mod restart {
     use std::time::Duration;
     pub const PRESS: f32 = 170.0;
     pub const DROP: (f32, f32) = (170.0, 890.0);
-    /// The air speeds up over this span, then blows steadily.
-    pub const WIND: (f32, f32) = (820.0, 1300.0);
+    /// The capture never runs ahead of this pace: first sparks once the button is out, all of
+    /// the window at the end.
+    pub const PACE: (f32, f32) = (600.0, 3100.0);
     /// The restart waits at least this long after the click: the button has fallen out and the
-    /// air rushes in before the window morphs.
+    /// controls are taken before the window morphs.
     pub const HOLD: Duration = Duration::from_millis(3500);
+    /// The newest version's download in percent, as Velopack reports it to the updater.
+    pub static DOWNLOADED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 }
 /// How the button leaves its slot: sinks turning like into a drain, is knocked out and falls
 /// off the window, swings in like a hatch, or cracks into slanted segments that drop one by one.
@@ -2285,26 +2288,22 @@ impl Restart {
     fn ms(&self, now: Instant) -> f32 {
         now.saturating_duration_since(self.start).as_secs_f32() * 1000.0
     }
-    /// The share the hole's floor shows: each step fills its third, slowing as it goes.
-    fn progress(&self, now: Instant) -> f32 {
+    /// How far the preparation really is, 0–1, as the hole's floor shows it: the download's
+    /// reported percent while the newest version is fetched, then the rollback copy and stopping
+    /// the sound, each creeping towards its share until the next step begins.
+    pub fn progress(&self, now: Instant) -> f32 {
         let since = now.saturating_duration_since(self.step_at).as_secs_f32();
-        (self.step.min(2) as f32 + 1.0 - (-since / 1.2).exp()) / 3.0
+        let creep = |tau: f32| 1.0 - (-since / tau).exp();
+        match self.step {
+            0 => 0.04 + 0.48 * f32::from(restart::DOWNLOADED.load(std::sync::atomic::Ordering::Relaxed).min(100)) / 100.0,
+            1 => 0.52 + 0.33 * creep(1.0),
+            _ => 0.85 + 0.15 * creep(0.45),
+        }
     }
-    /// The air's strength: none until the button is out, then more with each step.
-    fn wind(&self, now: Instant) -> f32 {
-        let level = |step: u8| [0.7, 0.85, 1.0][step.min(2) as usize];
-        let since = now.saturating_duration_since(self.step_at).as_secs_f32() * 1000.0;
-        let from = level(self.step.saturating_sub(1));
-        (from + (level(self.step) - from) * smooth((since / 400.0).min(1.0))) * smooth(ready_span(self.ms(now), restart::WIND))
-    }
-    /// The air's own clock: milliseconds at its speed, a third at first and full once it blows.
-    fn tau(&self, now: Instant) -> f32 {
-        let (a, b) = restart::WIND;
-        let t = (self.ms(now) - a).max(0.0);
-        let x = t / (b - a);
-        // The integral of the smoothstep speed-up, then a steady 1.
-        let ramp = if x < 1.0 { x * x * x - x * x * x * x / 2.0 } else { x - 0.5 };
-        0.35 * t + 0.65 * (b - a) * ramp
+    /// How much of the window the capture should hold: the real progress, never faster than
+    /// its pace.
+    fn capture_goal(&self, now: Instant) -> f32 {
+        self.progress(now).min(smooth(ready_span(self.ms(now), restart::PACE)))
     }
 }
 const PRESSED: Color = Color::from_rgb8(0xE3, 0x81, 0x3E);
@@ -2434,12 +2433,11 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartSlot {
 }
 
 /// The window's layer for the restart: the button falling off the window or crumbling into
-/// segments, and the air: streaks and specks from all over the window rushing into the hole.
-/// Pieces of the actual interface detach into the hole while the remaining window stays put.
-pub fn restart_wind<'a, Message: 'a>(restart: Option<Restart>, mosaic: Option<std::sync::Arc<Mosaic>>) -> Element<'a, Message> {
-    Element::new(RestartWind(restart, mosaic))
+/// segments. The controls it pulls in are [`capture`]'s.
+pub fn restart_wind<'a, Message: 'a>(restart: Option<Restart>) -> Element<'a, Message> {
+    Element::new(RestartWind(restart))
 }
-struct RestartWind(Option<Restart>, Option<std::sync::Arc<Mosaic>>);
+struct RestartWind(Option<Restart>);
 impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fill, height: Length::Fill }
@@ -2448,7 +2446,9 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
         layout::atomic(limits, Length::Fill, Length::Fill)
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
-        if let (Event::Window(window::Event::RedrawRequested(now)), Some(_)) = (event, self.0) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(r)) = (event, self.0)
+            && r.ms(*now) < restart::DROP.1
+        {
             shell.request_redraw_at(frame_after(*now));
         }
     }
@@ -2496,94 +2496,319 @@ impl<Message> Widget<Message, Theme, Renderer> for RestartWind {
                 }
                 Fall::Sink | Fall::Hatch => {}
             }
+            renderer.draw_geometry(frame.into_geometry());
         }
-        let strength = r.wind(now);
-        if strength > 0.001 {
-            restart_air(&mut frame, window, slot, r.tau(now), strength);
-            if let Some(mosaic)=&self.1 {restart_debris(&mut frame,window,slot,mosaic,ms);}
-        }
-        renderer.draw_geometry(frame.into_geometry());
     }
 }
 
-/// Straight streaks and specks of the interface rushing into the hole from all over the
-/// window, each speeding up towards a point along the slot. They are filled as a few paths, one
-/// per colour and brightness step, so a frame repaints the window as one patch: tiny-skia pays
-/// for every separate patch (a window-sized clip mask per layer), and a path per streak cost
-/// 70 ms a frame.
-fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, strength: f32) {
-    const STEPS: usize = 8;
-    let colors = [TAG, HEAD, INK, Color::from_rgb8(163, 163, 169), Color::from_rgb8(94, 95, 102)];
-    let mut quads: [[Vec<[Point; 4]>; STEPS]; 5] = Default::default();
-    let mut put = |color: usize, alpha: f32, quad: [Point; 4]| {
-        let step = (alpha * STEPS as f32).round() as usize;
-        if step > 0 {
-            quads[color][step.min(STEPS) - 1].push(quad);
+/// What the update does to the window's own controls ([`capture`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Takeover {
+    /// The restart being prepared: its real progress decides how much of the window is held.
+    Seize(Restart),
+    /// The controls rebuild from this moment on; before it they stay held.
+    Release(Instant),
+}
+/// The share of the capture's level over which one control goes from its first spark to held.
+const WAVE: f32 = 0.24;
+/// Seconds the controls take to rebuild after the restart.
+pub const REBUILD: f32 = 1.8;
+/// A takeover's own clock (ms) and the rebuild's share done.
+fn takeover_clock(takeover: Takeover, now: Instant) -> (f32, f32) {
+    match takeover {
+        Takeover::Seize(r) => (r.ms(now), 0.0),
+        Takeover::Release(start) => {
+            let ms = now.saturating_duration_since(start).as_secs_f32() * 1000.0;
+            (ms, ms / 1000.0 / REBUILD)
         }
-    };
-    let (cx, cy) = (slot.center_x(), slot.center_y());
-    let spawn = |seed: u32| {
-        for k in 0..8 {
-            let x = window.x + 6.0 + grain(seed, 20 + k) * (window.width - 12.0);
-            let y = window.y + 4.0 + grain(seed, 30 + k) * (window.height - 8.0);
-            if (x - cx).hypot((y - cy) * 1.6) > 90.0 {
-                return Point::new(x, y);
+    }
+}
+/// The rebuild is over, the last control's flash included: nothing left to draw.
+fn rebuilt(takeover: Takeover, now: Instant) -> bool {
+    matches!(takeover, Takeover::Release(_)) && takeover_clock(takeover, now).1 * (1.0 + WAVE) > 1.0 + 1.7 * WAVE
+}
+
+/// The update taking the window over. The real interface is laid out and drawn as usual; its
+/// layout nodes are the controls and panels the takeover seizes, nearest the restart's slot
+/// first and only as far as the preparation has really got. A control's rim lights up from the
+/// side facing the slot, energy fills it, it splits into the design's slanted segments and they
+/// stream along its row and down the rail into the slot as packets, leaving a dark socket no
+/// pointer reaches; panels light their borders as the capture enters them. [`Takeover::Release`]
+/// plays it backwards out of the update window's place and gives the controls back. Without a
+/// takeover it only passes the content through.
+pub fn capture<'a, Message: 'a>(content: Element<'a, Message>, takeover: Option<Takeover>, picture: Option<std::sync::Arc<Mosaic>>) -> Element<'a, Message> {
+    Element::new(Capture { content, takeover, picture })
+}
+struct Capture<'a, Message> {
+    content: Element<'a, Message>,
+    takeover: Option<Takeover>,
+    /// The untouched window, to tell real controls from empty layout boxes.
+    picture: Option<std::sync::Arc<Mosaic>>,
+}
+#[derive(Default)]
+struct CaptureState {
+    /// The seizing restart's start, the level shown and when: the level eases towards its goal,
+    /// never falls back, and a release starts from it.
+    level: std::cell::Cell<Option<(Instant, f32, Instant)>>,
+    /// Scrollables' content, viewport and offset: their content is laid out unscrolled.
+    scrolls: Vec<(Rectangle, Rectangle, iced::Vector)>,
+    /// What the takeover held in the last frame: no pointer reaches it.
+    held: RefCell<Vec<Rectangle>>,
+    /// The slot the controls went into: a release gives them back out of it.
+    slot: std::cell::Cell<Option<Rectangle>>,
+}
+struct Scrolls(Vec<(Rectangle, Rectangle, iced::Vector)>);
+impl iced::advanced::widget::Operation for Scrolls {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        operate(self);
+    }
+    fn scrollable(&mut self, _: Option<&iced::advanced::widget::Id>, bounds: Rectangle, content: Rectangle, translation: iced::Vector, _: &mut dyn iced::advanced::widget::operation::Scrollable) {
+        self.0.push((content, bounds, translation));
+    }
+}
+impl<Message> Widget<Message, Theme, Renderer> for Capture<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<CaptureState>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(CaptureState::default())
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+        self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn iced::advanced::widget::Operation) {
+        self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some(takeover)) = (event, self.takeover) {
+            let mut scrolls = Scrolls(Vec::new());
+            self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer, &mut scrolls);
+            tree.state.downcast_mut::<CaptureState>().scrolls = scrolls.0;
+            if !rebuilt(takeover, *now) {
+                shell.request_redraw_at(frame_after(*now));
             }
         }
-        Point::new(window.x + window.width - 30.0, window.y + 60.0)
-    };
-    // (seed offset, count, lifetime on the air's clock, specks rather than streaks)
-    for (v, count, life, speck) in [(2u32, 72u32, 850.0f32, false), (5, 24, 1250.0, true)] {
-        for i in 0..count {
-            let gate = (strength*2.0-grain(i,v+91)).clamp(0.0,1.0);
-            let flight = life * (0.7 + 0.8 * grain(i, v + 3));
-            let period = flight + 450.0 + 1800.0 * grain(i,v+7);
-            let age=tau-2000.0*grain(i,v+9);
-            if age<0.0 {continue;}
-            let round=(age/period).floor();
-            let u=(age-period*round)/flight;
-            if u>=1.0 || gate<=0.0 {continue;}
-            let seed = i.wrapping_mul(977).wrapping_add((round as u32).wrapping_mul(131)).wrapping_add(v * 71);
-            let from = spawn(seed);
-            let to = Point::new(cx + (grain(seed, 40) - 0.5) * (slot.width - 28.0), cy + (grain(seed, 41) - 0.5) * slot.height * 0.4);
-            let (r0, a0) = ((from.x - to.x).hypot(from.y - to.y), (from.y - to.y).atan2(from.x - to.x));
-            let (pull, bend) = if speck { (0.55, (grain(seed, 43) - 0.5) * 0.7) } else { (0.5, (grain(seed, 42) - 0.5) * 0.3) };
-            let at = |u: f32| {
-                let (r, a) = (r0 * (1.0 - u).powf(pull), a0 + bend * u);
-                Point::new(to.x + r * a.cos(), to.y + r * a.sin())
-            };
-            let fade = (u / 0.14).clamp(0.0, 1.0) * ((1.0 - u) / 0.1).clamp(0.0, 1.0) * gate;
-            let (head, back) = (at(u), at((u - 0.045).max(0.0)));
-            if speck {
-                let half = (2.0 + (grain(seed, 44) * 3.0).floor()) / 2.0;
-                let (sin, cos) = (if i % 2 == 1 { 1.0f32 } else { -1.0 } * u * 600.0).to_radians().sin_cos();
-                let corner = |x: f32, y: f32| Point::new(head.x + x * cos - y * sin, head.y + x * sin + y * cos);
-                put([0, 2, 3, 4][i as usize % 4], 0.9 * fade, [corner(-half, -half), corner(half, -half), corner(half, half), corner(-half, half)]);
-                continue;
-            }
-            let (dx, dy) = (head.x - back.x, head.y - back.y);
-            let moved = dx.hypot(dy);
-            if moved < 0.01 {
-                continue;
-            }
-            // A thin wedge from the head back along the path, in three pieces fading to its tail.
-            let (ux, uy) = (dx / moved, dy / moved);
-            let length = (moved * 2.1).clamp(2.0, 56.0);
-            let half = (1.3 + 0.6 * grain(seed, 45)) / 2.0;
-            let color = if i % 4 == 0 { 0 } else if i % 9 == 0 { 1 } else { 2 };
-            let alpha = (0.16 + 0.6 * u) * fade;
-            for (k, dim) in [1.0, 0.55, 0.22].into_iter().enumerate() {
-                let (near, far) = (k as f32 / 3.0, (k + 1) as f32 / 3.0);
-                let point = |along: f32, side: f32| {
-                    let w = half * (1.0 - along) * side;
-                    Point::new(head.x - ux * length * along - uy * w, head.y - uy * length * along + ux * w)
+        let held = tree.state.downcast_ref::<CaptureState>().held.borrow().iter().any(|r| cursor.is_over(*r));
+        let cursor = match event {
+            // Held controls take no input; the content still sees the pointer leave them and
+            // a drag begun before the capture end.
+            Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::ButtonReleased(_)) if held => mouse::Cursor::Unavailable,
+            Event::Mouse(_) | Event::Touch(_) if held => return,
+            Event::Keyboard(_) if matches!(self.takeover, Some(Takeover::Seize(_))) => return,
+            _ => cursor,
+        };
+        self.content.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+    }
+    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle, renderer: &Renderer) -> mouse::Interaction {
+        if tree.state.downcast_ref::<CaptureState>().held.borrow().iter().any(|r| cursor.is_over(*r)) {
+            return mouse::Interaction::default();
+        }
+        self.content.as_widget().mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+    }
+    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: iced::Vector) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
+        let state = tree.state.downcast_ref::<CaptureState>();
+        let cursor = if state.held.borrow().iter().any(|r| cursor.is_over(*r)) { mouse::Cursor::Unavailable } else { cursor };
+        // The slot draws itself inside the content when it is there at all.
+        if let Ok(mut slot) = RESTART_SLOT.lock() {
+            *slot = None;
+        }
+        self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+        let mut held = state.held.borrow_mut();
+        held.clear();
+        let now = Instant::now();
+        let Some(takeover) = self.takeover.filter(|t| !rebuilt(*t, now)) else { return };
+        let level = match takeover {
+            Takeover::Seize(r) => {
+                let goal = r.capture_goal(now);
+                let level = match state.level.get() {
+                    Some((start, level, at)) if start == r.start => {
+                        let dt = now.saturating_duration_since(at).as_secs_f32();
+                        (level + (goal - level) * (1.0 - (-dt / 0.3).exp())).clamp(level, level + 0.55 * dt)
+                    }
+                    // A picture painted offscreen, or the first frame: where it should be.
+                    _ => goal,
                 };
-                put(color, alpha * dim, [point(near, 1.0), point(near, -1.0), point(far, -1.0), point(far, 1.0)]);
+                state.level.set(Some((r.start, level, now)));
+                level
+            }
+            // A fresh window (the new version's) starts with everything held.
+            Takeover::Release(_) => state.level.get().map_or(1.0, |(_, level, _)| level),
+        };
+        let window = layout.bounds();
+        let slot = match takeover {
+            Takeover::Seize(_) => {
+                let slot = RESTART_SLOT.lock().ok().and_then(|s| *s);
+                state.slot.set(slot);
+                slot
+            }
+            Takeover::Release(_) => state.slot.get(),
+        };
+        let mut frame = Frame::new(window);
+        takeover_frame(&mut frame, &mut held, takeover, level, now, window, slot, layout, &state.scrolls, self.picture.as_deref());
+        // A layer of its own: within one, text is drawn over geometry and would show through.
+        renderer.with_layer(window, |renderer| renderer.draw_geometry(frame.into_geometry()));
+    }
+}
+
+/// The interface's controls and panels from its layout: a control is the outermost node of a
+/// single-child chain (a button, a field with its frame) or any leaf, as long as it is
+/// control-sized; larger nodes with children are panels to walk into. Scrolled content moves by
+/// its offset and is cut by its viewport. Each control remembers whether it scrolled: the
+/// window's picture shows it unscrolled.
+#[allow(clippy::too_many_arguments)]
+fn gather(node: Layout<'_>, shift: iced::Vector, scrolled: bool, clip: Rectangle, scrolls: &[(Rectangle, Rectangle, iced::Vector)], area: f32, parts: &mut Vec<(Rectangle, bool)>, panels: &mut Vec<Rectangle>) {
+    let raw = node.bounds();
+    let (shift, scrolled, clip) = match scrolls.iter().find(|(content, ..)| *content == raw) {
+        Some((_, view, offset)) => (shift - *offset, scrolled || *offset != iced::Vector::ZERO, clip.intersection(&(*view + shift)).unwrap_or_default()),
+        None => (shift, scrolled, clip),
+    };
+    let b = raw + shift;
+    let Some(seen) = b.intersection(&clip) else { return };
+    if seen.width < 6.0 || seen.height < 6.0 {
+        return;
+    }
+    let children: Vec<Layout<'_>> = node.children().collect();
+    if children.is_empty() || b.height <= 52.0 && (children.len() == 1 && b.width <= 460.0 || b.width <= 140.0) {
+        // Mostly in view and not a whole page.
+        if seen.width * seen.height >= 0.6 * b.width * b.height && b.width * b.height <= 0.2 * area {
+            parts.push((b, scrolled));
+        }
+        return;
+    }
+    let same = |p: &Rectangle| (p.x - seen.x).abs() + (p.y - seen.y).abs() + (p.width - seen.width).abs() + (p.height - seen.height).abs() < 6.0;
+    if seen.width >= 140.0 && seen.height >= 56.0 && seen.width * seen.height <= 0.6 * area && !panels.last().is_some_and(same) {
+        panels.push(seen);
+    }
+    for child in children {
+        gather(child, shift, scrolled, clip, scrolls, area, parts, panels);
+    }
+}
+/// What of a box the window's picture actually shows: the cells that differ from its corner,
+/// so a label spanning its column is only as wide as its words. Nothing for layout space.
+fn visible(m: &Mosaic, window: Rectangle, r: Rectangle) -> Option<Rectangle> {
+    let (cw, ch) = (window.width / m.width as f32, window.height / m.height as f32);
+    let cell = |x: f32, y: f32| (((x - window.x).max(0.0) / cw) as usize).min(m.width - 1) + (((y - window.y).max(0.0) / ch) as usize).min(m.height - 1) * m.width;
+    let (first, last) = (cell(r.x + 1.0, r.y + 1.0), cell(r.x + r.width - 1.0, r.y + r.height - 1.0));
+    let corner = m.cells[first];
+    let mut found: Option<(usize, usize, usize, usize)> = None;
+    for cy in first / m.width..=last / m.width {
+        for cx in first % m.width..=last % m.width {
+            let c = m.cells[cy * m.width + cx];
+            if (0..3).any(|k| c[k].abs_diff(corner[k]) >= 14) {
+                found = Some(found.map_or((cx, cy, cx, cy), |(a, b, c, d)| (a.min(cx), b.min(cy), c.max(cx), d.max(cy))));
             }
         }
     }
-    for (color, steps) in colors.into_iter().zip(&quads) {
-        for (step, quads) in steps.iter().enumerate().filter(|(_, q)| !q.is_empty()) {
+    let (a, b, c, d) = found?;
+    let seen = Rectangle { x: window.x + a as f32 * cw, y: window.y + b as f32 * ch, width: (c + 1 - a) as f32 * cw, height: (d + 1 - b) as f32 * ch };
+    let tight = seen.expand(2.0).intersection(&r)?;
+    // Never thinner than a rim can go round.
+    let grow = Size::new((10.0 - tight.width).max(0.0) / 2.0, (10.0 - tight.height).max(0.0) / 2.0);
+    Rectangle { x: tight.x - grow.width, y: tight.y - grow.height, width: tight.width + 2.0 * grow.width, height: tight.height + 2.0 * grow.height }.intersection(&r)
+}
+
+/// A rounded rectangle's outline as a closed polyline, clockwise from its top right, with the
+/// running length at each point: rims light up along it.
+struct Rim {
+    points: Vec<Point>,
+    at: Vec<f32>,
+    length: f32,
+}
+impl Rim {
+    fn new(r: Rectangle, radius: f32) -> Self {
+        let rad = radius.min(r.width / 2.0).min(r.height / 2.0);
+        let corners = [(r.x + r.width - rad, r.y + rad, -90.0f32), (r.x + r.width - rad, r.y + r.height - rad, 0.0), (r.x + rad, r.y + r.height - rad, 90.0), (r.x + rad, r.y + rad, 180.0)];
+        let points: Vec<Point> = corners.iter().flat_map(|&(cx, cy, from)| (0..5).map(move |k| {
+            let a = (from + 22.5 * k as f32).to_radians();
+            Point::new(cx + rad * a.cos(), cy + rad * a.sin())
+        })).collect();
+        let mut at = Vec::with_capacity(points.len());
+        let mut length = 0.0;
+        for (i, p) in points.iter().enumerate() {
+            at.push(length);
+            length += p.distance(points[(i + 1) % points.len()]);
+        }
+        Self { points, at, length: length.max(1.0) }
+    }
+    /// Where along the outline it comes closest to `p`.
+    fn nearest(&self, p: Point) -> f32 {
+        let i = (0..self.points.len()).min_by(|&a, &b| self.points[a].distance(p).total_cmp(&self.points[b].distance(p))).unwrap_or(0);
+        self.at[i]
+    }
+    fn point(&self, s: f32) -> Point {
+        let s = s.rem_euclid(self.length);
+        let i = self.at.partition_point(|&a| a <= s).saturating_sub(1);
+        let next = (i + 1) % self.points.len();
+        let span = self.at.get(i + 1).copied().unwrap_or(self.length) - self.at[i];
+        let k = if span > 0.0 { (s - self.at[i]) / span } else { 0.0 };
+        let (a, b) = (self.points[i], self.points[next]);
+        Point::new(a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k)
+    }
+    /// The outline from `from` on for `length`.
+    fn trace(&self, from: f32, length: f32) -> Vec<Point> {
+        let length = length.min(self.length);
+        let base = from.rem_euclid(self.length);
+        let mut line = vec![self.point(base)];
+        for lap in [0.0, self.length] {
+            line.extend(self.at.iter().zip(&self.points).filter(|(at, _)| **at + lap > base && **at + lap < base + length).map(|(_, p)| *p));
+        }
+        line.push(self.point(base + length));
+        line
+    }
+}
+/// The takeover's strokes and quads, filled as one path per colour: tiny-skia pays for every
+/// separate fill, and a path per segment would cost more than the frame.
+#[derive(Default)]
+struct Ink {
+    lines: std::collections::BTreeMap<(u32, u32), Vec<Vec<Point>>>,
+    quads: std::collections::BTreeMap<u32, Vec<[Point; 4]>>,
+}
+impl Ink {
+    fn pack(c: Color) -> u32 {
+        let q = |v: f32, n: f32| (v.clamp(0.0, 1.0) * n).round() as u32;
+        q(c.r, 63.0) << 18 | q(c.g, 63.0) << 12 | q(c.b, 63.0) << 6 | q(c.a, 16.0)
+    }
+    fn unpack(k: u32) -> Color {
+        Color { r: (k >> 18 & 63) as f32 / 63.0, g: (k >> 12 & 63) as f32 / 63.0, b: (k >> 6 & 63) as f32 / 63.0, a: (k & 63) as f32 / 16.0 }
+    }
+    fn line(&mut self, color: Color, width: f32, line: Vec<Point>) {
+        if color.a > 0.03 && line.len() > 1 {
+            self.lines.entry((Self::pack(color), (width * 4.0) as u32)).or_default().push(line);
+        }
+    }
+    fn quad(&mut self, color: Color, quad: [Point; 4]) {
+        if color.a > 0.03 {
+            self.quads.entry(Self::pack(color)).or_default().push(quad);
+        }
+    }
+    /// A slanted segment of the design around `c`: `w` wide at its base, leaning `lean`.
+    fn segment(&mut self, color: Color, c: Point, w: f32, h: f32, lean: f32) {
+        let (x, y) = (c.x - (w + lean) / 2.0, c.y + h / 2.0);
+        self.quad(color, [Point::new(x, y), Point::new(x + w, y), Point::new(x + w + lean, y - h), Point::new(x + lean, y - h)]);
+    }
+    fn paint(self, frame: &mut Frame) {
+        for ((color, width), lines) in &self.lines {
+            let path = Path::new(|p| {
+                for line in lines {
+                    p.move_to(line[0]);
+                    line[1..].iter().for_each(|q| p.line_to(*q));
+                }
+            });
+            frame.stroke(&path, Stroke::default().with_width(*width as f32 / 4.0).with_color(Self::unpack(*color)));
+        }
+        for (color, quads) in &self.quads {
             let path = Path::new(|p| {
                 for [a, b, c, d] in quads {
                     p.move_to(*a);
@@ -2593,57 +2818,195 @@ fn restart_air(frame: &mut Frame, window: Rectangle, slot: Rectangle, tau: f32, 
                     p.close();
                 }
             });
-            frame.fill(&path, Color { a: (step + 1) as f32 / STEPS as f32, ..color });
+            frame.fill(&path, Self::unpack(*color));
         }
     }
 }
+/// The energy's colour `k` of the way from the slot's orange to its hot white, in eight steps
+/// so the segments share few fills.
+fn energy(k: f32, alpha: f32) -> Color {
+    Color { a: alpha, ..mix(TAG, HEAD, (k.clamp(0.0, 1.0) * 8.0).round() / 8.0) }
+}
+fn bezier(a: Point, b: Point, c: Point, t: f32) -> Point {
+    let u = 1.0 - t;
+    Point::new(u * u * a.x + 2.0 * u * t * b.x + t * t * c.x, u * u * a.y + 2.0 * u * t * b.y + t * t * c.y)
+}
 
-/// Bounded pieces of the actual interface, with staggered lift, turn and accelerating pull.
-/// Seven colour paths preserve the snapshot's text/controls without a layer per pixel.
-fn restart_debris(frame: &mut Frame, window: Rectangle, slot: Rectangle, mosaic: &Mosaic, ms: f32) {
-    let palette=[Color::from_rgb8(20,21,23),Color::from_rgb8(34,35,38),Color::from_rgb8(75,77,82),INK,HEAD,TAG,Color::from_rgb8(92,165,116)];
-    let mut pieces: [Vec<[Point;4]>;7]=Default::default();
-    let mut holes: [Vec<Rectangle>;2]=Default::default();
-    for i in 0..12u32 {
-        let delay=980.0+grain(i,121)*1000.0;
-        if ms<delay {continue;}
-        let source=if i<4 {
-            Rectangle { x:window.x+20.0,y:window.y+96.0+i as f32*44.0,width:152.0,height:28.0 }
-        } else {
-            Rectangle { x:window.x+window.width*(0.28+0.57*grain(i,122)),y:window.y+window.height*(0.12+0.67*grain(i,123)),width:64.0+32.0*grain(i,124),height:24.0+12.0*grain(i,125) }
-        };
-        holes[usize::from(i>=4)].push(source);
-        let t=((ms-delay)/(750.0+grain(i,126)*700.0)).clamp(0.0,1.0);
-        if t>=1.0 {continue;}
-        let q=t.powf(2.2);
-        let origin=Point::new(source.center_x(),source.center_y());
-        let target=Point::new(slot.center_x(),slot.center_y());
-        let bend=(grain(i,127)-0.5)*120.0*(std::f32::consts::PI*t).sin();
-        let center=Point::new(origin.x+(target.x-origin.x)*q+bend,origin.y+(target.y-origin.y)*q-14.0*(std::f32::consts::PI*t).sin());
-        let scale=1.0-q;
-        let (sin,cos)=((grain(i,128)-0.5)*4.0*t*t).sin_cos();
-        let point=|x:f32,y:f32| {let (x,y)=((x-origin.x)*scale,(y-origin.y)*scale);Point::new(center.x+x*cos-y*sin,center.y+x*sin+y*cos)};
-        let side=MOSAIC_CELL;
-        for row in 0..(source.height/side).ceil() as usize {
-            for col in 0..(source.width/side).ceil() as usize {
-                let x=source.x+col as f32*side;let y=source.y+row as f32*side;
-                let pixel=sample(mosaic,(x-window.x)/window.width,(y-window.y)/window.height,(x+side-window.x)/window.width,(y+side-window.y)/window.height);
-                let color=palette.iter().enumerate().min_by_key(|(_,c)| {
-                    ((pixel[0]-c.r*255.0).powi(2)+(pixel[1]-c.g*255.0).powi(2)+(pixel[2]-c.b*255.0).powi(2)) as u32
-                }).map_or(0,|(index,_)|index);
-                let (right,bottom)=((x+side).min(source.x+source.width),(y+side).min(source.y+source.height));
-                pieces[color].push([point(x,y),point(right,y),point(right,bottom),point(x,bottom)]);
+/// One frame of the takeover. `level` is how much of the window the capture holds (a release
+/// starts from it); every control and panel has its place in the order, nearest the slot first,
+/// and its own state from it: 0 untouched, up to ½ lit and filling, then splitting and gone.
+#[allow(clippy::too_many_arguments)]
+fn takeover_frame(frame: &mut Frame, held: &mut Vec<Rectangle>, takeover: Takeover, level: f32, now: Instant, window: Rectangle, slot: Option<Rectangle>, layout: Layout<'_>, scrolls: &[(Rectangle, Rectangle, iced::Vector)], picture: Option<&Mosaic>) {
+    let (ms, rebuild) = takeover_clock(takeover, now);
+    // The ready card holding the slot runs the update: it stays.
+    let hub = slot.map(|s| Rectangle { x: s.x - 12.0, y: s.y + s.height + 12.0 - ready::CARD.height, width: ready::CARD.width, height: ready::CARD.height });
+    let (sink, spread) = match slot {
+        Some(s) => (s.center(), Size::new(s.width - 28.0, s.height * 0.3)),
+        // The new version rebuilds out of the update window it grew from.
+        None => (window.center(), Size::new(240.0, 60.0)),
+    };
+    let (mut found, mut panels) = (Vec::new(), Vec::new());
+    gather(layout, iced::Vector::ZERO, false, window, scrolls, window.width * window.height, &mut found, &mut panels);
+    // Scrolled content is not where the (unscrolled) picture shows it: its boxes stay whole.
+    let mut parts: Vec<(Rectangle, f32)> = found
+        .into_iter()
+        .filter(|(r, _)| !hub.is_some_and(|h| h.contains(r.center())))
+        .filter_map(|(r, scrolled)| match picture {
+            Some(m) if !scrolled => visible(m, window, r),
+            _ => Some(r),
+        })
+        .map(|r| (r, r.center().distance(sink)))
+        .collect();
+    let far = parts.iter().map(|(_, d)| *d).fold(1.0, f32::max);
+    for (r, at) in &mut parts {
+        *at = 0.9 * *at / far + 0.1 * grain((r.x as u32).wrapping_mul(7) ^ (r.y as u32).wrapping_mul(131), 61);
+    }
+    // A state from a place in the order: held as far as the level got, given back as the
+    // rebuild passes; the flash after a control is whole again.
+    let wave = |at: f32, wave: f32| {
+        let held = ((level * (1.0 + wave) - at) / wave).clamp(0.0, 1.0);
+        let back = (rebuild * (1.0 + WAVE) - at) / wave;
+        let flash = if back > 1.0 { 1.0 - ((back - 1.0) / 0.7).min(1.0) } else { 0.0 };
+        (held.min(1.0 - back.clamp(0.0, 1.0)), flash)
+    };
+    let mut ink = Ink::default();
+    for panel in panels.iter().filter(|p| !hub.is_some_and(|h| h.contains(p.center()))) {
+        let Some(at) = parts.iter().filter(|(r, _)| panel.contains(r.center())).map(|(_, at)| *at).reduce(f32::min) else { continue };
+        let (s, _) = wave(at - 0.05, WAVE * 1.4);
+        if s <= 0.0 {
+            continue;
+        }
+        // Drained as it is taken, its border lit from where the capture came in, then energy
+        // running round it.
+        frame.fill(&Path::rounded_rectangle(panel.position(), panel.size(), 10.0.into()), Color { a: 0.22 * smooth(s), ..Color::BLACK });
+        let rim = Rim::new(*panel, 10.0);
+        let entry = rim.nearest(sink);
+        let arm = smooth((s / 0.55).min(1.0)) * rim.length / 2.0;
+        for line in [rim.trace(entry, arm), rim.trace(entry - arm, arm)] {
+            ink.line(Color { a: 0.14, ..TAG }, 5.0, line.clone());
+            ink.line(Color { a: 0.8, ..TAG }, 1.2, line);
+        }
+        let run = smooth(((s - 0.55) / 0.45).clamp(0.0, 1.0));
+        for k in 0..2 {
+            ink.line(Color { a: 0.9 * run, ..HEAD }, 1.6, rim.trace(entry + ms * 0.16 + k as f32 * rim.length / 2.0, 34.0));
+        }
+    }
+    let mut sockets = Vec::new();
+    for (i, &(r, at)) in parts.iter().enumerate() {
+        let (s, flash) = wave(at, WAVE);
+        let rad = 6.0f32.min(r.height / 2.0);
+        if s <= 0.0 {
+            if flash > 0.0 {
+                // Whole again: one last flash round its rim.
+                let rim = Rim::new(r, rad);
+                ink.line(Color { a: 0.2 * flash, ..TAG }, 6.0, rim.trace(0.0, rim.length));
+                ink.line(Color { a: 0.8 * flash, ..HEAD }, 1.4, rim.trace(0.0, rim.length));
+            }
+            continue;
+        }
+        held.push(r);
+        let rim = Rim::new(r, rad);
+        let entry = rim.nearest(sink);
+        let seed = i as u32;
+        if s < 0.5 {
+            // The rim catches from the side facing the slot, both ways round, sparks at the ends.
+            let ignite = smooth((s / 0.28).min(1.0));
+            let arm = ignite * rim.length / 2.0;
+            let arms = [rim.trace(entry, arm), rim.trace(entry - arm, arm)];
+            if ignite < 1.0 {
+                for tip in [arms[0].last(), arms[1].first()].into_iter().flatten() {
+                    ink.segment(HEAD, *tip, 2.5, 3.5, 1.2);
+                }
+            }
+            for line in arms {
+                ink.line(Color { a: 0.22, ..TAG }, 5.0, line.clone());
+                ink.line(TAG, 1.4, line);
+            }
+            // Energy fills it from that side; a bright front, a sheen running through.
+            let charge = smooth(((s - 0.12) / 0.38).clamp(0.0, 1.0));
+            if charge > 0.0 {
+                let across = r.width >= 2.2 * r.height;
+                let (side, front) = if across {
+                    let w = r.width * charge;
+                    if sink.x < r.center_x() { (Rectangle { width: w, ..r }, r.x + w) } else { (Rectangle { x: r.x + r.width - w, width: w, ..r }, r.x + r.width - w) }
+                } else {
+                    let h = r.height * charge;
+                    if sink.y > r.center_y() { (Rectangle { y: r.y + r.height - h, height: h, ..r }, r.y + r.height - h) } else { (Rectangle { height: h, ..r }, r.y + h) }
+                };
+                let (from, to) = match (across, sink.x < r.center_x(), sink.y > r.center_y()) {
+                    (true, true, _) => (Point::new(r.x, r.center_y()), Point::new(front, r.center_y())),
+                    (true, false, _) => (Point::new(r.x + r.width, r.center_y()), Point::new(front, r.center_y())),
+                    (false, _, true) => (Point::new(r.center_x(), r.y + r.height), Point::new(r.center_x(), front)),
+                    (false, _, false) => (Point::new(r.center_x(), r.y), Point::new(r.center_x(), front)),
+                };
+                // Orange behind a hot front; a large surface glows rather than whites out.
+                let body = (3000.0 / (r.width * r.height)).clamp(0.4, 1.0);
+                let fill = gradient::Linear::new(from, to)
+                    .add_stop(0.0, Color { a: (0.25 + 0.4 * charge) * body, ..TAG })
+                    .add_stop(0.8, Color { a: (0.45 + 0.25 * charge) * body, ..TAG })
+                    .add_stop(1.0, Color { a: 0.85 * body.sqrt(), ..HEAD });
+                frame.fill(&Path::rounded_rectangle(side.position(), side.size(), rad.min(side.width / 2.0).min(side.height / 2.0).into()), fill);
+                if charge < 1.0 {
+                    let edge = if across { vec![Point::new(front, r.y + 1.0), Point::new(front, r.y + r.height - 1.0)] } else { vec![Point::new(r.x + 1.0, front), Point::new(r.x + r.width - 1.0, front)] };
+                    ink.line(Color { a: 0.25, ..HEAD }, 5.0, edge.clone());
+                    ink.line(HEAD, 1.5, edge);
+                }
+                if across {
+                    let travel = side.width + 40.0;
+                    let x = (ms * 0.22 + grain(seed, 62) * travel).rem_euclid(travel) - 20.0 + side.x;
+                    if x > side.x && x < side.x + side.width - 4.0 {
+                        ink.segment(Color { a: 0.35, ..HEAD }, Point::new(x, r.center_y()), 4.0, r.height - 2.0, (r.height * SKEW).min(8.0));
+                    }
+                }
+            }
+            continue;
+        }
+        // Split: a dark socket stays, its rim dimming to a breath; the charged surface parts
+        // into slanted segments that lift, shrink into packets and stream along the row and
+        // down to the slot, the side facing it first.
+        sockets.push((r, rad));
+        let gone = smooth(((s - 0.5) / 0.5).min(1.0));
+        ink.line(Color { a: 0.9 - 0.55 * gone + 0.1 * gone * (ms / 320.0 + seed as f32).sin(), ..TAG }, 1.0, rim.trace(0.0, rim.length));
+        let n = ((r.width / 11.0).round() as usize).clamp(2, 40);
+        let lean = (r.height * SKEW).min(8.0).min(r.width / n as f32 * 0.8);
+        let width = (r.width - lean) / n as f32;
+        let right = sink.x > r.center_x();
+        let body = (3000.0 / (r.width * r.height)).clamp(0.4, 1.0);
+        for k in 0..n {
+            let order = if right { n - 1 - k } else { k } as f32 / (n - 1) as f32;
+            let u = ((s - 0.5 - 0.2 * order) / 0.3).clamp(0.0, 1.0);
+            if u >= 1.0 {
+                continue;
+            }
+            let place = Point::new(r.x + k as f32 * width + (width + lean) / 2.0 - 0.6, r.center_y());
+            let tint = if right { k as f32 } else { (n - 1 - k) as f32 } / (n - 1) as f32;
+            if u < 0.25 {
+                let a = smooth(u / 0.25);
+                let at = Point::new(place.x + (k as f32 - (n - 1) as f32 / 2.0) * 1.4 * a, place.y - 3.0 * a);
+                ink.segment(energy(0.1 + 0.45 * (1.0 - tint) + 0.35 * a, 0.45 + 0.4 * body), at, width - 1.2, r.height, lean);
+                continue;
+            }
+            let q = (u - 0.25) / 0.75;
+            let shrink = smooth((q / 0.2).min(1.0));
+            let (w, h, ln) = (width - 1.2 + (6.0 - width + 1.2) * shrink, r.height + (5.0 - r.height) * shrink, lean + (2.0 - lean) * shrink);
+            let to = Point::new(sink.x + (grain(seed, 63 + k as u32) - 0.5) * spread.width, sink.y + (grain(seed, 90 + k as u32) - 0.5) * spread.height);
+            let bend = Point::new(to.x, place.y);
+            let e = ((q - 0.08).max(0.0) / 0.92).powi(2);
+            let fade = 1.0 - smooth(((q - 0.86) / 0.14).clamp(0.0, 1.0));
+            for (j, dim) in [1.0f32, 0.45, 0.2].into_iter().enumerate() {
+                if j > 0 && e <= 0.0 {
+                    break;
+                }
+                let c = bezier(place, bend, to, (e - 0.035 * j as f32).max(0.0));
+                ink.segment(energy(0.4 + 0.6 * q, fade * dim), c, w, h, ln);
             }
         }
     }
-    for (rects,color) in holes.iter().zip([Color::from_rgb8(17,18,20),Color::from_rgb8(13,14,16)]) {
-        let path=Path::new(|p| {for r in rects {p.rectangle(r.position(),r.size());}});
-        frame.fill(&path,color);
+    if !sockets.is_empty() {
+        let path = Path::new(|p| sockets.iter().for_each(|(r, rad)| p.rounded_rectangle(r.position(), r.size(), (*rad).into())));
+        frame.fill(&path, Color::from_rgb8(12, 13, 15));
     }
-    for (quads,color) in pieces.iter().zip(palette) {
-        let path=Path::new(|p| {for [a,b,c,d] in quads {p.move_to(*a);p.line_to(*b);p.line_to(*c);p.line_to(*d);p.close();}});
-        frame.fill(&path,color);
-    }
+    ink.paint(frame);
 }
 
 /// A version number whose differing tail rolls from the old one to the new one, then flashes
@@ -3358,6 +3721,26 @@ mod tests {
             assert_eq!(steps[SHIFT_STEPS - 1].1, 0.0, "the last step leaves the page clean");
         }
         assert!(shift_step(4, 0.0).1 < shift_step(4, 1.0).1, "the left edge dissolves first");
+    }
+    #[test]
+    fn takeover_holds_what_the_window_shows() {
+        // A 100×40 window as 25×10 cells, flat but for a "word" in cells 3–6 of row 4.
+        let mut cells = vec![[20u8; 3]; 250];
+        (3..7).for_each(|x| cells[4 * 25 + x] = [230, 230, 230]);
+        let m = Mosaic { width: 25, height: 10, cells };
+        let window = Rectangle::new(Point::ORIGIN, Size::new(100.0, 40.0));
+        let label = visible(&m, window, Rectangle::new(Point::new(0.0, 8.0), Size::new(100.0, 20.0))).expect("a label");
+        assert!(label.x >= 9.0 && label.x + label.width <= 31.0 && label.width >= 10.0, "only as wide as its word: {label:?}");
+        assert!(visible(&m, window, Rectangle::new(Point::new(40.0, 0.0), Size::new(60.0, 40.0))).is_none(), "layout space is not taken");
+        // A rim traced half way from a point ends opposite it, and both arms meet there.
+        let rim = Rim::new(Rectangle::new(Point::ORIGIN, Size::new(40.0, 20.0)), 0.0);
+        let (a, b) = (rim.trace(0.0, rim.length / 2.0), rim.trace(-rim.length / 2.0, rim.length / 2.0));
+        assert!(a.last().unwrap().distance(*b.first().unwrap()) < 0.01 && a.first().unwrap().distance(Point::new(40.0, 0.0)) < 0.01);
+        assert!(a.last().unwrap().distance(Point::new(0.0, 20.0)) < 0.01, "opposite corner: {:?}", a.last());
+        // The progress the capture follows is the real one, and never runs ahead of its pace.
+        let r = Restart::new(Instant::now() - Duration::from_millis(5000), Fall::Sink);
+        assert!(r.capture_goal(Instant::now()) <= r.progress(Instant::now()) + 1e-6);
+        assert_eq!(Restart::new(Instant::now(), Fall::Sink).capture_goal(Instant::now()), 0.0);
     }
     #[test]
     fn morph_events_restart_with_each_morph() {

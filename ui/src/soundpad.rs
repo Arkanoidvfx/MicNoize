@@ -303,19 +303,20 @@ pub fn decode_limited(path: &Path, seconds: usize) -> Result<Vec<f32>, String> {
         rate = audio.spec().rate();
         interleaved.resize(audio.samples_interleaved(), 0.0);
         audio.copy_to_slice_interleaved(&mut interleaved);
-        for frame in interleaved.chunks_exact(channels) {
+        // Keep one look-ahead frame for interpolation at the output boundary.
+        let source_limit = ((limit as u128 * rate as u128).div_ceil(RATE as u128) + 1)
+            .min(usize::MAX as u128) as usize;
+        for frame in interleaved.chunks_exact(channels).take(source_limit.saturating_sub(mono.len())) {
             mono.push(frame.iter().sum::<f32>() / channels as f32);
         }
-        // Stop reading once even the resampled result would exceed the cap.
-        if rate > 0 && mono.len() as u64 * RATE as u64 / rate as u64 > limit as u64 {
+        if mono.len() >= source_limit {
             break;
         }
     }
     if mono.is_empty() || rate == 0 {
         return Err("Пустой файл".into());
     }
-    let mut samples = resample(&mono, rate, RATE);
-    samples.truncate(limit);
+    let mut samples = resample(&mono, rate, RATE, limit);
     for v in &mut samples {
         *v = if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
     }
@@ -418,17 +419,20 @@ pub fn window(settings: &Settings) -> (f32, f32) {
 }
 
 /// Linear interpolation. ponytail: fine for memes; use a windowed sinc if bright clips alias.
-pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
-    if from == to || input.is_empty() {
-        return input.to_vec();
+pub fn resample(input: &[f32], from: u32, to: u32, limit: usize) -> Vec<f32> {
+    if input.is_empty() || from == 0 || to == 0 || limit == 0 {
+        return Vec::new();
     }
-    let count = (input.len() as u64 * to as u64 / from as u64) as usize;
+    let count = (input.len() as u128 * to as u128 / from as u128).min(limit as u128) as usize;
+    if from == to {
+        return input[..count].to_vec();
+    }
     let step = from as f64 / to as f64;
     (0..count)
         .map(|i| {
             let at = i as f64 * step;
             let index = at as usize;
-            let next = input[(index + 1).min(input.len() - 1)];
+            let next = input[index.saturating_add(1).min(input.len() - 1)];
             let frac = (at - index as f64) as f32;
             input[index.min(input.len() - 1)] * (1.0 - frac) + next * frac
         })
@@ -585,12 +589,88 @@ mod tests {
         let alpha = decode(&sounds[0].path).unwrap();
         assert_eq!(alpha.len(), 480);
         assert!(decode(&dir.join("notes.txt")).is_err());
-        assert_eq!(resample(&[0.0, 1.0], 1, 2), vec![0.0, 0.5, 1.0, 1.0]);
+        assert_eq!(resample(&[0.0, 1.0], 1, 2, usize::MAX), vec![0.0, 0.5, 1.0, 1.0]);
         let source = dir.join("Beta.wav");
         let library = dir.join("library");
         std::fs::create_dir_all(&library).unwrap();
         assert_eq!(import(&library, std::slice::from_ref(&source)).unwrap(), (1, 0));
         assert_eq!(import(&library, &[source, dir.join("missing.mp3")]).unwrap(), (0, 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn bounded_resample() {
+        let input = [0.0, 0.25, 0.5, 0.75, 1.0];
+        assert_eq!(resample(&input, 3, 2, usize::MAX), [0.0, 0.375, 0.75]);
+        assert_eq!(resample(&input, 3, 2, 2), [0.0, 0.375]);
+        assert_eq!(resample(&input, RATE, RATE, 2), input[..2]);
+        for (from, to) in [(7, RATE), (8000, RATE), (44_100, RATE), (RATE, RATE), (96_000, RATE)] {
+            let full = resample(&input, from, to, usize::MAX);
+            assert_eq!(full.len(), (input.len() as u128 * to as u128 / from as u128) as usize);
+            for limit in [0, 1, 2, 7, 33] {
+                let capped = resample(&input, from, to, limit);
+                assert_eq!(capped, full[..full.len().min(limit)]);
+                assert!(capped.capacity() <= limit);
+            }
+        }
+        let up = resample(&input, 1, u32::MAX, 3);
+        assert_eq!(up.len(), 3);
+        assert!(up.capacity() <= 3);
+        assert!(up.iter().all(|v| v.is_finite() && *v >= 0.0 && *v < 0.001));
+        assert!(resample(&input, u32::MAX, 1, usize::MAX).is_empty());
+        assert!(resample(&[], RATE, RATE, usize::MAX).is_empty());
+        assert!(resample(&input, 0, RATE, 1).is_empty());
+        assert!(resample(&input, RATE, 0, 1).is_empty());
+    }
+    #[test]
+    fn decode_bounds_before_allocation() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join(".tmp/soundpad-bounds-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bounded.wav");
+        let raw = |i: usize| ((i as f32 * 0.05).sin() * 16000.0) as i16 as f32 / 32768.0;
+        test_wav(&path, 1, 1, 1024);
+        for seconds in [0, 1, 20, MAX_SECONDS, usize::MAX] {
+            let limit = seconds.clamp(1, MAX_SECONDS) * RATE as usize;
+            let pcm = decode_limited(&path, seconds).unwrap();
+            assert_eq!(pcm.len(), limit);
+            assert!(pcm.capacity() <= limit, "retained oversized PCM allocation");
+            assert!(pcm.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+            assert!((pcm[RATE as usize / 2] - raw(1) * 0.5).abs() < 1e-6);
+            let at = (limit - 1) as f64 / RATE as f64;
+            let i = at as usize;
+            let fraction = (at - i as f64) as f32;
+            let expected = raw(i) * (1.0 - fraction) + raw(i + 1) * fraction;
+            assert!((pcm[limit - 1] - expected).abs() < 1e-6, "lost boundary look-ahead frame");
+        }
+        for (rate, channels) in [(8000, 1), (44_100, 2), (RATE, 1), (96_000, 2), (192_000, 2)] {
+            test_wav(&path, rate, channels, rate as usize * 2 + 7);
+            let pcm = decode_limited(&path, 1).unwrap();
+            assert_eq!(pcm.len(), RATE as usize);
+            assert!(pcm.capacity() <= RATE as usize);
+            for at in [0, 1, RATE as usize / 2, RATE as usize - 1] {
+                let source = at as f64 * rate as f64 / RATE as f64;
+                let i = source as usize;
+                let fraction = (source - i as f64) as f32;
+                let expected = raw(i) * (1.0 - fraction) + raw(i + 1) * fraction;
+                assert!((pcm[at] - expected).abs() < 1e-5, "rate={rate}, sample={at}");
+            }
+        }
+        test_wav(&path, 44_100, 2, 7);
+        assert_eq!(decode_limited(&path, 1).unwrap().len(), 7 * RATE as usize / 44_100);
+        test_wav(&path, 44_100, 2, 44_100);
+        let mut stereo = std::fs::read(&path).unwrap();
+        for frame in stereo[44..].chunks_exact_mut(4) {
+            let left = i16::from_le_bytes(frame[..2].try_into().unwrap());
+            frame[2..].copy_from_slice(&(-left).to_le_bytes());
+        }
+        std::fs::write(&path, stereo).unwrap();
+        assert!(decode_limited(&path, 1).unwrap().iter().all(|v| *v == 0.0));
+        for (rate, frames) in [(0, 1024), (RATE, 0)] {
+            test_wav(&path, rate, 1, frames);
+            assert_eq!(decode_limited(&path, 1).unwrap_err(), "Пустой файл");
+        }
+        std::fs::write(&path, b"not a WAV").unwrap();
+        assert!(decode_limited(&path, 1).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

@@ -15,6 +15,9 @@ fn manager() -> Result<UpdateManager, String> {
 }
 
 pub fn check_and_download() -> Status {
+    // The restart's takeover follows this percent; a package already on disk reports nothing.
+    let downloaded = &crate::tacho::restart::DOWNLOADED;
+    downloaded.store(0, std::sync::atomic::Ordering::Relaxed);
     let manager = match manager() {
         Ok(manager) => manager,
         // Development/portable builds have no Velopack locator and must remain usable.
@@ -24,9 +27,13 @@ pub fn check_and_download() -> Status {
         Ok(UpdateCheck::UpdateAvailable(update)) => {
             let version = update.TargetFullRelease.Version.to_string();
             if let Err(error)=crate::maintenance::preserve_current_package_for_download(){return Status::Unavailable(error);}
-            manager
-                .download_updates(&update, None)
+            let (progress, reports) = std::sync::mpsc::channel::<i16>();
+            std::thread::scope(|scope| {
+                scope.spawn(move || reports.iter().for_each(|p| downloaded.store(p.clamp(0, 100) as u8, std::sync::atomic::Ordering::Relaxed)));
+                manager.download_updates(&update, Some(progress))
+            })
                 .map_err(|e| e.to_string())
+                .inspect(|_| downloaded.store(100, std::sync::atomic::Ordering::Relaxed))
                 .and_then(|_| crate::maintenance::verify_download(&update.TargetFullRelease))
                 .map(|_| Status::Ready(version))
                 .unwrap_or_else(Status::Unavailable)

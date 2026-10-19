@@ -1,4 +1,6 @@
 #![windows_subsystem = "windows"]
+mod component_http;
+mod component_install;
 mod components;
 mod cpu_denoise;
 mod engine;
@@ -153,6 +155,14 @@ fn clip_name() -> String {
     unsafe { GetLocalTime(&mut t) };
     format!(
         "Запись {:04}-{:02}-{:02} {:02}-{:02}-{:02} (mix).wav",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+fn trace_name() -> String {
+    let mut t = LocalTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    format!(
+        "Звук для разработчика {:04}-{:02}-{:02} {:02}-{:02}-{:02}.wav",
         t.year, t.month, t.day, t.hour, t.minute, t.second
     )
 }
@@ -883,13 +893,16 @@ struct App {
     ready_fx: Option<Instant>,
     /// Visible playback elapsed before focus/visibility was lost; no hidden redraw clock.
     ready_fx_paused: Option<Duration>,
-    /// The interface snapshot whose pieces detach during restart preparation.
+    /// The untouched interface the takeover tells real controls apart in.
     restart_mosaic: Option<Arc<tacho::Mosaic>>,
     ready_fx_due: bool,
     ready_preview: Option<Instant>,
-    /// «Перезапустить» clicked: the button falls out of the card and air rushes into the hole
-    /// until the window morphs; cleared when the restart does not happen after all.
+    /// «Перезапустить» clicked: the button falls out of the card and the controls are captured
+    /// into the hole until the window morphs; cleared when the restart does not happen after all.
     restart: Option<tacho::Restart>,
+    /// The captured controls rebuild from then on: after a restart that did not happen, or in
+    /// the new version once it has grown out of the update window.
+    rebuild: Option<Instant>,
     /// The running or last finished strength tune, and the microphone's saved strength before it.
     tune: Option<tune::Tune>,
     /// «by ARKANOID» hovered since, and the window's picture its glitch slices.
@@ -916,6 +929,8 @@ struct App {
     quit_after_repair: bool,
     resume_monitor: Option<(i32,bool)>,
     report_sending: bool,
+    /// File name of the sound trace saved with the report being sent.
+    trace_saved: Option<String>,
     logs_page: bool,
     guide_page: bool,
     /// Engine denoiser: 1 NVIDIA, 2 none, 3 DeepFilterNet on the CPU, 4 input already denoised
@@ -1463,6 +1478,7 @@ impl App {
                 ready_fx: None,
                 ready_fx_paused: None,
                 restart_mosaic: None,
+                rebuild: None,
                 ready_fx_due: false,
                 ready_preview: None,
                 restart: None,
@@ -1487,6 +1503,7 @@ impl App {
                 quit_after_repair:false,
                 resume_monitor:None,
                 report_sending: false,
+                trace_saved: None,
                 logs_page: args.iter().any(|s| s == "--ui-logs"),
                 guide_page: args.iter().any(|s| s == "--ui-guide"),
                 denoiser: (0, String::new()),
@@ -1898,9 +1915,16 @@ impl App {
         let size=tacho::window_area().unwrap_or(Self::window_size());
         self.restart_mosaic=self.window_mosaic(size);
         self.restart=Some(tacho::Restart::new(Instant::now(),tacho::Fall::random()));
+        self.rebuild=None;
         self.ready_fx=None;
         self.ready_fx_paused=None;
         self.ready_fx_due=false;
+    }
+    /// The restart is off: the controls it captured rebuild.
+    fn end_restart(&mut self) {
+        if self.restart.take().is_some() {
+            self.rebuild = Some(Instant::now());
+        }
     }
     /// The version the ready card shows: the download, or one patch up for the preview.
     fn ready_version(&self) -> String {
@@ -2440,12 +2464,16 @@ impl App {
                             let played = restart.start.elapsed();
                             restart.advance(u8::from(played > Duration::from_millis(1400)) + u8::from(played > Duration::from_millis(2600)), Instant::now());
                             if played > Duration::from_millis(3800) {
-                                (self.ready_preview, self.restart) = (None, None);
+                                self.ready_preview = None;
+                                self.end_restart();
                             }
                         }
                         None if self.ready_fx_paused.is_none() && since.elapsed() > Duration::from_secs(8) => self.ready_preview = None,
                         None => {}
                     }
+                }
+                if self.restart.is_none() && self.rebuild.is_some_and(|at| at.elapsed() > Duration::from_secs(4)) {
+                    (self.rebuild, self.restart_mosaic) = (None, None);
                 }
                 let status = components::status();
                 if self.rvc_runtime_installing
@@ -2992,7 +3020,7 @@ impl App {
                     if let Some(restart)=&mut self.restart {restart.advance(1,Instant::now());}
                     return perform(async{updater::prepare()},Msg::UpdatePrepared);
                 }
-                self.restart=None;
+                self.end_restart();
             }
             Msg::UpdatePrepared(result) => {
                 self.apply_pending=false;self.update_checking=false;
@@ -3007,8 +3035,8 @@ impl App {
                         }
                         return self.update(Msg::Quit);
                     }
-                    Err(error)=>{self.restart=None;self.update_status=format!("Подготовка обновления: {error}");}
-                    _=>{self.restart=None;}
+                    Err(error)=>{self.end_restart();self.update_status=format!("Подготовка обновления: {error}");}
+                    _=>{self.end_restart();}
                 }
             }
             Msg::UpdateApplied(result) => {
@@ -3016,7 +3044,7 @@ impl App {
                     update_window::with_next_frame(hwnd,true);
                 }
                 if let Err(error)=result {
-                    self.quitting=false;self.busy=false;self.apply_after_quit=false;self.restart=None;
+                    self.quitting=false;self.busy=false;self.apply_after_quit=false;self.end_restart();
                     self.engine.resume_after_failed_update();
                     self.snapshot.state=0;self.headphone_state=0;self.headphone_busy=false;
                     self.update_status=format!("Обновление не применено: {error}");self.message=self.update_status.clone();
@@ -3565,6 +3593,14 @@ impl App {
                     // Live engine counters: a stutter during a game is diagnosable without a Stop.
                     let note = format!("{note}
 live:{}", self.engine.session_report());
+                    // Sound black box: the last 30 s of the voice stays in the logs folder on this PC;
+                    // only its numbers travel in the report.
+                    let folder = self.runtime_root.join("results");
+                    let _ = std::fs::create_dir_all(&folder);
+                    let name = trace_name();
+                    let trace = self.engine.save_trace(&folder.join(&name));
+                    let note = format!("{note}\n{}", trace.as_deref().unwrap_or_else(|error| error));
+                    self.trace_saved = trace.is_ok().then_some(name);
                     let perf = self.engine.perf_report();
                     self.report_sending = true;
                     self.message = "Отправляем логи…".into();
@@ -3583,6 +3619,12 @@ live:{}", self.engine.session_report());
                     Ok(text) => text,
                     Err(error) => error,
                 };
+                if let Some(name) = self.trace_saved.take() {
+                    self.message = format!(
+                        "{} Звук последних 30 секунд сохранён в папке логов: «{name}». Пришлите этот файл разработчику.",
+                        self.message
+                    );
+                }
             }
             Msg::DriverInstalled(result) => {
                 self.driver_installing = false;
@@ -4607,7 +4649,11 @@ live:{}", self.engine.session_report());
                     height: view::UPDATE_CARD.height,
                 };
                 let from = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Launching, "", env!("CARGO_PKG_VERSION")), view::UPDATE_CARD);
-                let to = self.window_mosaic(size);
+                // The window grows back still captured, as the old version left it; its controls
+                // rebuild once the growth is over.
+                self.restart_mosaic = self.window_mosaic(size);
+                self.rebuild = Some(Instant::now() + Duration::from_millis(980));
+                let to = view::mosaic_of(self.taken_root(), size);
                 // Visible now, over the watcher's identical card; then the watcher may close. The
                 // rounded region comes off with the growth's first frame.
                 if let Some(hwnd) = self.morph.as_ref().and_then(|m| m.hwnd) {
@@ -4790,7 +4836,8 @@ live:{}", self.engine.session_report());
     }
     fn key(&mut self, key: keyboard::Key, mods: keyboard::Modifiers, repeat: bool) -> Task<Msg> {
         use keyboard::{Key, key::Named};
-        if self.window.is_none() {
+        // The restart's takeover holds the controls: nothing to type into or activate.
+        if self.window.is_none() || self.restart.is_some() {
             return Task::none();
         }
         if self.binding.is_some() {
@@ -5587,6 +5634,26 @@ fn main() {
 #[cfg(test)]
 mod controller_tests {
     #[test]
+    fn component_download_errors_release_busy_and_allow_retry() {
+        let (mut app, initial) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        drop(initial);
+        app.component_root = std::env::temp_dir().join(format!("mnr-missing-components-{}", uuid::Uuid::new_v4()));
+        app.core_installing = true;
+        drop(app.update(Msg::CoreInstalled(Err("timeout: recv body".into()))));
+        assert!(!app.core_installing && app.setup_error.contains("timeout"));
+        // Leave tasks unpolled: this checks retry state without starting a download.
+        drop(app.update(Msg::RetryCore));
+        assert!(app.core_installing && app.setup_error.is_empty());
+        app.core_installing = false;
+        app.rvc_runtime_installed = false;
+        app.rvc_runtime_installing = true;
+        drop(app.update(Msg::RvcInstalled(Err("timeout: recv body".into()))));
+        assert!(!app.rvc_runtime_installing && app.rvc_import_note.contains("timeout"));
+        drop(app.update(Msg::RvcInstall));
+        assert!(app.rvc_runtime_installing);
+    }
+
+    #[test]
     fn guide_opens_by_keyboard_and_returns_without_changing_audio() {
         use keyboard::{Key, key::Named, Modifiers};
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
@@ -6297,6 +6364,7 @@ page_pixelate=0")).unwrap().unwrap();
         let _=app.update(Msg::UpdateChecked(updater::Status::Ready("0.2.4".into())));
         let _=app.update(Msg::UpdatePrepared(Err("invalid bundle".into())));
         assert!(app.restart.is_none(),"a failed preparation brings the button back");
+        assert!(app.rebuild.is_some(),"and the captured controls rebuild");
         assert_eq!(app.snapshot.state,2);assert!(!app.quitting && !app.apply_pending && !app.apply_after_quit);
         assert!(app.update_status.contains("invalid bundle"));
     }

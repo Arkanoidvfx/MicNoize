@@ -13,6 +13,8 @@ typedef struct {
 } MnrSnapshot;
 Mnr* mnr_create(char* error,uint32_t capacity);
 void mnr_destroy(Mnr*);
+// Stop UI/audio resources while outstanding decoders may still own the sound storage.
+void mnr_shutdown(Mnr*);
 int32_t mnr_start(Mnr*,const char* input,uint32_t input_len,const char* output,uint32_t output_len,
     int32_t version,uint32_t buffer,uint32_t period,int32_t graphs,float intensity,char* error,uint32_t capacity);
 void mnr_stop(Mnr*);
@@ -49,6 +51,9 @@ int32_t mnr_denoiser_state(Mnr*,char* text,uint32_t capacity);
 void mnr_session_report(Mnr*,char* text,uint32_t capacity);
 // Last 15 minutes of per-second audio health (minute summaries plus incident seconds).
 void mnr_perf_report(Mnr*,char* text,uint32_t capacity);
+// Writes the last 30 s of sound at five chain points to `path` (WAV) and `path`.csv. Returns 1 with
+// a one-line summary in `text`, or 0 with the error.
+int32_t mnr_trace_save(Mnr*,const uint16_t* path,char* text,uint32_t capacity);
 // Report-time system snapshot; blocks about one second, call off the UI thread.
 void mnr_system_report(char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);

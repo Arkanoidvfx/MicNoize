@@ -146,23 +146,32 @@ static bool rvcRequest(float* input,float* output,unsigned frames,const RvcSetti
 // chunks, converts them and pushes exactly as many samples as it consumed (zeros when a chunk is
 // skipped or the server fails), so both rings stay index-aligned.
 class RvcClient {
+    friend void checkRvcIdle();
+    struct InputBlock {std::array<float,block> samples{};uint64_t config=0;unsigned generation=0;};
+    struct Hooks {
+        void* context=nullptr;
+        void (*beforeDrain)(void*)=nullptr;
+        bool (*request)(void*,float*,float*,unsigned,const RvcSettings&,uint64_t)=nullptr;
+    };
     Stats& stats_;
     std::atomic<uint64_t>& config_;
-    Ring<65536,RvcSample> input_,output_;
+    Ring<136,InputBlock> input_;
+    Ring<65536,RvcSample> output_;
     Event data_;
-    std::atomic<bool> enabled_{false},lastFailed_{false};
+    std::atomic<bool> lastFailed_{false};
     std::atomic<unsigned> generation_{0};
     bool active_=false;
     uint64_t previousConfig_=0;
     unsigned seenGeneration_=0;
     RvcPlayout playout_;
     const uint64_t streamBase_=GetTickCount64()<<20;
+    const Hooks* hooks_=nullptr;
     std::jthread worker_; // Start only after all state has been initialized.
     void run(std::stop_token stop) {
         std::array<float,rvcFrames> chunk{},output{};
         std::array<RvcSample,rvcFrames> converted{};
-        unsigned filled=0,chunkGeneration=0,skips=0;
-        RvcSample s;
+        unsigned filled=0,chunkGeneration=0,skips=0,frames=0;
+        InputBlock input;RvcSettings config;
         // Every consumed chunk produces exactly `frames` output samples, silence included.
         auto publish=[&](unsigned frames,bool ok){
             for(unsigned i=0;i<frames;++i)converted[i]={ok?output[i]:0.0f,chunkGeneration};
@@ -170,20 +179,21 @@ class RvcClient {
         };
         while(!stop.stop_requested()) {
             WaitForSingleObject(data_.h,INFINITE);
-            if(!enabled_) {while(input_.pop(&s,1)){}continue;}
-            const auto config=RvcSettings::unpack(config_.load());
-            const auto frames=config.chunkMs*48;
-            while(!stop.stop_requested() && input_.pop(&s,1)) {
-                // A generation change restarts the chunk at index 0 of the new stream.
-                if(s.generation!=chunkGeneration){filled=0;chunkGeneration=s.generation;}
-                chunk[filled++]=std::clamp(s.sample*config.gain/100.0f,-1.0f,1.0f);
+            if(hooks_ && hooks_->beforeDrain)hooks_->beforeDrain(hooks_->context);
+            while(!stop.stop_requested() && input_.pop(&input,1)) {
+                if(input.generation!=generation_.load())continue;
+                // Samples and settings cross the same queue boundary, including after re-enable.
+                if(input.generation!=chunkGeneration){filled=0;chunkGeneration=input.generation;config=RvcSettings::unpack(input.config);frames=config.chunkMs*48;}
+                for(unsigned i=0;i<block;++i)chunk[filled+i]=std::clamp(input.samples[i]*config.gain/100.0f,-1.0f,1.0f);
+                filled+=block;
                 if(filled<frames)continue;
                 filled=0;
                 if(chunkGeneration!=generation_.load())continue; // Stale chunk: no inference for audio nobody will play.
-                if(input_.size()>=rvcSlack){publish(frames,false);++skips;continue;} // Would miss the playout deadline anyway.
+                if(input_.size()>=rvcSlack/block){publish(frames,false);++skips;continue;} // Would miss the playout deadline anyway.
                 const auto begin=std::chrono::steady_clock::now();
                 // A new stream id after a skip makes the server reset its crossfade instead of joining across the gap.
-                const bool ok=rvcRequest(chunk.data(),output.data(),frames,config,streamBase_+(static_cast<uint64_t>(chunkGeneration)<<8)+(skips&255));
+                const auto stream=streamBase_+(static_cast<uint64_t>(chunkGeneration)<<8)+(skips&255);
+                const bool ok=hooks_ && hooks_->request?hooks_->request(hooks_->context,chunk.data(),output.data(),frames,config,stream):rvcRequest(chunk.data(),output.data(),frames,config,stream);
                 stats_.rvcLatencyMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 lastFailed_=!ok;
                 publish(frames,ok);
@@ -192,10 +202,9 @@ class RvcClient {
         }
     }
 public:
-    explicit RvcClient(Stats& stats,std::atomic<uint64_t>& config):stats_(stats),config_(config),worker_([this](std::stop_token stop){run(stop);}) {}
+    explicit RvcClient(Stats& stats,std::atomic<uint64_t>& config,const Hooks* hooks=nullptr):stats_(stats),config_(config),hooks_(hooks),worker_([this](std::stop_token stop){run(stop);}) {}
     ~RvcClient() {worker_.request_stop();SetEvent(data_.h);worker_.join();}
-    void process(float* samples,unsigned count,bool enabled,uint8_t* modified=nullptr) {
-        enabled_=enabled;
+    void process(float* samples,bool enabled,uint8_t* modified=nullptr) {
         const auto config=config_.load();
         if(enabled!=active_ || config!=previousConfig_) {
             previousConfig_=config;active_=enabled;
@@ -205,16 +214,14 @@ public:
         if(!enabled) return; // Exact dry bypass.
         const auto generation=generation_.load();
         if(generation!=seenGeneration_){seenGeneration_=generation;output_.trim(0);} // Before this generation's first push, so no fresh chunk can be trimmed.
-        std::array<RvcSample,block> tagged{};
-        const auto n=std::min(count,block);
-        for(unsigned i=0;i<n;++i)tagged[i]={samples[i],generation};
-        if(!input_.push(tagged.data(),n)) {
+        InputBlock input;std::copy_n(samples,block,input.samples.begin());input.config=config;input.generation=generation;
+        if(!input_.push(&input,1)) {
             generation_.fetch_add(1);SetEvent(data_.h);
-            std::fill_n(samples,count,0.0f);if(modified)std::fill_n(modified,count,static_cast<uint8_t>(ModifiedEffects));
+            std::fill_n(samples,block,0.0f);if(modified)std::fill_n(modified,block,static_cast<uint8_t>(ModifiedEffects));
             stats_.rvcState=3;return;
         }
         SetEvent(data_.h);
-        const int state=playout_.process(output_,samples,n,modified,RvcSettings::unpack(config).chunkMs*48+rvcSlack,generation);
+        const int state=playout_.process(output_,samples,block,modified,RvcSettings::unpack(config).chunkMs*48+rvcSlack,generation);
         stats_.rvcState=lastFailed_?3:state;
     }
 };
@@ -223,7 +230,7 @@ void checkRvcIdle() {
     auto rvc=std::make_unique<RvcClient>(stats,config);
     std::array<float,block> samples{};samples.fill(0.125f);const auto dry=samples;
     for(int pass=0;pass<2;++pass) {
-        rvc->process(samples.data(),block,false);
+        rvc->process(samples.data(),false);
         if(samples!=dry || stats.rvcState!=0)throw std::runtime_error("Disabled RVC changed audio/state");
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -231,6 +238,52 @@ void checkRvcIdle() {
     rvc.reset(); // Destructor must wake the indefinitely sleeping worker.
     if(std::chrono::steady_clock::now()-begin>std::chrono::seconds(1))throw std::runtime_error("Idle RVC shutdown stalled");
     std::cout<<"RVC IDLE CHECK PASSED: dry bypass and sleeping-worker shutdown; no model loaded\n";
+    for(unsigned order=0;order<3;++order) {
+        const RvcSettings old{3,100,20,100,-12},fresh{4,150,40,200,12};
+        struct Schedule {
+            Event paused,resume;std::atomic<bool> pause{true};
+            std::atomic<bool> timedOut{false},valid{true};std::atomic<unsigned> requests{0};
+            RvcSettings expected;
+        } schedule;
+        schedule.expected=order==0?old:fresh;
+        schedule.pause=order!=2;
+        RvcClient::Hooks hooks{&schedule,[](void* context){
+            auto& s=*static_cast<Schedule*>(context);if(!s.pause.exchange(false))return;
+            SetEvent(s.paused.h);
+            if(WaitForSingleObject(s.resume.h,2000)!=WAIT_OBJECT_0)s.timedOut=true;
+        },[](void* context,float* in,float* out,unsigned frames,const RvcSettings& settings,uint64_t){
+            auto& s=*static_cast<Schedule*>(context);++s.requests;
+            if(settings.packed()!=s.expected.packed() || frames!=s.expected.chunkMs*48 ||
+               !std::all_of(in,in+frames,[&](float v){return std::abs(v-0.1f*s.expected.gain/100)<1e-6f;}))s.valid=false;
+            std::fill_n(out,frames,settings.pitch/100.0f);return true;
+        }};
+        Stats checked;std::atomic<uint64_t> setting{old.packed()};
+        auto client=std::make_unique<RvcClient>(checked,setting,&hooks);
+        struct Resume {HANDLE event;~Resume(){SetEvent(event);}} resume{schedule.resume.h};
+        auto feed=[&](unsigned blocks,bool enabled=true){for(unsigned i=0;i<blocks;++i){samples.fill(0.1f);client->process(samples.data(),enabled);}};
+        feed(1);
+        if(order==2){
+            const auto drained=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+            while(client->input_.size() && std::chrono::steady_clock::now()<drained)std::this_thread::yield();
+            if(client->input_.size())throw std::runtime_error("RVC worker did not consume the initial enabled block");
+            schedule.pause=true;feed(1,false);
+        }
+        if(WaitForSingleObject(schedule.paused.h,1000)!=WAIT_OBJECT_0)throw std::runtime_error("RVC worker did not reach the drain barrier");
+        if(order==0)feed(old.chunkMs*48/block-1);
+        setting=fresh.packed();
+        if(order!=0)feed(fresh.chunkMs*48/block);
+        SetEvent(schedule.resume.h);
+        const auto frames=schedule.expected.chunkMs*48;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        while(client->output_.size()<frames && std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+        std::vector<RvcSample> converted(frames);
+        if(!client->output_.pop(converted.data(),frames) || schedule.timedOut || !schedule.valid || schedule.requests!=1)
+            throw std::runtime_error("RVC worker lost its queued settings or re-enabled input");
+        const auto generation=client->generation_.load();
+        for(const auto& v:converted)if(v.generation!=generation || v.sample!=schedule.expected.pitch/100.0f)
+            throw std::runtime_error("RVC worker published the wrong generation or conversion");
+    }
+    std::cout<<"RVC WORKER CHECK PASSED: queued snapshots, new-generation settings and re-enable; synthetic requests only\n";
 }
 void checkRvc() {
     Stats stats;std::atomic<uint64_t> config{RvcSettings{}.packed()};auto rvc=std::make_unique<RvcClient>(stats,config);std::array<float,block> samples{};
@@ -239,7 +292,7 @@ void checkRvc() {
     for(unsigned pass=0;pass<350;++pass) {
         for(unsigned i=0;i<block;++i) samples[i]=static_cast<float>(0.08*std::sin(2*3.141592653589793*220*(pass*block+i)/rate));
         const auto dry=samples;
-        rvc->process(samples.data(),block,true);
+        rvc->process(samples.data(),true);
         const bool zero=std::all_of(samples.begin(),samples.end(),[](float v){return v==0;});
         if(pass<priming && !zero)throw std::runtime_error("RVC leaked audio before its fixed delay elapsed");
         if(pass>=priming+30){++steady;if(zero)++silent;else if(samples!=dry)++converted;}
@@ -248,7 +301,7 @@ void checkRvc() {
     }
     if(converted<steady*8/10 || stats.rvcLatencyMs<=0) throw std::runtime_error("RVC worker mostly returned silence or dry audio");
     samples.fill(0.125f);const auto dry=samples;
-    rvc->process(samples.data(),block,false);
+    rvc->process(samples.data(),false);
     if(samples!=dry || stats.rvcState!=0)throw std::runtime_error("Disabled RVC changed audio");
     std::cout<<"RVC CHECK PASSED: priming_blocks="<<priming<<" converted="<<converted<<'/'<<steady<<" steady blocks, silent="<<silent<<"; disabled bypass\n";
 }
@@ -550,14 +603,25 @@ public:
         } catch(...) { release(); throw; }
     }
     ~Afx() { release(); }
-    void strength(float f) { ok(setFloat_(handle_,NVAFX_PARAM_INTENSITY_RATIO,f),f>1?"NVIDIA rejected experimental intensity above 100%; return to 100%":"Intensity"); }
-    void reset() {
+    void strength(float f,std::stop_token stop={}) {
+        if(!stop.stop_requested())ok(setFloat_(handle_,NVAFX_PARAM_INTENSITY_RATIO,f),f>1?"NVIDIA rejected experimental intensity above 100%; return to 100%":"Intensity");
+    }
+    void reset(std::stop_token stop={}) {
+        if(stop.stop_requested())return;
         if(version_!=1) {ok(reset_(handle_),"Reset effect");return;}
         // SDK 3.0 v1 adds 10 ms of delay on each live Reset; flush its audio history instead.
         std::array<float,block> silence{},discard{};
-        for(unsigned i=0;i<20;++i) process(silence.data(),discard.data());
+        for(unsigned i=0;i<20 && !stop.stop_requested();++i)process(silence.data(),discard.data(),stop);
     }
-    void process(const float* in,float* out) { ok(run_(handle_,&in,&out,block,1),"Process audio"); }
+    void process(const float* in,float* out,std::stop_token stop={}) {
+        if(!stop.stop_requested())ok(run_(handle_,&in,&out,block,1),"Process audio");
+    }
+};
+struct StereoAfx {
+    Afx* left;Afx* right;
+    void process(const float* in,float* out,std::stop_token stop={}){left->process(in,out,stop);right->process(in+block,out+block,stop);}
+    void strength(float value,std::stop_token stop={}){left->strength(value,stop);right->strength(value,stop);}
+    void reset(std::stop_token stop={}){left->reset(stop);right->reset(stop);}
 };
 
 void checkDenoiseContinuity(Config config) {
@@ -593,6 +657,31 @@ void checkDenoiseContinuity(Config config) {
         std::cout<<"NVIDIA v"<<version<<" delay_ms="<<delay/48.0f<<" unaligned_blocks_before="<<misaligned
                  <<" aligned_after=PASS (synthetic, zero suppression, no devices opened)\n";
     }
+    config.version=2;config.intensity=0;
+    Afx left(config),right(config);
+    const unsigned delay=measureDenoiseDelay(left,0);
+    if(measureDenoiseDelay(right,0)!=delay)throw std::runtime_error("Headphone denoiser channel delays differ");
+    StereoAfx stereo{&left,&right};Stats stats;
+    DenoiseWorker<StereoAfx,2> worker(stereo,stats,0);
+    DenoisePlayout leftPlayout(delay),rightPlayout(delay);
+    std::array<float,block*2> in{},out{};
+    for(unsigned frame=0;frame<90;++frame) {
+        for(unsigned i=0;i<block;++i){in[i]=0.1f+(frame*block+i)*0.00001f;in[i+block]=-0.2f-(frame*block+i)*0.00001f;}
+        const bool skip=(frame>=18 && frame<=22) || frame==55;
+        const bool processed=worker.process(in.data(),out.data(),0,false,std::chrono::milliseconds(200),skip);
+        if(processed==skip)throw std::runtime_error("Stereo denoiser missed its offline test deadline");
+        if(!processed)out=in;
+        leftPlayout.process(in.data(),out.data(),processed);
+        rightPlayout.process(in.data()+block,out.data()+block,processed);
+        for(unsigned i=block/2;i<block;++i) {
+            const unsigned sample=frame*block+i;
+            const float wantLeft=sample<delay?0:0.1f+(sample-delay)*0.00001f;
+            const float wantRight=sample<delay?0:-0.2f-(sample-delay)*0.00001f;
+            if(!std::isfinite(out[i]) || !std::isfinite(out[i+block]) || std::abs(out[i]-wantLeft)>0.0001f || std::abs(out[i+block]-wantRight)>0.0001f)
+                throw std::runtime_error("Stereo NVIDIA fallback/recovery changed the audio timeline: frame="+std::to_string(frame)+" sample="+std::to_string(i));
+        }
+    }
+    std::cout<<"NVIDIA v2 stereo delay_ms="<<delay/48.0f<<" paired worker fallback/recovery=PASS (synthetic, zero suppression, no devices opened)\n";
 }
 
 void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigned seconds,const std::filesystem::path& csv,bool churn,unsigned resetEvery) {
@@ -600,7 +689,7 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
         throw std::runtime_error("Invalid benchmark input");
     for(float v:samples) if(!std::isfinite(v) || std::abs(v)>1) throw std::runtime_error("Invalid PCM sample");
     if(std::filesystem::exists(csv)) throw std::runtime_error("Benchmark report already exists");
-    struct Timing {double run, cpu, late;};
+    struct Timing {double run,cpu,late;uint64_t cycles;int64_t qpc;};
     std::vector<Timing> timings; timings.reserve(seconds*100);
     std::vector<float> rendered; rendered.reserve(seconds*rate);
     auto cpu=[] {
@@ -609,6 +698,14 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
         return ((static_cast<uint64_t>(kernel.dwHighDateTime)<<32)|kernel.dwLowDateTime)+
                ((static_cast<uint64_t>(user.dwHighDateTime)<<32)|user.dwLowDateTime);
     };
+    // Raw CPU cycles supplement wall time; they are not elapsed milliseconds.
+    auto cycles=[] {
+        ULONG64 value=0;
+        if(!QueryThreadCycleTime(GetCurrentThread(),&value))throw std::runtime_error("Thread cycle timing failed");
+        return value;
+    };
+    LARGE_INTEGER qpcFrequency{},anchorQpc{};FILETIME anchorUtc{};
+    if(!QueryPerformanceFrequency(&qpcFrequency))throw std::runtime_error("QPC frequency unavailable");
     Afx fx(config); Mmcss priority;
     std::array<float,block> in{},out{};
     for(unsigned i=0;i<20;++i) fx.process(samples.data()+(i%(samples.size()/block))*block,out.data());
@@ -618,6 +715,8 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
     HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     if(!timer) throw std::runtime_error("Benchmark timer creation failed");
     struct Timer {HANDLE h; ~Timer(){CloseHandle(h);}} closeTimer{timer};
+    GetSystemTimePreciseAsFileTime(&anchorUtc);
+    if(!QueryPerformanceCounter(&anchorQpc))throw std::runtime_error("Benchmark clock anchor unavailable");
     auto due=Clock::now();
     for(unsigned frame=0;frame<seconds*100;++frame) {
         const auto remaining=std::chrono::duration_cast<std::chrono::nanoseconds>(due-Clock::now()).count();
@@ -636,20 +735,27 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
             const double ms=std::chrono::duration<double,std::milli>(Clock::now()-begin).count();resetMs+=ms;resetMax=std::max(resetMax,ms);
         }
         else if(churn && frame && frame%100==0) fx.strength((frame/100)%2?0.5f:config.intensity);
-        const auto beforeCpu=cpu(); const auto begin=Clock::now();
+        const auto beforeCpu=cpu();const auto beforeCycles=cycles();LARGE_INTEGER startQpc{};
+        if(!QueryPerformanceCounter(&startQpc))throw std::runtime_error("Benchmark QPC unavailable");
+        const auto begin=Clock::now();
         fx.process(in.data(),out.data());
-        const auto end=Clock::now(); const auto afterCpu=cpu();
+        const auto end=Clock::now();const auto afterCycles=cycles();const auto afterCpu=cpu();
         timings.push_back({std::chrono::duration<double,std::milli>(end-begin).count(),(afterCpu-beforeCpu)/10000.0,
-            std::chrono::duration<double,std::milli>(begin-due).count()});
+            std::chrono::duration<double,std::milli>(begin-due).count(),afterCycles-beforeCycles,startQpc.QuadPart});
         for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("Non-finite benchmark output");
         rendered.insert(rendered.end(),out.begin(),out.end());
         due+=std::chrono::milliseconds(10);
     }
-    std::ofstream report(csv); report<<"frame,run_ms,thread_cpu_ms,start_late_ms\n";
-    for(size_t i=0;i<timings.size();++i) {auto& t=timings[i];report<<i<<','<<t.run<<','<<t.cpu<<','<<t.late<<'\n';}
+    std::ofstream report(csv);report<<"frame,run_ms,thread_cpu_ms,start_late_ms,thread_cycles,start_qpc\n";
+    for(size_t i=0;i<timings.size();++i){auto& t=timings[i];report<<i<<','<<t.run<<','<<t.cpu<<','<<t.late<<','<<t.cycles<<','<<t.qpc<<'\n';}
+    std::ofstream metadata(csv.wstring()+L".meta.json");
+    metadata<<"{\"schema\":1,\"qpc_frequency\":"<<qpcFrequency.QuadPart<<",\"anchor_qpc\":"<<anchorQpc.QuadPart
+        <<",\"anchor_utc_filetime\":"<<((static_cast<uint64_t>(anchorUtc.dwHighDateTime)<<32)|anchorUtc.dwLowDateTime)
+        <<",\"process_id\":"<<GetCurrentProcessId()<<",\"thread_id\":"<<GetCurrentThreadId()<<",\"version\":"<<config.version
+        <<",\"cuda_graphs_requested\":"<<config.cudaGraphs<<",\"frames\":"<<timings.size()<<"}\n";
     std::ofstream pcm(csv.wstring()+L".f32",std::ios::binary);
     pcm.write(reinterpret_cast<const char*>(rendered.data()),rendered.size()*sizeof(float));
-    if(!report || !pcm) throw std::runtime_error("Benchmark report write failed");
+    if(!report || !metadata || !pcm)throw std::runtime_error("Benchmark report write failed");
     if(resets) std::cout<<"version="<<config.version<<" resets="<<resets<<" reset_avg_ms="<<resetMs/resets<<" reset_max_ms="<<resetMax<<"\n";
 }
 
@@ -899,6 +1005,7 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask,bool raw) {
                     if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY){queue.trim(0);primed=false;}
                     downmix.process(reinterpret_cast<const float*>(bytes),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
                     check(capture->ReleaseBuffer(n),"Monitor capture release");
+                    if(!effectsOnly)engine_.trace.write(AudioTrace::Monitor,mono.data(),n);
                     if(!effectsOnly && !queue.push(mono.data(),n)){queue.trim(0);primed=false;}
                     captured=std::chrono::steady_clock::now();
                     check(capture->GetNextPacketSize(&n),"Monitor next packet");
@@ -1186,17 +1293,21 @@ void Engine::dspLoop(Config c) {
                     if(runMs>stats.secondRunMaxMs.load(std::memory_order_relaxed)) stats.secondRunMaxMs.store(runMs,std::memory_order_relaxed);
                 }
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
-                stats.processMs=ms; stats.maxProcessMs=std::max(stats.maxProcessMs.load(),ms);
-                second.processMaxMs=std::max(second.processMaxMs,ms);
+                stats.processMs=ms;
+                trace.write(AudioTrace::Input,in.data(),block);trace.write(AudioTrace::Denoiser,out.data(),block);
+                trace.mark({static_cast<uint8_t>((denoised?AudioTrace::Denoised:0)|(catchUp?AudioTrace::CatchUp:0)|(reset?AudioTrace::Reset:0)|(gpu?AudioTrace::Gpu:0)),
+                    static_cast<uint16_t>(std::min(ms*1000.0f,65535.0f)),static_cast<uint16_t>(std::min<size_t>(captured_.size(),65535)),
+                    static_cast<uint16_t>(std::min<size_t>(cleaned_.size(),65535))});
                 second.inMaxMs=std::max(second.inMaxMs,captured_.size()/48.0f);
                 second.outMinMs=std::min(second.outMinMs,cleaned_.size()/48.0f);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
                 if(gpu || cpu.state) denoisePlayout.process(in.data(),out.data(),denoised,reset);
                 for(float& v:out) v=std::clamp(v,-1.0f,1.0f);
+                trace.write(AudioTrace::Playout,out.data(),block);
                 // RVC belongs to the microphone path only: it runs before the Discord source switch, so
                 // the converted voice also feeds the background mix while a Discord effect is held.
                 modified.fill(0);
-                rvc->process(out.data(),block,rvcEnabled.load() && !muted,modified.data());
+                rvc->process(out.data(),rvcEnabled.load() && !muted,modified.data());
                 // Keep raw input for effects and a gated copy for live/background voice.
                 // RVC is still voice: its monitor marks must not bypass the gate.
                 microphoneRaw=out;microphone=out;
@@ -1313,6 +1424,10 @@ void Engine::dspLoop(Config c) {
                 soundPlaying=sounds.playing();soundPosition=sounds.position();soundLength=sounds.length();
                 for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,((fromDiscord&&!echoHeld)||replay)?microphone[i]:0,sound[i],recording[i],echoMicOut[i],echoDiscordOut[i]};
                 if(!cleaned_.push(routed.data(),block)) ++stats.drops;
+                trace.write(AudioTrace::Output,out.data(),block);
+                const float blockMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
+                stats.maxProcessMs=std::max(stats.maxProcessMs.load(),blockMs);
+                second.processMaxMs=std::max(second.processMaxMs,blockMs);
                 ++stats.processed;
                 stats.inputQueue=static_cast<unsigned>(captured_.size());
                 if(++perfBlocks==100) {
@@ -1350,6 +1465,7 @@ void Engine::preview(const float* audio,const float* echo,const RoutedSample* ro
             if((mask&ModifiedEffects) && audible && routed[at].epoch==epoch && echo[at]!=0){
                 samples[i].value+=echo[at];samples[i].modified|=ModifiedEffects;
             }
+                samples[i].value=std::clamp(samples[i].value,-1.0f,1.0f);
         }
         // Preview must never block or trim from the producer side.
         if(!preview_.push(samples.data(),n))break;
@@ -1667,33 +1783,54 @@ void Headphones::dspLoop(bool denoise) {
         Config c;c.version=2;c.intensity=intensity;c.sdk=projectRoot()/L"vendor/nvidia-afx-3.0.0";
         std::unique_ptr<Afx> leftFx,rightFx;
         if(denoise){leftFx=std::make_unique<Afx>(c);if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0)return;rightFx=std::make_unique<Afx>(c);}
+        unsigned delay=0;
+        if(leftFx) {
+            if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0)return;
+            delay=measureDenoiseDelay(*leftFx,c.intensity);
+            if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0)return;
+            if(measureDenoiseDelay(*rightFx,c.intensity)!=delay)throw std::runtime_error("Headphone denoiser channel delays differ");
+            if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0)return;
+        }
+        DenoisePlayout leftPlayout(delay),rightPlayout(delay);
+        StereoAfx stereo{leftFx.get(),rightFx.get()};
+        Stats workerStats;
+        // One job and one deadline keep both channels on the same wet/dry timeline.
+        std::unique_ptr<DenoiseWorker<StereoAfx,2>> gpu;
+        if(leftFx)gpu=std::make_unique<DenoiseWorker<StereoAfx,2>>(stereo,workerStats,c.intensity);
         PitchEffect leftPitch,rightPitch;
         GrainReverse leftReverse,rightReverse;bool reversing=false;
         std::array<StereoSample,block> samples{};
-        std::array<float,block> left{},right{},outLeft{},outRight{};
-        unsigned generation=epoch_;float strength=intensity;
+        std::array<float,block*2> input{},output{};
+        unsigned generation=epoch_;
+        constexpr unsigned bufferMs=40;
         SetEvent(ready_);Mmcss priority;
         HANDLE waits[]={stop_,data_};
         while(WaitForMultipleObjects(2,waits,FALSE,INFINITE)==WAIT_OBJECT_0+1) {
-            while(WaitForSingleObject(stop_,0)!=WAIT_OBJECT_0 && captured_.pop(samples.data(),block)) {
+            while(WaitForSingleObject(stop_,0)!=WAIT_OBJECT_0) {
+                if(captured_.size()>bufferMs*48+block*2){captured_.trim(block*2);++drops;}
+                if(!captured_.pop(samples.data(),block))break;
                 const unsigned current=epoch_;
                 if(samples.front().epoch!=current || samples.back().epoch!=current)continue;
-                if(generation!=current){if(leftFx){leftFx->reset();rightFx->reset();}leftPitch.reset();rightPitch.reset();leftReverse.reset();rightReverse.reset();generation=current;}
-                for(unsigned i=0;i<block;++i){left[i]=samples[i].left;right[i]=samples[i].right;}
-                if(leftFx) {
-                    const float next=intensity;
-                    if(next!=strength){leftFx->strength(next);rightFx->strength(next);strength=next;}
-                    leftFx->process(left.data(),outLeft.data());rightFx->process(right.data(),outRight.data());
-                } else {outLeft=left;outRight=right;}
+                const bool reset=generation!=current;
+                if(reset){leftPitch.reset();rightPitch.reset();leftReverse.reset();rightReverse.reset();generation=current;}
+                for(unsigned i=0;i<block;++i){input[i]=samples[i].left;input[i+block]=samples[i].right;}
+                if(gpu) {
+                    const auto reserve=std::chrono::microseconds(cleaned_.size()*1000/48);
+                    const auto budget=std::max<std::chrono::microseconds>(std::chrono::milliseconds(8),reserve-std::chrono::milliseconds(10));
+                    const bool denoised=gpu->process(input.data(),output.data(),intensity,reset,budget,dspBehind(captured_.size(),bufferMs));
+                    if(!denoised)output=input;
+                    leftPlayout.process(input.data(),output.data(),denoised,reset);
+                    rightPlayout.process(input.data()+block,output.data()+block,denoised,reset);
+                } else output=input;
                 const int tone=pitch;
-                leftPitch.process(outLeft.data(),block,tone,tone!=0);
-                rightPitch.process(outRight.data(),block,tone,tone!=0);
+                leftPitch.process(output.data(),block,tone,tone!=0);
+                rightPitch.process(output.data()+block,block,tone,tone!=0);
                 // Off adds no latency; each switch starts from empty grains (no old tail).
                 if(const bool want=reverse;want!=reversing){leftReverse.reset();rightReverse.reset();reversing=want;}
-                if(reversing){leftReverse.process(outLeft.data(),block);rightReverse.process(outRight.data(),block);}
+                if(reversing){leftReverse.process(output.data(),block);rightReverse.process(output.data()+block,block);}
                 for(unsigned i=0;i<block;++i){
-                    if(!std::isfinite(outLeft[i])||!std::isfinite(outRight[i]))throw std::runtime_error("Non-finite headphone audio");
-                    samples[i]={std::clamp(outLeft[i],-1.f,1.f),std::clamp(outRight[i],-1.f,1.f),current};
+                    if(!std::isfinite(output[i])||!std::isfinite(output[i+block]))throw std::runtime_error("Non-finite headphone audio");
+                    samples[i]={std::clamp(output[i],-1.f,1.f),std::clamp(output[i+block],-1.f,1.f),current};
                 }
                 if(!cleaned_.push(samples.data(),block))++drops;
                 ++processed;
@@ -1818,6 +1955,60 @@ static std::string utcText(uint64_t filetime,bool timeOnly) {
     if(timeOnly) sprintf_s(text,"%02u:%02u:%02u",t.wHour,t.wMinute,t.wSecond);
     else sprintf_s(text,"%04u-%02u-%02uT%02u:%02uZ",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute);
     return text;
+}
+// rms: level dBFS; hf: first-difference energy against signal energy, dB (rises with added
+// broadband hash); pulse: the strongest 10 ms block phase of that difference energy against the
+// median phase (about 1 for clean audio, block-boundary artifacts raise it); clip: full-scale samples.
+std::string AudioTrace::describe(const int16_t* tap,uint64_t written) {
+    const uint64_t count=std::min<uint64_t>(written,length);
+    if(count<block*2) return "empty";
+    double xx=0,dd=0;std::array<double,block> phase{};unsigned clipped=0;
+    double previous=tap[(written-count)%length]/32768.0;
+    for(uint64_t i=written-count;i<written;++i) {
+        const int16_t raw=tap[i%length];const double x=raw/32768.0,d=x-previous;previous=x;
+        xx+=x*x;dd+=d*d;phase[i%block]+=d*d;if(raw>=32767 || raw<=-32767)++clipped;
+    }
+    auto sorted=phase;std::nth_element(sorted.begin(),sorted.begin()+block/2,sorted.end());
+    const double median=sorted[block/2],strongest=*std::max_element(phase.begin(),phase.end());
+    char text[128];
+    sprintf_s(text,"rms=%.1f hf=%.1f pulse=%.2f clip=%u",10*std::log10(xx/count+1e-12),10*std::log10((dd+1e-20)/(xx+1e-20)),
+        median>0?strongest/median:0.0,clipped);
+    return text;
+}
+std::string AudioTrace::save(const std::filesystem::path& wav) const {
+    std::vector<int16_t> samples;std::array<uint64_t,Taps> written;std::vector<Block> marks;uint64_t marked;
+    {std::lock_guard lock(mutex_);samples=samples_;written=written_;marks=blocks_;marked=marked_;}
+    std::ofstream out(wav,std::ios::binary);
+    const auto u32=[&](uint32_t v){out.write(reinterpret_cast<const char*>(&v),4);};
+    const auto u16=[&](uint16_t v){out.write(reinterpret_cast<const char*>(&v),2);};
+    const uint32_t bytes=length*Taps*2;
+    out.write("RIFF",4);u32(36+bytes);out.write("WAVEfmt ",8);u32(16);u16(1);u16(Taps);u32(rate);u32(rate*Taps*2);u16(Taps*2);u16(16);
+    out.write("data",4);u32(bytes);
+    // Each channel ends at its newest sample; the start of a tap shorter than 30 s is silence.
+    std::vector<int16_t> frame(Taps);
+    for(uint64_t i=0;i<length;++i) {
+        for(unsigned t=0;t<Taps;++t) {
+            const uint64_t missing=written[t]<length?length-written[t]:0;
+            frame[t]=i<missing?0:samples[size_t{t}*length+(written[t]-length+i)%length];
+        }
+        out.write(reinterpret_cast<const char*>(frame.data()),Taps*2);
+    }
+    std::ofstream csv(wav.wstring()+L".csv");
+    csv<<"block,denoised,catch_up,reset,gpu,run_us,in_queue,out_queue\n";
+    unsigned denoised=0,catchUp=0,resets=0,runMax=0;
+    for(uint64_t k=marked>blocks?marked-blocks:0;k<marked;++k) {
+        const auto& b=marks[k%blocks];
+        csv<<k<<','<<(b.flags&Denoised?1:0)<<','<<(b.flags&CatchUp?1:0)<<','<<(b.flags&Reset?1:0)<<','<<(b.flags&Gpu?1:0)<<','
+           <<b.runUs<<','<<b.inQueue<<','<<b.outQueue<<'\n';
+        denoised+=(b.flags&Denoised)!=0;catchUp+=(b.flags&CatchUp)!=0;resets+=(b.flags&Reset)!=0;runMax=std::max<unsigned>(runMax,b.runUs);
+    }
+    if(!out || !csv) throw std::runtime_error("Sound trace write failed");
+    std::ostringstream summary;
+    const char* names[]={"in","dfn","play","out","mon"};
+    summary<<"trace "<<utf8(wav.filename().wstring())<<" blocks="<<std::min<uint64_t>(marked,blocks)<<" denoised="<<denoised
+           <<" catch_up="<<catchUp<<" resets="<<resets<<" run_max_us="<<runMax<<" missed="<<missed_.load();
+    for(unsigned t=0;t<Taps;++t) summary<<" | "<<names[t]<<' '<<describe(samples.data()+size_t{t}*length,written[t]);
+    return summary.str();
 }
 static void perfCounts(std::ostream& out,const PerfSecond& s) {
     const std::pair<const char*,unsigned> counts[]={{"late",s.late},{"catch_up",s.catchUp},{"capture_gaps",s.gaps},{"underruns",s.underruns},

@@ -15,6 +15,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <string>
+#include <stop_token>
 #include <thread>
 #include <vector>
 #include "hotkeys.hpp"
@@ -243,11 +244,14 @@ public:
 // Runs the GPU denoiser beside the DSP thread. A game's graphics held one NVIDIA run for up to
 // 263 ms; waiting for it starved the output and the voice chopped on and off. The DSP waits only
 // as long as its output reserve allows, then passes that block dry; the late result is discarded
-// and the next block goes to the model once it is free. `Fx` needs process/reset/strength.
-template<class Fx> class DenoiseWorker {
+// and the next block goes to the model once it is free. `Fx` stages share a stop token.
+template<class Fx,unsigned Channels=1> class DenoiseWorker {
+    friend void checkDenoiseCancellation();
+    static_assert(Channels==1 || Channels==2);
+    static constexpr unsigned samples=block*Channels;
 public:
     DenoiseWorker(Fx& fx,Stats& stats,float strength):fx_(fx),stats_(stats),applied_(strength),thread_([this]{run();}) {}
-    ~DenoiseWorker() {{std::lock_guard lock(mutex_);stop_=true;}wake_.notify_all();thread_.join();}
+    ~DenoiseWorker() {{std::lock_guard lock(mutex_);stop_.request_stop();}wake_.notify_all();thread_.join();}
     DenoiseWorker(const DenoiseWorker&)=delete;
     DenoiseWorker& operator=(const DenoiseWorker&)=delete;
     // True with the denoised block in `out`; false while the model is busy or past `budget`.
@@ -256,33 +260,38 @@ public:
         if(error_) std::rethrow_exception(error_);
         resetPending_|=reset;
         if(busy_ || skip) return false;
-        std::copy_n(in,block,input_.begin());strength_=strength;busy_=true;
+        std::copy_n(in,samples,input_.begin());strength_=strength;busy_=true;
         const uint64_t mine=++submitted_;
         wake_.notify_all();
         const bool ready=wake_.wait_for(lock,budget,[&]{return finished_==mine || error_;});
         if(error_) std::rethrow_exception(error_);
         if(!ready || finished_!=mine) return false;
-        std::copy_n(output_.begin(),block,out);
+        std::copy_n(output_.begin(),samples,out);
         return true;
     }
 private:
     void run() {
         AudioPriority priority;
-        std::array<float,block> input{},output{};
+        const auto stop=stop_.get_token();
+        std::array<float,samples> input{},output{};
         std::unique_lock lock(mutex_);
         for(;;) {
-            wake_.wait(lock,[&]{return stop_ || (busy_ && started_!=submitted_);});
-            if(stop_) return;
+            wake_.wait(lock,[&]{return stop.stop_requested() || (busy_ && started_!=submitted_);});
+            if(stop.stop_requested()) return;
             started_=submitted_;input=input_;
             const float strength=strength_;const bool reset=std::exchange(resetPending_,false);
             lock.unlock();
             try {
                 using Clock=std::chrono::steady_clock;
                 auto ms=[](Clock::time_point since){return std::chrono::duration<float,std::milli>(Clock::now()-since).count();};
-                if(reset) {const auto begin=Clock::now();fx_.reset();stats_.maxResetMs=std::max(stats_.maxResetMs.load(),ms(begin));stats_.resets.fetch_add(1,std::memory_order_relaxed);}
-                if(strength!=applied_) {const auto begin=Clock::now();fx_.strength(strength);applied_=strength;stats_.reconfigureMs=std::max(stats_.reconfigureMs.load(),ms(begin));}
+                // An in-flight vendor call must return before cancellation can skip the next one.
+                if(stop.stop_requested()) return;
+                if(reset) {const auto begin=Clock::now();fx_.reset(stop);stats_.maxResetMs=std::max(stats_.maxResetMs.load(),ms(begin));stats_.resets.fetch_add(1,std::memory_order_relaxed);}
+                if(stop.stop_requested()) return;
+                if(strength!=applied_) {const auto begin=Clock::now();fx_.strength(strength,stop);applied_=strength;stats_.reconfigureMs=std::max(stats_.reconfigureMs.load(),ms(begin));}
+                if(stop.stop_requested()) return;
                 const auto begin=Clock::now();
-                fx_.process(input.data(),output.data());
+                fx_.process(input.data(),output.data(),stop);
                 const float run=ms(begin);
                 if(run>stats_.maxRunMs.load(std::memory_order_relaxed)){stats_.maxRunMs=run;stats_.maxRunBlock=stats_.processed.load(std::memory_order_relaxed);}
                 if(run>5) stats_.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
@@ -292,6 +301,7 @@ private:
                 lock.lock();error_=std::current_exception();busy_=false;wake_.notify_all();return;
             }
             lock.lock();
+            if(stop.stop_requested()) return;
             output_=output;finished_=started_;busy_=false;
             wake_.notify_all();
         }
@@ -301,9 +311,10 @@ private:
     float applied_;
     std::mutex mutex_;
     std::condition_variable wake_;
-    std::array<float,block> input_{},output_{};
+    std::array<float,samples> input_{},output_{};
     float strength_=1;
-    bool busy_=false,stop_=false,resetPending_=false;
+    bool busy_=false,resetPending_=false;
+    std::stop_source stop_;
     uint64_t submitted_=0,started_=0,finished_=0;
     std::exception_ptr error_;
     std::thread thread_; // Last: the worker starts once every member above exists.
@@ -437,8 +448,46 @@ inline RoutedSample previewQueued(float effectOnly,uint8_t modified,unsigned sam
     const RoutedSample sample{effectOnly,0,modified,sampleEpoch};
     return {previewSample(sample,mask,epoch,audible)+(clip&&audible?sound:0),0,static_cast<uint8_t>(modified|(clip?ModifiedSound|(recording?ModifiedEffects:0):0)),epoch};
 }
+// Developer "black box": the last 30 s of the voice at five points of the chain plus one record per
+// DSP block, written to disk only when the user sends a report. Audio threads try-lock and never
+// allocate; a write lost to a contended lock is counted. The four DSP taps share one timeline; the
+// monitor tap runs on its own clock and is only roughly aligned.
+class AudioTrace {
+public:
+    enum Tap : unsigned {Input,Denoiser,Playout,Output,Monitor,Taps};
+    static constexpr unsigned length=rate*30,blocks=length/block;
+    enum : uint8_t {Denoised=1,CatchUp=2,Reset=4,Gpu=8};
+    struct Block {uint8_t flags=0;uint16_t runUs=0,inQueue=0,outQueue=0;};
+    AudioTrace():samples_(size_t{Taps}*length),blocks_(blocks) {}
+    void write(Tap tap,const float* x,unsigned n) noexcept {
+        std::unique_lock lock(mutex_,std::try_to_lock);
+        if(!lock.owns_lock()){missed_.fetch_add(1,std::memory_order_relaxed);return;}
+        int16_t* data=samples_.data()+size_t{tap}*length;
+        for(unsigned i=0;i<n;++i)data[(written_[tap]+i)%length]=sample(x[i]);
+        written_[tap]+=n;
+    }
+    void mark(const Block& b) noexcept {
+        std::unique_lock lock(mutex_,std::try_to_lock);
+        if(!lock.owns_lock()){missed_.fetch_add(1,std::memory_order_relaxed);return;}
+        blocks_[marked_++%blocks]=b;
+    }
+    // Writes `wav` (5 channels, 16-bit) and `wav`.csv; returns a one-line summary for the report.
+    std::string save(const std::filesystem::path& wav) const;
+    // Per-tap numbers for the report line, from the newest `length` samples of each tap.
+    static std::string describe(const int16_t* tap,uint64_t written);
+private:
+    static int16_t sample(float v) {return static_cast<int16_t>(std::lround(std::clamp(std::isfinite(v)?v:0.0f,-1.0f,1.0f)*32767));}
+    mutable std::mutex mutex_;
+    std::vector<int16_t> samples_;
+    std::array<uint64_t,Taps> written_{};
+    std::vector<Block> blocks_;
+    uint64_t marked_=0;
+    mutable std::atomic<unsigned> missed_{0};
+};
+
 class Engine {
     friend void checkTagStack();
+    friend void checkPreviewMix();
     friend void checkDiscordCapture(unsigned seconds);
     friend class Monitor;
     HANDLE stop_ = nullptr, data_ = nullptr, ready_ = nullptr;
@@ -488,6 +537,7 @@ public:
     // Counters of the current (or last) session in the sessions.log format, for a live report.
     std::string sessionLine() const;
     PerfHistory perf;
+    AudioTrace trace;
     std::wstring denoiserMessage() const;
     std::atomic<int> state{0}; // Stopped, Loading, WaitingClient, Running, Stopping, Error
     std::atomic<float> volume{1}, boost{3};

@@ -18,7 +18,7 @@ const RVC_MANIFEST_URL: &str =
 /// Per-architecture NVIDIA denoiser models (`models-<arch>.json`); the core ships Ampere only.
 const MODELS_RELEASE: &str =
     "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-models-v3.0.0";
-const MODELS_DIR: &str = "vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models";
+pub(crate) const MODELS_DIR: &str = "vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models";
 /// Bump together with `MODELS_RELEASE` to make every install download newer models. A folder
 /// without `version.txt` came with core v2, which carries 3.0.0 models.
 const MODELS_VERSION: &str = "3.0.0";
@@ -144,14 +144,8 @@ pub fn models_present(root: &Path, arch: Option<&str>) -> bool {
     arch.is_none_or(|a| !MODEL_ARCHS.contains(&a) || models_installed(root, a))
 }
 
-/// A dead server fails the install instead of hanging it. The body has no limit: a gigabyte on a
-/// slow line takes long, and ureq has no idle timeout (the setup card shows a stall instead).
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(std::time::Duration::from_secs(15)))
-        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
-        .build()
-        .into()
+    crate::component_http::agent()
 }
 
 /// Why an install failed, in a few words for the setup card; app.log keeps the full text.
@@ -257,8 +251,7 @@ pub fn install_rvc(components: &Path) -> Result<String, String> {
         Item::Rvc,
         RVC_MANIFEST_URL,
         components,
-        "vendor/vcclient-2.1.4-alpha/dist/main/mnr_vcclient_server.exe",
-        &["vendor/vcclient-2.1.4-alpha"],
+        crate::component_install::Component::Rvc,
     )
 }
 
@@ -271,23 +264,17 @@ pub fn install_core(components: &Path, arch: Option<&str>) -> Result<String, Str
             Item::Core,
             CORE_MANIFEST_URL,
             components,
-            "vendor/nvidia-afx-3.0.0/bin/NVAudioEffects.dll",
-            &[
-                "vendor/nvidia-afx-3.0.0",
-                "vendor/tag-2.0.0.1903-demo",
-            ],
+            crate::component_install::Component::Core,
         )?;
     }
     if let Some(arch) = arch.filter(|a| MODEL_ARCHS.contains(a))
         && !models_installed(components, arch)
     {
-        let entry = format!("{MODELS_DIR}/{arch}");
         let models = install(
             Item::Models,
             &format!("{MODELS_RELEASE}/models-{arch}.json"),
             components,
-            &format!("{entry}/denoiser_48k.trtpkg"),
-            &[&entry],
+            crate::component_install::Component::Models(arch.to_owned()),
         )
         .map_err(|e| format!("модели NVIDIA для {arch}: {e}"))?;
         if version.is_empty() {
@@ -301,9 +288,9 @@ fn install(
     item: Item,
     manifest_url: &str,
     components: &Path,
-    expected: &str,
-    entries: &[&str],
+    component: crate::component_install::Component,
 ) -> Result<String, String> {
+    crate::component_install::prepare(components)?;
     set_stage(item, Phase::Connect, 0);
     let mut response = agent().get(manifest_url).call().map_err(|e| e.to_string())?;
     let envelope: Envelope = serde_json::from_str(
@@ -339,24 +326,7 @@ fn install(
     set_stage(item, Phase::Unpack, total);
     unpack(&archive, &stage)?;
     set_stage(item, Phase::Place, 0);
-    if !stage.join(expected).is_file() {
-        return Err("Архив компонента не содержит ожидаемый файл".into());
-    }
-    for entry in entries {
-        let source = stage.join(entry);
-        let destination = components.join(entry);
-        if destination.is_dir() {
-            std::fs::remove_dir_all(&destination).map_err(|e| e.to_string())?;
-        } else if destination.exists() {
-            std::fs::remove_file(&destination).map_err(|e| e.to_string())?;
-        }
-        std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::rename(source, destination).map_err(|e| e.to_string())?;
-    }
-    if entries.iter().any(|entry| entry.contains("vcclient")) {
-        std::fs::create_dir_all(components.join("vendor/vcclient-2.1.4-alpha/dist/main/model_dir"))
-            .map_err(|e| e.to_string())?;
-    }
+    crate::component_install::place(components, component)?;
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&stage);
     Ok(manifest.version)
@@ -413,14 +383,19 @@ fn download(part: &Part, path: &Path) -> Result<(), String> {
     let mut reader = response.into_parts().1.into_reader();
     let mut output = File::create(path).map_err(|e| e.to_string())?;
     let mut buffer = [0_u8; 1024 * 1024];
+    let mut written = 0_u64;
     loop {
         let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
         if count == 0 {
             break;
         }
+        if count as u64 > part.size.saturating_sub(written) {
+            return Err("Размер загруженной части превышает подписанный манифест".into());
+        }
         output
             .write_all(&buffer[..count])
             .map_err(|e| e.to_string())?;
+        written += count as u64;
         DONE.fetch_add(count as u64, Ordering::Relaxed);
     }
     drop(output);
@@ -561,6 +536,40 @@ mod tests {
         std::fs::write(&path, b"corrupt").unwrap();
         assert!(!cached_part_is_valid(&part, &path));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn downloads_require_exact_signed_size_eof_and_hash() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        for (body, chunked, valid) in [(&b"abc"[..], false, true), (b"ab", false, false),
+            (b"abcd", false, false), (b"abcd", true, false), (b"abd", false, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/part", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 65536);
+                    let mut byte = [0]; stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
+                }
+                if chunked {
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n1\r\nd\r\n0\r\n\r\n");
+                } else {
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = stream.write_all(body);
+                }
+            });
+            let part = Part { url, size: 3, sha256: hex::encode(Sha256::digest(b"abc")) };
+            let path = std::env::temp_dir().join(format!("mnr-download-{}", uuid::Uuid::new_v4()));
+            let result = download(&part, &path);
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), valid, "body={body:?}, chunked={chunked}, result={result:?}");
+            assert!(path.metadata().unwrap().len() <= part.size, "oversized data reached disk");
+            if valid { assert_eq!(std::fs::read(&path).unwrap(), b"abc"); }
+            std::fs::remove_file(path).unwrap();
+        }
     }
     #[test]
     fn models_need_both_files_and_the_current_version() {

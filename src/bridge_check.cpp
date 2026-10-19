@@ -9,6 +9,7 @@
 #include <exception>
 static void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
 namespace mic {
+void checkNativeShutdown();
 void checkStaDevices() {
     std::exception_ptr failure;
     std::thread([&] {
@@ -49,6 +50,7 @@ void checkTagStack() {
 }
 }
 int main(){try{
+    mic::checkNativeShutdown();
     mic::checkStaDevices();
     mic::checkTagStack();
     mic::checkRvcIdle();

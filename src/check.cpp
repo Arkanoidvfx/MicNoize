@@ -9,6 +9,7 @@
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
 #include <fstream>
+#include <cstring>
 
 struct Packet { uint64_t qpc; uint32_t frames, flags; size_t offset; };
 struct Received {
@@ -196,39 +197,190 @@ static void denoisePlayoutTest() {
 static void denoiseWorkerTest() {
     struct SlowFx {
         std::atomic<int> delayMs{0};std::atomic<int> resets{0};
-        void process(const float* in,float* out){std::this_thread::sleep_for(std::chrono::milliseconds(delayMs.load()));for(unsigned i=0;i<mic::block;++i)out[i]=in[i]*0.5f;}
-        void reset(){++resets;}
-        void strength(float){}
+        void process(const float* in,float* out,std::stop_token){std::this_thread::sleep_for(std::chrono::milliseconds(delayMs.load()));for(unsigned i=0;i<mic::block;++i)out[i]=in[i]*0.5f;}
+        void reset(std::stop_token){++resets;}
+        void strength(float,std::stop_token){}
     } fx;
     mic::Stats stats;
     std::array<float,mic::block> in{},out{};in.fill(0.8f);
     using Clock=std::chrono::steady_clock;using std::chrono::milliseconds;
     mic::DenoiseWorker<SlowFx> worker(fx,stats,1);
     require(worker.process(in.data(),out.data(),1,false,milliseconds(200)) && out[0]==0.4f,"Idle GPU worker denoises the block");
-    fx.delayMs=200;
+    constexpr int stallMs=224;fx.delayMs=stallMs;
     auto begin=Clock::now();
     require(!worker.process(in.data(),out.data(),1,false,milliseconds(20)),"A stalled GPU run reports a late block");
     require(Clock::now()-begin<milliseconds(120),"A stalled GPU run held the DSP past its budget");
     begin=Clock::now();
     require(!worker.process(in.data(),out.data(),1,true,milliseconds(20)) && Clock::now()-begin<milliseconds(15),"A busy GPU worker must not make the DSP wait");
-    fx.delayMs=0;
     std::this_thread::sleep_for(milliseconds(300));
+    fx.delayMs=0;
     out.fill(0);
     require(worker.process(in.data(),out.data(),1,true,milliseconds(200)) && out[0]==0.4f,"GPU worker recovers after a stall");
     require(fx.resets.load()==1,"Resets requested while busy collapse into one, run on the worker");
-    require(stats.maxRunMs>150,"Worker records the stalled run");
+    require(stats.maxRunMs>stallMs*0.9f,"Worker records the 224 ms synthetic stalled run");
     require(!worker.process(in.data(),out.data(),1,true,milliseconds(200),true),"Catch-up defers model work");
     require(worker.process(in.data(),out.data(),1,false,milliseconds(200)),"Worker processes after catch-up");
     require(fx.resets.load()==2,"Catch-up must retain a pending model reset");
     struct FailingFx {
-        void process(const float*,float*) {throw std::runtime_error("fake inference failure");}
-        void reset() {} void strength(float) {}
+        void process(const float*,float*,std::stop_token) {throw std::runtime_error("fake inference failure");}
+        void reset(std::stop_token) {} void strength(float,std::stop_token) {}
     } failing;
     mic::DenoiseWorker<FailingFx> failed(failing,stats,1);
     bool threw=false;
     try {failed.process(in.data(),out.data(),1,false,milliseconds(200));}
     catch(const std::runtime_error&) {threw=true;}
     require(threw,"Inference errors must propagate on the waiting call");
+}
+static void stereoDenoiseWorkerTest() {
+    using Clock=std::chrono::steady_clock;using std::chrono::milliseconds;
+    constexpr unsigned delay=mic::block*2;
+    struct DelayedStereo {
+        std::array<float,delay*2> history{};unsigned position=0;
+        std::atomic<bool> holdNext{false};
+        std::atomic<unsigned> resets{0},strengthCalls{0};std::atomic<float> applied{1};
+        std::mutex mutex;std::condition_variable changed;
+        bool entered=false,released=false;Clock::time_point enteredAt{};
+        void process(const float* in,float* out,std::stop_token) {
+            if(holdNext.exchange(false)) {
+                std::unique_lock lock(mutex);entered=true;enteredAt=Clock::now();changed.notify_all();
+                if(!changed.wait_for(lock,milliseconds(2000),[&]{return released;}))throw std::runtime_error("Synthetic stereo stall was not released");
+            }
+            for(unsigned i=0;i<mic::block;++i) {
+                out[i]=history[position];out[i+mic::block]=history[position+delay];
+                history[position]=in[i];history[position+delay]=in[i+mic::block];position=(position+1)%delay;
+            }
+        }
+        void reset(std::stop_token){history.fill(0);position=0;++resets;}
+        void strength(float value,std::stop_token){applied=value;++strengthCalls;}
+    } fx;
+    mic::Stats stats;
+    mic::DenoiseWorker<DelayedStereo,2> worker(fx,stats,1);
+    mic::DenoisePlayout left(delay),right(delay);
+    std::array<float,mic::block*2> in{},out{};
+    unsigned generationFrame=0;Clock::duration waited{};std::array<float,2> raw{};
+    auto marker=[](unsigned sample,unsigned channel){return channel?-.4f-sample*.000001f:.1f+sample*.000001f;};
+    auto render=[&](unsigned frame,bool reset,bool skip,float strength,milliseconds budget,bool retryBusy=false) {
+        for(unsigned i=0;i<mic::block;++i){in[i]=marker(frame*mic::block+i,0);in[i+mic::block]=marker(frame*mic::block+i,1);}
+        out.fill(.95f);bool wet=false;
+        for(unsigned attempt=0;;++attempt) {
+            const auto begin=Clock::now();wet=worker.process(in.data(),out.data(),strength,reset,budget,skip);waited=Clock::now()-begin;
+            if(wet || !retryBusy)break;
+            require(waited<milliseconds(15) && attempt<1000,"Stereo recovery did not finish after the stall was released");
+            std::this_thread::sleep_for(milliseconds(1));
+        }
+        raw={out[mic::block/2],out[mic::block+mic::block/2]};
+        if(!wet){for(float sample:out)require(sample==.95f,"A late stereo job overwrote the caller's output");out=in;}
+        if(reset)generationFrame=frame;
+        left.process(in.data(),out.data(),wet,reset);right.process(in.data()+mic::block,out.data()+mic::block,wet,reset);
+        for(unsigned channel=0;channel<2;++channel)for(unsigned i=mic::block/2;i<mic::block;++i) {
+            const unsigned sample=frame*mic::block+i;
+            const float expected=sample<generationFrame*mic::block+delay?0:marker(sample-delay,channel);
+            require(std::isfinite(out[channel*mic::block+i]) && std::abs(out[channel*mic::block+i]-expected)<.000001f,"Stereo fallback/recovery moved a channel on the capture timeline");
+        }
+        return wet;
+    };
+    for(unsigned frame=0;frame<8;++frame)require(render(frame,false,false,1,milliseconds(200)),"Idle stereo worker missed a block");
+    fx.holdNext=true;
+    require(!render(8,false,false,1,milliseconds(20)),"A stalled stereo pair must fall back together");
+    require(waited<milliseconds(120),"Stereo inference held DSP past one shared deadline");
+    Clock::time_point stalledAt;
+    {std::unique_lock lock(fx.mutex);require(fx.changed.wait_for(lock,milliseconds(1000),[&]{return fx.entered;}),"Stereo stall did not start");stalledAt=fx.enteredAt;}
+    for(unsigned frame=9;frame<30;++frame) {
+        require(!render(frame,frame==9,false,.75f,milliseconds(20)),"A busy stereo worker must keep both channels dry");
+        require(waited<milliseconds(15),"A busy stereo worker waited again");
+    }
+    require(fx.resets==0 && fx.strengthCalls==0,"Busy stereo reconfiguration ran concurrently with inference");
+    std::this_thread::sleep_until(stalledAt+milliseconds(224));
+    {std::lock_guard lock(fx.mutex);fx.released=true;}fx.changed.notify_all();
+    require(render(30,false,false,.75f,milliseconds(200),true),"Stereo worker did not recover");
+    require(raw[0]==0 && raw[1]==0,"Stereo recovery returned the abandoned result or retained pre-reset audio");
+    require(fx.resets==1 && fx.strengthCalls==1 && fx.applied==.75f,"Pending stereo reset/strength was not applied once to the next job");
+    require(stats.maxRunMs>224*.9f,"Stereo worker did not record the 224 ms stall");
+    for(unsigned frame=31;frame<36;++frame)require(render(frame,false,false,.75f,milliseconds(200)),"Stereo recovery lost a block");
+    require(!render(36,true,true,.5f,milliseconds(200)),"Stereo catch-up submitted model work");
+    require(render(37,false,false,.5f,milliseconds(200)),"Stereo worker did not resume after catch-up");
+    require(fx.resets==2 && fx.strengthCalls==2 && fx.applied==.5f,"Stereo catch-up lost its pending reset/strength");
+    for(unsigned frame=38;frame<42;++frame)require(render(frame,false,false,.5f,milliseconds(200)),"Stereo catch-up recovery lost a block");
+    struct FailingStereo {
+        void process(const float*,float* out,std::stop_token){out[mic::block]=.8f;throw std::runtime_error("fake stereo inference failure");}
+        void reset(std::stop_token){}void strength(float,std::stop_token){}
+    } failing;
+    mic::DenoiseWorker<FailingStereo,2> failed(failing,stats,1);bool threw=false;const auto beforeFailure=out;
+    try{failed.process(in.data(),out.data(),1,false,milliseconds(200));}catch(const std::runtime_error&){threw=true;}
+    require(threw && out==beforeFailure,"Stereo inference failure must propagate without publishing a partial pair");
+    std::cout<<"PASS: paired stereo deadline, 224 ms stall, late-result discard, pending reset/strength and aligned recovery\n";
+}
+namespace mic {
+void checkDenoiseCancellation() {
+    using Clock=std::chrono::steady_clock;using std::chrono::milliseconds;
+    enum class Phase {Run,Reset,Strength};
+    auto check=[]<unsigned Channels>(Phase phase) {
+        struct Gate {
+            std::mutex mutex;std::condition_variable changed;
+            bool entered=false,returned=false,released=false,timedOut=false;
+            void hold() {
+                std::unique_lock lock(mutex);entered=true;changed.notify_all();
+                timedOut=!changed.wait_for(lock,milliseconds(2000),[&]{return released;});returned=true;
+            }
+            void release(){{std::lock_guard lock(mutex);released=true;}changed.notify_all();}
+        } gate;
+        struct Fx {
+            Gate& gate;Phase phase;unsigned runs=0,resets=0,strengths=0,runCalls=0,resetCalls=0,strengthCalls=0;
+            void process(const float* in,float* out,std::stop_token stop) {
+                ++runCalls;
+                for(unsigned channel=0;channel<Channels;++channel) {
+                    if(stop.stop_requested())return;
+                    ++runs;if(phase==Phase::Run && channel==0)gate.hold();
+                    std::copy_n(in+channel*block,block,out+channel*block);
+                }
+            }
+            void reset(std::stop_token stop) {
+                ++resetCalls;
+                for(unsigned step=0;step<20*Channels;++step) {
+                    if(stop.stop_requested())return;
+                    ++resets;if(phase==Phase::Reset && step==0)gate.hold();
+                }
+            }
+            void strength(float,std::stop_token stop) {
+                ++strengthCalls;
+                for(unsigned channel=0;channel<Channels;++channel) {
+                    if(stop.stop_requested())return;
+                    ++strengths;if(phase==Phase::Strength && channel==0)gate.hold();
+                }
+            }
+        } fx{gate,phase};
+        Stats stats;
+        auto worker=std::make_unique<DenoiseWorker<Fx,Channels>>(fx,stats,1);
+        struct Release {Gate& gate;~Release(){gate.release();}} release{gate};
+        std::array<float,block*Channels> in{},out{};in.fill(.25f);out.fill(.75f);
+        const bool wet=worker->process(in.data(),out.data(),phase==Phase::Run?1.f:.5f,phase==Phase::Reset,milliseconds(1));
+        std::unique_lock lock(gate.mutex);
+        const bool held=gate.changed.wait_for(lock,milliseconds(1000),[&]{return gate.entered;}) && !gate.returned;
+        if(!held) {
+            gate.released=true;lock.unlock();gate.changed.notify_all();worker.reset();
+            require(false,"Cancellation fixture did not hold its fake vendor call");
+        }
+        const auto* stopping=&worker->stop_;
+        std::atomic<bool> destroyed=false;
+        std::thread destroyer([&]{worker.reset();destroyed=true;});
+        // Holding the fake-call mutex keeps the worker alive while observing its private stop source.
+        const auto deadline=Clock::now()+milliseconds(1000);
+        while(!stopping->stop_requested() && Clock::now()<deadline)std::this_thread::yield();
+        const bool stopped=stopping->stop_requested();
+        const bool waited=stopped && !destroyed.load();
+        gate.released=true;lock.unlock();gate.changed.notify_all();destroyer.join();
+        require(stopped && waited && destroyed && !gate.timedOut,"Worker destruction must wait for the in-flight vendor call");
+        require(!wet && std::all_of(out.begin(),out.end(),[](float value){return value==.75f;}),"Cancelled job must not publish its output");
+        require(fx.runs==(phase==Phase::Run?1u:0u) && fx.resets==(phase==Phase::Reset?1u:0u) && fx.strengths==(phase==Phase::Strength?1u:0u),
+                "Cancellation token must skip later reset steps and stereo channels");
+        require(fx.runCalls==(phase==Phase::Run?1u:0u) && fx.resetCalls==(phase==Phase::Reset?1u:0u) && fx.strengthCalls==(phase==Phase::Strength?1u:0u),
+                "Cancellation must skip stages following a held reset or strength change");
+    };
+    check.operator()<1>(Phase::Run);check.operator()<2>(Phase::Run);
+    check.operator()<1>(Phase::Reset);check.operator()<2>(Phase::Reset);
+    check.operator()<1>(Phase::Strength);check.operator()<2>(Phase::Strength);
+    std::cout<<"PASS: mono/stereo cancellation skips later stages, reset steps and stereo channels; in-flight work stays owned until release\n";
+}
 }
 // Developer-report timeline: minute summaries, incident seconds only, silent gaps named.
 static void perfFormatTest() {
@@ -247,8 +399,45 @@ static void perfFormatTest() {
         || text.find("no processed audio for 41 s")==std::string::npos) throw std::runtime_error("Perf timeline format:\n"+text);
     require(mic::formatPerf({})=="perf: no processed audio seconds\n","Empty perf");
 }
+// Sound black box: ring wrap, channel order and alignment, block CSV, and the pulse number that
+// separates clean noise from a step on every 10 ms block boundary.
+static void audioTraceTest() {
+    auto trace=std::make_unique<mic::AudioTrace>();
+    uint32_t seed=11;std::array<float,mic::block> x{},spiked{};
+    const unsigned total=35*mic::rate/mic::block; // longer than the 30 s ring
+    for(unsigned b=0;b<total;++b) {
+        for(auto& v:x){seed=seed*1664525u+1013904223u;v=((seed>>8)/16777216.0f-0.5f)*0.1f;}
+        if(b+1==total) x.back()=0.5f;
+        spiked=x;spiked[0]+=0.3f;
+        trace->write(mic::AudioTrace::Input,x.data(),mic::block);
+        trace->write(mic::AudioTrace::Output,spiked.data(),mic::block);
+        if(b+100>=total) trace->write(mic::AudioTrace::Denoiser,x.data(),mic::block);
+        trace->mark({static_cast<uint8_t>(b%2?mic::AudioTrace::Denoised:mic::AudioTrace::CatchUp),static_cast<uint16_t>(b%1000),1,2});
+    }
+    const auto wav=std::filesystem::temp_directory_path()/("mnr-trace-"+std::to_string(GetCurrentProcessId())+".wav");
+    const auto csvPath=std::filesystem::path(wav.wstring()+L".csv");
+    const auto summary=trace->save(wav);
+    std::ifstream in(wav,std::ios::binary);std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{});in.close();
+    std::ifstream csv(csvPath);size_t rows=0;for(std::string line;std::getline(csv,line);)++rows;csv.close();
+    std::error_code ignored;std::filesystem::remove(wav,ignored);std::filesystem::remove(csvPath,ignored);
+    constexpr size_t frames=mic::AudioTrace::length,taps=mic::AudioTrace::Taps;
+    require(bytes.size()==44+frames*taps*2,"Sound trace WAV size");
+    const auto at=[&](size_t frame,size_t tap){int16_t v;std::memcpy(&v,bytes.data()+44+(frame*taps+tap)*2,2);return v;};
+    require(at(frames-1,mic::AudioTrace::Input)==16384,"Sound trace ends at the newest input sample");
+    require(at(0,mic::AudioTrace::Denoiser)==0 && at(frames-1,mic::AudioTrace::Denoiser)==16384,"Short tap is right-aligned after silence");
+    require(at(frames/2,mic::AudioTrace::Playout)==0,"Unwritten tap stays silent");
+    require(rows==mic::AudioTrace::blocks+1,"Sound trace CSV keeps the newest 30 s of blocks");
+    const auto pulse=[&](const char* tap){
+        const auto from=summary.find(std::string("| ")+tap+" ");if(from==std::string::npos)return -1.0;
+        const auto p=summary.find("pulse=",from);return p==std::string::npos?-1.0:std::stod(summary.substr(p+6));
+    };
+    if(pulse("in")<0.5 || pulse("in")>1.3 || pulse("out")<3 || summary.find("| mon empty")==std::string::npos
+        || summary.find(" blocks=3000 ")==std::string::npos || summary.find(" missed=0")==std::string::npos)
+        throw std::runtime_error("Sound trace summary: "+summary);
+}
 static void selfTest() {
     perfFormatTest();
+    audioTraceTest();
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
     require(mic::preferredDevice(choices,L"two",L"HyperX")==1,"Saved endpoint wins over name hint");
     require(mic::preferredDevice(choices,L"missing",L"HyperX")==-1,"Missing endpoint must not switch microphones");
@@ -384,8 +573,11 @@ static void protocolTest() {
             SetEvent(server.response);
         }catch(const std::exception& error){serverError=error.what();}
     });
-    const auto started=GetTickCount64();const auto result=client.command(1);responder.join();
-    require(serverError.empty() && result==0 && GetTickCount64()-started>=25,"IPC ignores stale response event");
+    const auto started=std::chrono::steady_clock::now();const auto result=client.command(1);responder.join();
+    // GetTickCount64 can report 16 ms for a real 30 ms wait.
+    const auto elapsedMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    if(!serverError.empty() || result!=0 || elapsedMs<25)throw std::runtime_error("IPC ignores stale response event: result="+std::to_string(result)+
+        " elapsed_ms="+std::to_string(elapsedMs)+" server="+serverError);
     bool expired=false;try{client.command(4);}catch(...){expired=true;}
     require(expired && !client.usable(),"IPC timeout poisons old connection");
     {mic::TagLink::Lock lock(server,100);require(!mic::TagSession{host}.accept(*server.packet,4,GetTickCount64()),"IPC timed-out queued command rejected");}
@@ -401,7 +593,7 @@ int main(int argc,char** argv) {
             mic::checkHeadphones(outputs[index].id,std::stoi(argv[3])!=0);return 0;
         }
         if(argc==2 && std::string(argv[1])=="--discord-capture") { mic::checkDiscordCapture(5); return 0; }
-        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoisePlayoutTest(); denoiseWorkerTest(); protocolTest(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoisePlayoutTest(); denoiseWorkerTest(); stereoDenoiseWorkerTest(); mic::checkDenoiseCancellation(); protocolTest(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }

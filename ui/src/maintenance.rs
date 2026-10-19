@@ -262,7 +262,7 @@ struct Journal {
     #[serde(default,skip_serializing_if="Option::is_none")]
     legacy:Option<LegacyBackup>,
 }
-fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension("tmp");
     let mut file = File::create(&temp).map_err(|e| format!("Создание {}: {e}", temp.display()))?;
     file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?; drop(file);
@@ -808,6 +808,7 @@ pub fn startup() -> Result<bool,String> {
         }
         if process_alive(Some((pid,created))) || applier_alive(&read(&runtime)?){return Err("Установщик не завершился за 5 минут. Повторное восстановление доступно при следующем запуске Mic Noize".into());}
     }
+    crate::component_install::recover(&runtime)?;
     let repair_path=runtime.join(".update/repair.json");
     if repair_path.exists() {
         let _lock=Lock::wait(10000)?;let mut bytes=Vec::new();
