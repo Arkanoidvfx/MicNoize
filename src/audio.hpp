@@ -150,6 +150,11 @@ struct Stats {
     std::atomic<unsigned> tagBufferFrames{0}, tagDriverGaps{0};
     std::atomic<uint64_t> tagFrames{0};
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};
+    // Host-written capture frames Windows has not read yet (TagBufferV1), min/max over the session,
+    // the current report second and the current DSP block; UINT_MAX/0 mean "not seen". Only the TAG
+    // thread lowers/raises them; the DSP thread takes the second/block pairs back.
+    std::atomic<unsigned> tagBufferedMin{UINT_MAX}, tagBufferedMax{0}, secondBufferedMin{UINT_MAX}, secondBufferedMax{0};
+    std::atomic<unsigned> blockBufferedMin{UINT_MAX}, blockBufferedMax{0}, tagStreamOverflows{0}, tagStreamUnderflows{0};
     std::atomic<float> tagMaxWakeMs{0};
     // Per-second maxima for PerfHistory: writers raise them, the DSP takes them once a second.
     std::atomic<float> secondRunMaxMs{0}, secondWakeMaxMs{0};
@@ -160,6 +165,7 @@ struct PerfSecond {
     uint64_t utc=0; // FILETIME when the second's 100th block finished
     float runMaxMs=0, processMaxMs=0, wakeMaxMs=0, outMinMs=0, inMaxMs=0;
     uint16_t late=0, catchUp=0, gaps=0, underruns=0, drops=0, resets=0, tagGaps=0, lateTicks=0, reconnects=0;
+    uint32_t bufferedMin=UINT32_MAX, bufferedMax=0; // TAG capture frames not yet read by Windows
 };
 // Last 15 minutes, allocated once. The DSP thread only try-locks: a second that meets a
 // report copy is skipped, the audio path never waits.
@@ -457,7 +463,7 @@ public:
     enum Tap : unsigned {Input,Denoiser,Playout,Output,Monitor,Taps};
     static constexpr unsigned length=rate*30,blocks=length/block;
     enum : uint8_t {Denoised=1,CatchUp=2,Reset=4,Gpu=8};
-    struct Block {uint8_t flags=0;uint16_t runUs=0,inQueue=0,outQueue=0;};
+    struct Block {uint8_t flags=0;uint16_t runUs=0,inQueue=0,outQueue=0;uint32_t bufferedMin=UINT32_MAX,bufferedMax=0;};
     AudioTrace():samples_(size_t{Taps}*length),blocks_(blocks) {}
     void write(Tap tap,const float* x,unsigned n) noexcept {
         std::unique_lock lock(mutex_,std::try_to_lock);

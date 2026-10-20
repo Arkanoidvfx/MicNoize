@@ -31,6 +31,38 @@ struct TagPacketV2 {
     int result=0;
     float samples[16384]{};
 };
+// Diagnostics only, beside the audio protocol: the host publishes the driver's capture buffer state
+// after each loop pass; the engine reads it if present. An older host has no mapping and an older UI
+// ignores it, so neither audio layout nor host/UI compatibility changes. Seqlock: odd while writing.
+inline constexpr wchar_t tagBufferMapping[]=L"Local\\MicNoize.TagBuffer.v1";
+struct TagBufferV1 {
+    unsigned version=1,bytes=sizeof(TagBufferV1);
+    volatile LONG sequence=0;
+    unsigned running=0,bufferFrames=0,framesBuffered=0,clientPos=0,devicePos=0,overflows=0,underflows=0;
+    ULONGLONG transferred=0;
+};
+inline void publishTagBuffer(TagBufferV1& to,const TagBufferV1& from) {
+    InterlockedIncrement(&to.sequence);
+    to.running=from.running;to.bufferFrames=from.bufferFrames;to.framesBuffered=from.framesBuffered;to.clientPos=from.clientPos;
+    to.devicePos=from.devicePos;to.overflows=from.overflows;to.underflows=from.underflows;to.transferred=from.transferred;
+    InterlockedIncrement(&to.sequence);
+}
+// False while the host is mid-write after a few tries, or for a layout this build does not know.
+inline bool readTagBuffer(const TagBufferV1& from,TagBufferV1& out) {
+    for(unsigned attempt=0;attempt<4;++attempt) {
+        // Plain volatile loads: the reader maps the page read-only, so no interlocked write.
+        const LONG before=from.sequence;
+        if(before&1)continue;
+        MemoryBarrier();
+        out.version=from.version;out.bytes=from.bytes;out.running=from.running;out.bufferFrames=from.bufferFrames;
+        out.framesBuffered=from.framesBuffered;out.clientPos=from.clientPos;out.devicePos=from.devicePos;
+        out.overflows=from.overflows;out.underflows=from.underflows;out.transferred=from.transferred;
+        MemoryBarrier();
+        if(from.sequence==before)
+            return out.version==1 && out.bytes==sizeof(TagBufferV1);
+    }
+    return false;
+}
 inline bool tagHeaderValid(const TagPacketV2& p,const GUID& host) {
     return p.version==tagProtocolVersion && p.bytes==sizeof(p) && host!=GUID_NULL && p.host==host;
 }

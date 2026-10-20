@@ -388,14 +388,14 @@ static void perfFormatTest() {
     const uint64_t start=133000000000000000ull/600000000ull*600000000ull; // a whole UTC minute
     for(unsigned i=0;i<130;++i) {
         mic::PerfSecond s;s.utc=start+(i<120?i:i+40)*10000000ull;s.runMaxMs=1;s.processMaxMs=2;s.outMinMs=30;s.inMaxMs=10;
-        if(i==5){s.late=3;s.runMaxMs=42;}
+        if(i==5){s.late=3;s.runMaxMs=42;s.bufferedMin=12;s.bufferedMax=900;}
         if(i==70) s.gaps=1;
         seconds.push_back(s);
     }
     const auto text=mic::formatPerf(seconds);
     const auto lines=[&](const std::string& part){size_t n=0;for(size_t at=text.find(part);at!=std::string::npos;at=text.find(part,at+1))++n;return n;};
     if(text.rfind("perf: seconds=130 ",0)!=0 || lines("\nminute ")!=3 || lines(" run=42.0 ")!=2 || text.find(" late=3")==std::string::npos
-        || text.find(" capture_gaps=1")==std::string::npos || text.find("incidents=3 ")==std::string::npos
+        || text.find(" capture_gaps=1")==std::string::npos || text.find(" buf=12-900")==std::string::npos || text.find("incidents=3 ")==std::string::npos
         || text.find("no processed audio for 41 s")==std::string::npos) throw std::runtime_error("Perf timeline format:\n"+text);
     require(mic::formatPerf({})=="perf: no processed audio seconds\n","Empty perf");
 }
@@ -412,7 +412,8 @@ static void audioTraceTest() {
         trace->write(mic::AudioTrace::Input,x.data(),mic::block);
         trace->write(mic::AudioTrace::Output,spiked.data(),mic::block);
         if(b+100>=total) trace->write(mic::AudioTrace::Denoiser,x.data(),mic::block);
-        trace->mark({static_cast<uint8_t>(b%2?mic::AudioTrace::Denoised:mic::AudioTrace::CatchUp),static_cast<uint16_t>(b%1000),1,2});
+        trace->mark({static_cast<uint8_t>(b%2?mic::AudioTrace::Denoised:mic::AudioTrace::CatchUp),static_cast<uint16_t>(b%1000),1,2,
+            b+10<total?UINT32_MAX:300u+b%7,b+10<total?0u:960u});
     }
     std::vector<float> a(mic::block),b(mic::block);
     require(trace->latest(mic::AudioTrace::Input,a.data(),mic::AudioTrace::Output,b.data(),mic::block)==mic::block,"Trace pair copies the newest block");
@@ -435,11 +436,23 @@ static void audioTraceTest() {
         const auto p=summary.find("pulse=",from);return p==std::string::npos?-1.0:std::stod(summary.substr(p+6));
     };
     if(pulse("in")<0.5 || pulse("in")>1.3 || pulse("out")<3 || summary.find("| mon empty")==std::string::npos
-        || summary.find(" blocks=3000 ")==std::string::npos || summary.find(" missed=0")==std::string::npos)
+        || summary.find(" blocks=3000 ")==std::string::npos || summary.find(" tag_buffered=300-960")==std::string::npos || summary.find(" missed=0")==std::string::npos)
         throw std::runtime_error("Sound trace summary: "+summary);
+}
+// Host-to-engine TAG buffer diagnostics: a seqlock snapshot, refused mid-write or for another layout.
+static void tagBufferTest() {
+    mic::TagBufferV1 shared,read,sample;
+    sample.running=1;sample.bufferFrames=1920;sample.framesBuffered=37;sample.clientPos=100;sample.devicePos=137;sample.overflows=2;sample.underflows=5;sample.transferred=123456789;
+    mic::publishTagBuffer(shared,sample);
+    require(mic::readTagBuffer(shared,read) && shared.sequence==2,"TAG buffer snapshot");
+    require(read.bufferFrames==1920 && read.framesBuffered==37 && read.clientPos==100 && read.devicePos==137 &&
+        read.overflows==2 && read.underflows==5 && read.transferred==123456789,"TAG buffer fields");
+    shared.sequence=3;require(!mic::readTagBuffer(shared,read),"TAG buffer mid-write is refused");
+    shared.sequence=4;shared.version=2;require(!mic::readTagBuffer(shared,read),"Unknown TAG buffer layout is refused");
 }
 static void selfTest() {
     perfFormatTest();
+    tagBufferTest();
     audioTraceTest();
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
     require(mic::preferredDevice(choices,L"two",L"HyperX")==1,"Saved endpoint wins over name hint");

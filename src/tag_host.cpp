@@ -187,6 +187,12 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR arguments,int) {
         DWORD task=0;HANDLE mmcss=AvSetMmThreadCharacteristicsW(L"Audio",&task);
         struct Priority {HANDLE h;~Priority(){if(h)AvRevertMmThreadCharacteristics(h);}} priority{mmcss};
         std::array<float,16384> silence{};
+        // Capture buffer diagnostics for the engine's report; audio never depends on them.
+        Handle bufferMapping{CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,sizeof(mic::TagBufferV1),mic::tagBufferMapping)};
+        void* bufferMemory=bufferMapping.h?MapViewOfFile(bufferMapping.h,FILE_MAP_ALL_ACCESS,0,0,sizeof(mic::TagBufferV1)):nullptr;
+        struct Unmap {void* p;~Unmap(){if(p)UnmapViewOfFile(p);}} unmapBuffer{bufferMemory};
+        auto* bufferView=bufferMemory?new(bufferMemory) mic::TagBufferV1{}:nullptr;
+        if(!bufferView)logHost("TAG buffer diagnostics unavailable");
         bool connected=false,producing=false,wasRunning=false,retryLock=false;
         auto last=std::chrono::steady_clock::now(),lastProducer=last;
         mic::TagClock clock;
@@ -268,6 +274,7 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR arguments,int) {
                 if(frames) tag.write(silence.data(),frames);
             }
             last=now;
+            if(bufferView)mic::publishTagBuffer(*bufferView,tag.bufferState());
         }
     } catch(const std::exception& e) {
         logHost(e.what());

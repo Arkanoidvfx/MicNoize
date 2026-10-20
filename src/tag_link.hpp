@@ -141,6 +141,30 @@ inline void ensureTagHost() {
     if(readTagEndpointStatus(endpoint) && endpoint.error[0])throw std::runtime_error(endpoint.error);
     throw std::runtime_error("TAG host initializing or waiting for driver; see results/tag-host.log");
 }
+// Read side of TagBufferV1, absent with an older host; tries to open it at most once a second.
+// One per TAG session: a restarted host means a reconnect, and a new view of its new mapping.
+class TagBufferView {
+    HANDLE mapping_=nullptr;
+    const TagBufferV1* view_=nullptr;
+    ULONGLONG retryAt_=0;
+public:
+    TagBufferView()=default;
+    TagBufferView(const TagBufferView&)=delete;
+    TagBufferView& operator=(const TagBufferView&)=delete;
+    ~TagBufferView(){if(view_)UnmapViewOfFile(view_);if(mapping_)CloseHandle(mapping_);}
+    bool read(TagBufferV1& out) {
+        if(!view_) {
+            const auto now=GetTickCount64();
+            if(now<retryAt_)return false;
+            retryAt_=now+1000;
+            if(!mapping_)mapping_=OpenFileMappingW(FILE_MAP_READ,FALSE,tagBufferMapping);
+            if(!mapping_)return false;
+            view_=static_cast<const TagBufferV1*>(MapViewOfFile(mapping_,FILE_MAP_READ,0,0,sizeof(TagBufferV1)));
+            if(!view_)return false;
+        }
+        return readTagBuffer(*view_,out);
+    }
+};
 class TagClient {
     TagLink link_;
     bool rejected_=false;

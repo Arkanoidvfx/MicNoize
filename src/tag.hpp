@@ -1,5 +1,6 @@
 #pragma once
 #include "audio.hpp"
+#include "tag_protocol.hpp"
 #include <winternl.h>
 #include <mmreg.h>
 #include <ks.h>
@@ -224,6 +225,15 @@ public:
     unsigned capacity() const {return pipe_->GetCommonData().Drv.SI.BufferFrames;}
     unsigned driverGaps() const {
         const auto& c=pipe_->GetCommonData(); return c.Drv.FI.DataOverflows+c.Drv.FI.DataUnderflows;
+    }
+    // The capture stream as the driver sees it: how much the host has written that Windows has not
+    // read yet, and both positions. Diagnostics for TagBufferV1.
+    TagBufferV1 bufferState() const {
+        const auto& c=pipe_->GetCommonData();TagBufferV1 s;
+        s.running=running();s.bufferFrames=c.Drv.SI.BufferFrames;s.framesBuffered=c.Drv.SI.FramesBuffered;
+        s.clientPos=c.Drv.SI.ClientPos;s.devicePos=c.Host.DevicePos;s.overflows=c.Drv.SI.DataOverflows;
+        s.underflows=c.Drv.SI.DataUnderflows;s.transferred=c.Drv.SI.FramesTransferred;
+        return s;
     }
     void read(float* left,float* right,unsigned n) {
         auto& c=pipe_->GetCommonData();

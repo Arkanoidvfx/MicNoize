@@ -845,6 +845,10 @@ std::string Engine::sessionLine() const {
         <<" catch_up_blocks="<<stats.catchUpBlocks<<" gpu_late_blocks="<<stats.lateBlocks<<" wake_max_ms="<<stats.tagMaxWakeMs<<" process_max_ms="<<stats.maxProcessMs<<" mmcss_failures="<<mmcssFailures
         <<" gate_db="<<noiseGateDb<<" gate_hold_ms="<<gateHoldMs<<" intensity="<<intensity
         <<" cpus="<<std::thread::hardware_concurrency()<<" resets="<<stats.resets;
+    // TAG capture buffer as the driver sees it (host 0.4.39+): how close Windows' reads come to the host's writes.
+    if(const unsigned low=stats.tagBufferedMin;low!=UINT_MAX)
+        log<<" tag_buffer_frames="<<stats.tagBufferFrames<<" tag_buffered_min="<<low<<" tag_buffered_max="<<stats.tagBufferedMax
+           <<" tag_stream_overflows="<<stats.tagStreamOverflows<<" tag_stream_underflows="<<stats.tagStreamUnderflows;
     if(const LONG priority=gpuPriorityStatus;priority==unsetPriority) log<<" gpu_priority=unset";
     else if(priority==0) log<<" gpu_priority=high";
     else log<<" gpu_priority=failed:0x"<<std::hex<<static_cast<unsigned long>(priority)<<std::dec;
@@ -1100,6 +1104,8 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0; stats.inputChannels=0; stats.inputFlipped=false;
     stats.tagBufferFrames=0; stats.tagDriverGaps=0; stats.tagFrames=0;
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
+    stats.tagBufferedMin=UINT_MAX; stats.tagBufferedMax=0; stats.secondBufferedMin=UINT_MAX; stats.secondBufferedMax=0;
+    stats.blockBufferedMin=UINT_MAX; stats.blockBufferedMax=0; stats.tagStreamOverflows=0; stats.tagStreamUnderflows=0;
     stats.pitchActive=false; stats.boostActive=false; stats.pitchDelayMs=0; stats.pitchMaxMs=0;stats.phraseState=0;stats.phraseSeconds=0;
     stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;stats.denoiseDelaySamples=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
@@ -1297,7 +1303,7 @@ void Engine::dspLoop(Config c) {
                 trace.write(AudioTrace::Input,in.data(),block);trace.write(AudioTrace::Denoiser,out.data(),block);
                 trace.mark({static_cast<uint8_t>((denoised?AudioTrace::Denoised:0)|(catchUp?AudioTrace::CatchUp:0)|(reset?AudioTrace::Reset:0)|(gpu?AudioTrace::Gpu:0)),
                     static_cast<uint16_t>(std::min(ms*1000.0f,65535.0f)),static_cast<uint16_t>(std::min<size_t>(captured_.size(),65535)),
-                    static_cast<uint16_t>(std::min<size_t>(cleaned_.size(),65535))});
+                    static_cast<uint16_t>(std::min<size_t>(cleaned_.size(),65535)),stats.blockBufferedMin.exchange(UINT_MAX),stats.blockBufferedMax.exchange(0)});
                 second.inMaxMs=std::max(second.inMaxMs,captured_.size()/48.0f);
                 second.outMinMs=std::min(second.outMinMs,cleaned_.size()/48.0f);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
@@ -1439,6 +1445,7 @@ void Engine::dspLoop(Config c) {
                     second.drops=delta(now.drops,perfBefore.drops);second.resets=delta(now.resets,perfBefore.resets);
                     second.tagGaps=delta(now.tagGaps,perfBefore.tagGaps);second.lateTicks=delta(now.lateTicks,perfBefore.lateTicks);
                     second.reconnects=delta(now.reconnects,perfBefore.reconnects);
+                    second.bufferedMin=stats.secondBufferedMin.exchange(UINT_MAX);second.bufferedMax=stats.secondBufferedMax.exchange(0);
                     perf.push(second);perfBefore=now;second={};second.outMinMs=1e9f;perfBlocks=0;
                 }
             }
@@ -1530,6 +1537,7 @@ void Engine::tagLoop(Config c) {
     Event captureEvent;
     Stream input; input.open(c.input,true,captureEvent.h,c.periodMs);
     TagClient tag;
+    TagBufferView bufferView;
     ComPtr<IAudioCaptureClient> capture;
     check(input.client->GetService(IID_PPV_ARGS(&capture)),"TAG microphone capture client");
     std::vector<float> mono(input.capacity+block); Downmix downmix;
@@ -1559,6 +1567,15 @@ void Engine::tagLoop(Config c) {
         if(wait==WAIT_FAILED || wait==WAIT_TIMEOUT) throw std::runtime_error("TAG audio event wait failed");
         if(testStallMs.load(std::memory_order_relaxed)) if(const auto ms=testStallMs.exchange(0)) Sleep(ms);
         tag.handleEvent();
+        // Capture buffer diagnostics (host 0.4.39+): lowest/highest written-but-unread amount.
+        if(TagBufferV1 buffer;bufferView.read(buffer) && buffer.running && buffer.bufferFrames) {
+            const unsigned queued=buffer.framesBuffered;
+            const auto lower=[queued](std::atomic<unsigned>& at){unsigned v=at.load(std::memory_order_relaxed);while(queued<v && !at.compare_exchange_weak(v,queued,std::memory_order_relaxed)){}};
+            const auto raise=[queued](std::atomic<unsigned>& at){unsigned v=at.load(std::memory_order_relaxed);while(queued>v && !at.compare_exchange_weak(v,queued,std::memory_order_relaxed)){}};
+            lower(stats.tagBufferedMin);lower(stats.secondBufferedMin);lower(stats.blockBufferedMin);
+            raise(stats.tagBufferedMax);raise(stats.secondBufferedMax);raise(stats.blockBufferedMax);
+            stats.tagStreamOverflows.store(buffer.overflows,std::memory_order_relaxed);stats.tagStreamUnderflows.store(buffer.underflows,std::memory_order_relaxed);
+        }
         UINT32 n=0; check(capture->GetNextPacketSize(&n),"TAG capture packet size");
         while(n) {
             BYTE* bytes=nullptr; DWORD flags=0;
@@ -1994,12 +2011,17 @@ std::string AudioTrace::save(const std::filesystem::path& wav) const {
         out.write(reinterpret_cast<const char*>(frame.data()),Taps*2);
     }
     std::ofstream csv(wav.wstring()+L".csv");
-    csv<<"block,denoised,catch_up,reset,gpu,run_us,in_queue,out_queue\n";
-    unsigned denoised=0,catchUp=0,resets=0,runMax=0;
+    csv<<"block,denoised,catch_up,reset,gpu,run_us,in_queue,out_queue,tag_buffered_min,tag_buffered_max\n";
+    unsigned denoised=0,catchUp=0,resets=0,runMax=0;uint32_t bufferedMin=UINT32_MAX,bufferedMax=0;
     for(uint64_t k=marked>blocks?marked-blocks:0;k<marked;++k) {
         const auto& b=marks[k%blocks];
         csv<<k<<','<<(b.flags&Denoised?1:0)<<','<<(b.flags&CatchUp?1:0)<<','<<(b.flags&Reset?1:0)<<','<<(b.flags&Gpu?1:0)<<','
-           <<b.runUs<<','<<b.inQueue<<','<<b.outQueue<<'\n';
+           <<b.runUs<<','<<b.inQueue<<','<<b.outQueue<<',';
+        // Empty when the host did not report the buffer during this block.
+        if(b.bufferedMin!=UINT32_MAX) csv<<b.bufferedMin<<','<<b.bufferedMax;
+        else csv<<',';
+        csv<<'\n';
+        bufferedMin=std::min(bufferedMin,b.bufferedMin);bufferedMax=std::max(bufferedMax,b.bufferedMax);
         denoised+=(b.flags&Denoised)!=0;catchUp+=(b.flags&CatchUp)!=0;resets+=(b.flags&Reset)!=0;runMax=std::max<unsigned>(runMax,b.runUs);
     }
     if(!out || !csv) throw std::runtime_error("Sound trace write failed");
@@ -2007,6 +2029,7 @@ std::string AudioTrace::save(const std::filesystem::path& wav) const {
     const char* names[]={"in","dfn","play","out","mon"};
     summary<<"trace "<<utf8(wav.filename().wstring())<<" blocks="<<std::min<uint64_t>(marked,blocks)<<" denoised="<<denoised
            <<" catch_up="<<catchUp<<" resets="<<resets<<" run_max_us="<<runMax<<" missed="<<missed_.load();
+    if(bufferedMin!=UINT32_MAX) summary<<" tag_buffered="<<bufferedMin<<'-'<<bufferedMax;
     for(unsigned t=0;t<Taps;++t) summary<<" | "<<names[t]<<' '<<describe(samples.data()+size_t{t}*length,written[t]);
     return summary.str();
 }
@@ -2015,12 +2038,16 @@ static void perfCounts(std::ostream& out,const PerfSecond& s) {
         {"drops",s.drops},{"resets",s.resets},{"tag_gaps",s.tagGaps},{"late_ticks",s.lateTicks},{"reconnects",s.reconnects}};
     for(const auto& [name,value]:counts) if(value) out<<' '<<name<<'='<<value;
 }
+// TAG capture frames written by the host and not yet read by Windows, when the host reports them.
+static void perfBuffer(std::ostream& out,const PerfSecond& s) {
+    if(s.bufferedMin!=UINT32_MAX) out<<" buf="<<s.bufferedMin<<'-'<<s.bufferedMax;
+}
 std::string formatPerf(const std::vector<PerfSecond>& seconds) {
     if(seconds.empty()) return "perf: no processed audio seconds\n";
     std::ostringstream out;out<<std::fixed<<std::setprecision(1);
     out<<"perf: seconds="<<seconds.size()<<" from="<<utcText(seconds.front().utc,false)<<" to="<<utcText(seconds.back().utc,false)
        <<" UTC; one entry per 100 processed blocks. run=max NVIDIA/DFN run, proc=max DSP block, wake=max TAG wake,"
-       <<" out=min output reserve, in=max input queue (all ms); counters are per period.\n";
+       <<" out=min output reserve, in=max input queue (all ms); buf=min-max TAG capture frames written and not yet read by Windows; counters are per period.\n";
     constexpr uint64_t minute=600000000ull;
     for(size_t i=0;i<seconds.size();) {
         const uint64_t bucket=seconds[i].utc/minute;PerfSecond m{};m.outMinMs=1e9f;unsigned n=0;
@@ -2031,9 +2058,10 @@ std::string formatPerf(const std::vector<PerfSecond>& seconds) {
             const auto add=[](uint16_t& total,uint16_t value){total=static_cast<uint16_t>(std::min(total+value,0xffff));};
             add(m.late,s.late);add(m.catchUp,s.catchUp);add(m.gaps,s.gaps);add(m.underruns,s.underruns);add(m.drops,s.drops);
             add(m.resets,s.resets);add(m.tagGaps,s.tagGaps);add(m.lateTicks,s.lateTicks);add(m.reconnects,s.reconnects);
+            m.bufferedMin=std::min(m.bufferedMin,s.bufferedMin);m.bufferedMax=std::max(m.bufferedMax,s.bufferedMax);
         }
         out<<"minute "<<utcText(bucket*minute,false)<<" n="<<n<<" run="<<m.runMaxMs<<" proc="<<m.processMaxMs<<" wake="<<m.wakeMaxMs
-           <<" out="<<m.outMinMs<<" in="<<m.inMaxMs;perfCounts(out,m);out<<'\n';
+           <<" out="<<m.outMinMs<<" in="<<m.inMaxMs;perfBuffer(out,m);perfCounts(out,m);out<<'\n';
     }
     std::vector<std::string> lines;
     for(size_t i=0;i<seconds.size();++i) {
@@ -2044,7 +2072,7 @@ std::string formatPerf(const std::vector<PerfSecond>& seconds) {
         if(!counted && s.runMaxMs<=5 && s.processMaxMs<=10 && s.wakeMaxMs<=10 && s.outMinMs>=5) continue;
         std::ostringstream line;line<<std::fixed<<std::setprecision(1)<<utcText(s.utc,true)<<" run="<<s.runMaxMs<<" proc="<<s.processMaxMs
             <<" wake="<<s.wakeMaxMs<<" out="<<s.outMinMs<<" in="<<s.inMaxMs;
-        perfCounts(line,s);lines.push_back(line.str());
+        perfBuffer(line,s);perfCounts(line,s);lines.push_back(line.str());
     }
     constexpr size_t keep=400;
     out<<"incidents="<<lines.size()<<" (run>5, proc>10, wake>10, out<5 or any counter)";
