@@ -100,6 +100,104 @@ struct Drift {
         return std::clamp(integral + filtered*0.000003, -0.003, 0.003);
     }
 };
+// Asynchronous resampler for small clock offsets (well under 1 %): windowed sinc, 16 taps, 512
+// phases interpolated linearly. `step` is input samples per output sample. Latency 7 samples. The
+// buffer is sized at construction; process() never allocates.
+class DriftResampler {
+public:
+    static constexpr unsigned taps=16,half=taps/2,phases=512;
+    explicit DriftResampler(size_t maxInput):table_((phases+1)*taps),buffer_(maxInput+taps*2) {
+        // Kaiser beta 8, cutoff 0.94 of Nyquist: flat across the voice, no images at ratios this close to 1.
+        const auto bessel=[](double x){double sum=1,term=1;for(int k=1;k<30;++k){term*=(x/(2*k))*(x/(2*k));sum+=term;}return sum;};
+        constexpr double beta=8,cutoff=0.94,pi=3.14159265358979323846;
+        for(unsigned p=0;p<=phases;++p) {
+            double sum=0;
+            for(unsigned k=0;k<taps;++k) {
+                const double d=static_cast<double>(k)-(half-1)-static_cast<double>(p)/phases,r=d/half;
+                const double window=std::abs(r)<1?bessel(beta*std::sqrt(1-r*r))/bessel(beta):0;
+                const double sinc=d==0?1:std::sin(pi*cutoff*d)/(pi*cutoff*d);
+                sum+=table_[p*taps+k]=static_cast<float>(sinc*window);
+            }
+            for(unsigned k=0;k<taps;++k)table_[p*taps+k]=static_cast<float>(table_[p*taps+k]/sum);
+        }
+        reset();
+    }
+    void reset() {std::fill(buffer_.begin(),buffer_.end(),0.0f);fill_=half-1;time_=half-1;}
+    // Appends `n` input samples and writes up to `room` output samples; returns how many it wrote.
+    unsigned process(const float* in,unsigned n,double step,float* out,unsigned room) {
+        n=static_cast<unsigned>(std::min<size_t>(n,buffer_.size()-fill_));
+        std::copy_n(in,n,buffer_.begin()+fill_);fill_+=n;
+        unsigned produced=0;
+        while(produced<room) {
+            const auto i=static_cast<size_t>(time_);
+            if(i+half>=fill_) break;
+            const double at=(time_-static_cast<double>(i))*phases;
+            const auto p=std::min<unsigned>(static_cast<unsigned>(at),phases-1);
+            const float w=static_cast<float>(at-p);
+            const float* a=&table_[p*taps];const float* b=a+taps;const float* x=&buffer_[i-(half-1)];
+            float sum=0;
+            for(unsigned k=0;k<taps;++k)sum+=x[k]*(a[k]+w*(b[k]-a[k]));
+            out[produced++]=sum;time_+=step;
+        }
+        // Keep only the history the next output still needs.
+        const auto keep=static_cast<size_t>(time_)-(half-1);
+        if(keep) {std::copy(buffer_.begin()+keep,buffer_.begin()+fill_,buffer_.begin());fill_-=keep;time_-=static_cast<double>(keep);}
+        return produced;
+    }
+private:
+    std::vector<float> table_,buffer_;
+    size_t fill_=0;
+    double time_=0;
+};
+// TAG clocking. The host writes the TAG capture buffer at the engine's pace. Windows reads it in one
+// of two ways. Usually it takes everything written each period (written-but-unread falls to 0): the
+// virtual microphone then simply carries the microphone's clock, like any USB microphone, and the
+// write pace follows the microphone (the old scheme, kept here unchanged). On some PCs it takes a
+// fixed 480 frames per period on the system clock; a microphone off by +1016 ppm then filled the
+// 960-frame buffer and writes overwrote unread audio every period. The host reports after its own
+// write, so a take-everything reader still shows up to about two 2 ms writes. Fixed reads show as
+// never under 240 frames for 2 s, a full buffer for 3 windows, or the driver counting underflows in 2
+// windows in a row (reads past the writes: a take-everything reader never does that). Then the pacer
+// engages: writes keep the peak written-but-unread amount at 3/4 of the buffer, and the input is
+// resampled onto the system clock so the engine's audio in flight stays at its target. Under 120
+// frames for 5 s means a take-everything reader again, and the pacer lets go.
+struct TagPacer {
+    Drift queue,lead;
+    double inputCorrection=0,writeCorrection=0,queueSum=0;
+    unsigned queueCount=0,low=UINT_MAX,high=0,steady=0,full=0,drained=0,starved=0,underflows=0,underflowsBefore=0;
+    bool engaged=false,counted=false;
+    // Each TAG tick, from the host's report: written-but-unread frames and the driver's underflow count.
+    void observe(unsigned buffered,unsigned driverUnderflows) {
+        low=std::min(low,buffered);high=std::max(high,buffered);
+        if(!counted){underflowsBefore=driverUnderflows;counted=true;}
+        underflows=driverUnderflows;
+    }
+    // Audio in flight, input queue plus output queue: the output queue alone steps by whole DSP
+    // blocks, and with a nearly 1:1 ratio that step beats slowly (10 s at 1000 ppm) into the pitch.
+    void observeQueue(size_t frames){queueSum+=static_cast<double>(frames);++queueCount;}
+    // Every 100 ms: `target` audio in flight, `bufferFrames` the TAG buffer, `microphone` the old
+    // pacing's current correction (the microphone's offset, learned) to start the resampler from.
+    // Returns whether `engaged` changed.
+    bool update(double target,unsigned bufferFrames,double microphone) {
+        bool changed=false;
+        if(low!=UINT_MAX && bufferFrames) {
+            steady=low>=240?steady+1:0; full=high+32>=bufferFrames?full+1:0; drained=low<120?drained+1:0;
+            starved=underflows!=underflowsBefore?starved+1:0;underflowsBefore=underflows;
+            if(!engaged && (steady>=20 || full>=3 || starved>=2)) {
+                engaged=changed=true;queue={};queue.integral=std::clamp(microphone,-0.0015,0.0015);lead={};writeCorrection=0;
+            } else if(engaged && drained>=50) {
+                engaged=false;changed=true;inputCorrection=writeCorrection=0;
+            }
+            if(engaged) {
+                if(queueCount) inputCorrection=queue.update(queueSum/queueCount-target);
+                writeCorrection=-lead.update(static_cast<double>(high)-(bufferFrames-bufferFrames/4.0));
+            }
+        }
+        queueSum=0;queueCount=0;low=UINT_MAX;high=0;
+        return changed;
+    }
+    double step() const {return 1+inputCorrection;}
+};
 struct Config {
     std::wstring input, output;
     int version = 1;
@@ -155,6 +253,8 @@ struct Stats {
     // thread lowers/raises them; the DSP thread takes the second/block pairs back.
     std::atomic<unsigned> tagBufferedMin{UINT_MAX}, tagBufferedMax{0}, secondBufferedMin{UINT_MAX}, secondBufferedMax{0};
     std::atomic<unsigned> blockBufferedMin{UINT_MAX}, blockBufferedMax{0}, tagStreamOverflows{0}, tagStreamUnderflows{0};
+    // TAG writes follow the reported buffer (TagPacer) instead of the microphone; their correction.
+    std::atomic<bool> tagPaced{false}; std::atomic<float> tagWritePpm{0};
     std::atomic<float> tagMaxWakeMs{0};
     // Per-second maxima for PerfHistory: writers raise them, the DSP takes them once a second.
     std::atomic<float> secondRunMaxMs{0}, secondWakeMaxMs{0};

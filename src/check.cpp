@@ -450,9 +450,92 @@ static void tagBufferTest() {
     shared.sequence=3;require(!mic::readTagBuffer(shared,read),"TAG buffer mid-write is refused");
     shared.sequence=4;shared.version=2;require(!mic::readTagBuffer(shared,read),"Unknown TAG buffer layout is refused");
 }
+// Small-offset resampler: a tone keeps its shape at +/-1000 ppm, chunking changes nothing.
+static void driftResamplerTest() {
+    double worst=-200;
+    const auto residual=[](const std::vector<float>& y,double omega,size_t from,size_t to){
+        // Least-squares fit of a sinusoid at the known frequency; returns error RMS relative to its amplitude, dB.
+        double ss=0,cc=0,sc=0,ys=0,yc=0;
+        for(size_t j=from;j<to;++j){const double s=std::sin(omega*j),c=std::cos(omega*j);ss+=s*s;cc+=c*c;sc+=s*c;ys+=y[j]*s;yc+=y[j]*c;}
+        const double det=ss*cc-sc*sc,a=(ys*cc-yc*sc)/det,b=(yc*ss-ys*sc)/det;double err=0;
+        for(size_t j=from;j<to;++j){const double e=y[j]-a*std::sin(omega*j)-b*std::cos(omega*j);err+=e*e;}
+        return 10*std::log10(err/(to-from)/((a*a+b*b)/2));
+    };
+    for(const auto [hz,step]:{std::pair{1000.0,1.001},std::pair{8000.0,0.999},std::pair{1000.0,1.0}}) {
+        constexpr size_t n=96000;std::vector<float> x(n);
+        for(size_t i=0;i<n;++i)x[i]=static_cast<float>(0.5*std::sin(2*3.14159265358979323846*hz*i/48000));
+        mic::DriftResampler whole(n),pieces(4096);std::vector<float> a(n*2),b(n*2);
+        const unsigned count=whole.process(x.data(),n,step,a.data(),n*2);
+        unsigned got=0,seed=3;
+        for(size_t at=0;at<n;) {
+            seed=seed*1664525u+1013904223u;const auto len=static_cast<unsigned>(std::min<size_t>(1+(seed>>20)%3000,n-at));
+            got+=pieces.process(x.data()+at,len,step,b.data()+got,n*2-got);at+=len;
+        }
+        require(count==got && std::abs(count-(n-8)/step)<2,"Drift resampler output length");
+        for(unsigned j=0;j<count;++j)if(std::abs(a[j]-b[j])>1e-6f)throw std::runtime_error("Drift resampler depends on packet sizes");
+        a.resize(count);
+        const double db=residual(a,2*3.14159265358979323846*hz/48000*step,1000,count-1000);
+        if(db>-70) throw std::runtime_error("Drift resampler distortion "+std::to_string(db)+" dB at "+std::to_string(hz)+" Hz");
+        worst=std::max(worst,db);
+    }
+    std::cout<<"PASS: drift resampler 1 kHz / 8 kHz at +/-1000 ppm, worst error "<<worst<<" dB, packet-size independent"<<std::endl;
+}
+// The whole TAG clock loop in simulation, as tagLoop runs it: microphone packets on their own clock,
+// DSP blocks of 480, host writes every 2 ms (old microphone pacing unless the pacer engages), and
+// Windows reading every 10 ms from a 960-frame buffer either a fixed 480 frames or everything written.
+static void tagPacingTest() {
+    struct Case {double ppm;bool fixed;unsigned start;bool engages;};
+    for(const auto c:{Case{1000,true,900,true},Case{-60,true,500,true},Case{1000,false,0,false},Case{-60,false,0,false}}) {
+        mic::DriftResampler resampler(4096);mic::TagPacer pacer;mic::TagClock clock;mic::Drift drift;double correction=0;
+        std::vector<float> packet(480),resampled(1024);
+        double micDebt=0,phase=0,captured=0,cleaned=1920;unsigned buffered=c.start,overflows=0,underflows=0,low=960,high=0,lastLead=0,driverUnderflows=0;
+        double queueLow=1e9,queueHigh=0,ratioLow=1,ratioHigh=-1;bool everEngaged=false;
+        constexpr unsigned target=1920,bufferFrames=960;
+        for(unsigned tick=0;tick<150000;++tick) { // 2 ms ticks, 300 s
+            const bool settled=tick>15000;
+            micDebt+=96*(1+c.ppm*1e-6);
+            while(micDebt>=480) {
+                micDebt-=480;
+                for(auto& v:packet){v=static_cast<float>(0.1*std::sin(phase));phase+=0.05;}
+                captured+=pacer.engaged?resampler.process(packet.data(),480,pacer.step(),resampled.data(),1024):480;
+            }
+            while(captured>=480){captured-=480;cleaned+=480;}
+            const unsigned frames=clock.take(0.002,pacer.engaged?pacer.writeCorrection:correction,480);
+            cleaned-=frames;buffered+=frames;
+            // The host reports after its write: a take-everything reader never shows 0 here.
+            pacer.observe(std::min(buffered,bufferFrames),driverUnderflows);pacer.observeQueue(static_cast<size_t>(cleaned+captured));
+            if(buffered>bufferFrames){if(settled)++overflows;buffered=bufferFrames;}
+            if(tick%5==4) {
+                if(!c.fixed) buffered=0;                                   // Windows takes everything
+                else if(buffered<480){if(settled)++underflows;++driverUnderflows;buffered=0;}
+                else buffered-=480;
+            }
+            if(tick%50==49) {
+                correction=drift.update(cleaned-target);                    // the old microphone pacing
+                if(pacer.update(target+240.0,bufferFrames,correction)) resampler.reset();
+            }
+            everEngaged=everEngaged||pacer.engaged;
+            if(settled){low=std::min(low,buffered);high=std::max(high,buffered);queueLow=std::min(queueLow,cleaned);queueHigh=std::max(queueHigh,cleaned);}
+            if(tick>120000 && pacer.engaged){ratioLow=std::min(ratioLow,pacer.inputCorrection);ratioHigh=std::max(ratioHigh,pacer.inputCorrection);}
+            if(tick%5==3) lastLead=buffered;
+        }
+        // Engaged: the input ratio holds the microphone's offset within 300 ppm (0.5 cent; pitch changes
+        // are heard from about 5 cents). Rare spikes come from 10 ms packets crossing 100 ms windows.
+        const bool ratioOk=!c.engages || (std::abs(ratioLow*1e6-c.ppm)<300 && std::abs(ratioHigh*1e6-c.ppm)<300);
+        const std::string at=std::to_string(c.ppm)+" ppm, "+(c.fixed?"fixed reads":"take-everything reads");
+        if(pacer.engaged!=c.engages || (!c.engages && everEngaged) || overflows || underflows || queueLow<target-960 || queueHigh>target+960 || !ratioOk)
+            throw std::runtime_error("TAG pacing at "+at+": engaged="+std::to_string(pacer.engaged)+" overflows="+std::to_string(overflows)+" underflows="+std::to_string(underflows)+
+                " buffered="+std::to_string(low)+".."+std::to_string(high)+" queue="+std::to_string(queueLow)+".."+std::to_string(queueHigh)+" input="+std::to_string(ratioLow*1e6)+".."+std::to_string(ratioHigh*1e6));
+        std::cout<<"PASS: TAG pacing at "<<at<<": "<<(pacer.engaged?"engaged":"microphone pacing")<<", buffered "<<low<<".."<<high<<" of 960, queue "<<queueLow<<".."<<queueHigh;
+        if(c.engages) std::cout<<", input "<<ratioLow*1e6<<".."<<ratioHigh*1e6<<" ppm";
+        std::cout<<std::endl;
+    }
+}
 static void selfTest() {
     perfFormatTest();
     tagBufferTest();
+    driftResamplerTest();
+    tagPacingTest();
     audioTraceTest();
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
     require(mic::preferredDevice(choices,L"two",L"HyperX")==1,"Saved endpoint wins over name hint");

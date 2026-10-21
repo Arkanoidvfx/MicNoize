@@ -849,6 +849,8 @@ std::string Engine::sessionLine() const {
     if(const unsigned low=stats.tagBufferedMin;low!=UINT_MAX)
         log<<" tag_buffer_frames="<<stats.tagBufferFrames<<" tag_buffered_min="<<low<<" tag_buffered_max="<<stats.tagBufferedMax
            <<" tag_stream_overflows="<<stats.tagStreamOverflows<<" tag_stream_underflows="<<stats.tagStreamUnderflows;
+    // buffer: writes follow Windows' reads and drift_ppm is the input resampling; microphone: the old pacing.
+    if(config_.tag) log<<" tag_pacing="<<(stats.tagPaced?"buffer":"microphone")<<" tag_write_ppm="<<stats.tagWritePpm;
     if(const LONG priority=gpuPriorityStatus;priority==unsetPriority) log<<" gpu_priority=unset";
     else if(priority==0) log<<" gpu_priority=high";
     else log<<" gpu_priority=failed:0x"<<std::hex<<static_cast<unsigned long>(priority)<<std::dec;
@@ -1106,6 +1108,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
     stats.tagBufferedMin=UINT_MAX; stats.tagBufferedMax=0; stats.secondBufferedMin=UINT_MAX; stats.secondBufferedMax=0;
     stats.blockBufferedMin=UINT_MAX; stats.blockBufferedMax=0; stats.tagStreamOverflows=0; stats.tagStreamUnderflows=0;
+    stats.tagPaced=false; stats.tagWritePpm=0;
     stats.pitchActive=false; stats.boostActive=false; stats.pitchDelayMs=0; stats.pitchMaxMs=0;stats.phraseState=0;stats.phraseSeconds=0;
     stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;stats.denoiseDelaySamples=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
@@ -1541,6 +1544,10 @@ void Engine::tagLoop(Config c) {
     ComPtr<IAudioCaptureClient> capture;
     check(input.client->GetService(IID_PPV_ARGS(&capture)),"TAG microphone capture client");
     std::vector<float> mono(input.capacity+block); Downmix downmix;
+    // Writes follow the microphone (the old pacing) unless the host's buffer report shows Windows
+    // reading fixed periods on the system clock; then TagPacer paces writes and resamples the input.
+    DriftResampler resampler(mono.size());std::vector<float> resampled(mono.size()*2+64);
+    TagPacer pacer;ULONGLONG bufferSeen=0;
     // Allocate once before rendering: these buffers exceed the audio thread's stack budget.
     constexpr unsigned capacity=16384;
     std::vector<float> output(capacity);
@@ -1573,9 +1580,13 @@ void Engine::tagLoop(Config c) {
             const auto lower=[queued](std::atomic<unsigned>& at){unsigned v=at.load(std::memory_order_relaxed);while(queued<v && !at.compare_exchange_weak(v,queued,std::memory_order_relaxed)){}};
             const auto raise=[queued](std::atomic<unsigned>& at){unsigned v=at.load(std::memory_order_relaxed);while(queued>v && !at.compare_exchange_weak(v,queued,std::memory_order_relaxed)){}};
             lower(stats.tagBufferedMin);lower(stats.secondBufferedMin);lower(stats.blockBufferedMin);
+            pacer.observe(queued,buffer.underflows);bufferSeen=GetTickCount64();
             raise(stats.tagBufferedMax);raise(stats.secondBufferedMax);raise(stats.blockBufferedMax);
             stats.tagStreamOverflows.store(buffer.overflows,std::memory_order_relaxed);stats.tagStreamUnderflows.store(buffer.underflows,std::memory_order_relaxed);
         }
+        // A host that stopped reporting (or an older one) leaves only the old microphone pacing.
+        const bool reported=bufferSeen && GetTickCount64()-bufferSeen<500;
+        if(!reported && pacer.engaged){pacer=TagPacer{};resampler.reset();stats.tagPaced=false;}
         UINT32 n=0; check(capture->GetNextPacketSize(&n),"TAG capture packet size");
         while(n) {
             BYTE* bytes=nullptr; DWORD flags=0;
@@ -1586,7 +1597,10 @@ void Engine::tagLoop(Config c) {
             stats.inputFlipped=downmix.sign<0;
             check(capture->ReleaseBuffer(n),"TAG release capture");
             peakHold(stats.inputPeak,peak(mono.data(),n));
-            if(!captured_.push(mono.data(),n))++stats.drops;
+            if(pacer.engaged) {
+                const unsigned produced=resampler.process(mono.data(),n,pacer.step(),resampled.data(),static_cast<unsigned>(resampled.size()));
+                if(!captured_.push(resampled.data(),produced))++stats.drops;
+            } else if(!captured_.push(mono.data(),n))++stats.drops;
             SetEvent(data_); lastCapture=std::chrono::steady_clock::now();
             check(capture->GetNextPacketSize(&n),"TAG next capture packet");
         }
@@ -1597,7 +1611,7 @@ void Engine::tagLoop(Config c) {
         stats.outputActive=running;
         if(!running || !wasRunning) {
             stats.outputPeak=0;
-            cleaned_.trim(target); primed=false; fade=0; clock={}; drift={}; correction=0;
+            cleaned_.trim(target); primed=false; fade=0; clock={}; drift={}; correction=0; pacer.lead={}; pacer.writeCorrection=0;
             lastAdjustment=now;
             if(running!=wasRunning) status(running?L"Running: NVIDIA v"+std::to_wstring(c.version)+L" -> TAG":L"TAG ready; waiting for recording client");
         } else {
@@ -1610,12 +1624,12 @@ void Engine::tagLoop(Config c) {
             if(elapsed*rate>maxFrames) ++stats.tagLateTicks;
             // Keep overdue frames for the next tick. A late wake must neither lose
             // device-clock time nor discard/re-prime already processed audio.
-            const unsigned frames=clock.take(elapsed,correction,maxFrames);
+            const unsigned frames=clock.take(elapsed,pacer.engaged?pacer.writeCorrection:correction,maxFrames);
             if(frames) {
-                if(cleaned_.size()>target+rate/20){cleaned_.trim(target);++stats.drops;fade=0;drift={};correction=0;}
+                if(cleaned_.size()>target+rate/20){cleaned_.trim(target);++stats.drops;fade=0;drift={};correction=0;pacer.lead={};pacer.writeCorrection=0;}
                 if(!primed && cleaned_.size()>=target+frames) primed=true;
                 const bool have=primed && cleaned_.pop(routed.data(),frames);
-                if(primed && !have){++stats.underruns;primed=false;fade=0;drift={};correction=0;}
+                if(primed && !have){++stats.underruns;primed=false;fade=0;drift={};correction=0;pacer.lead={};pacer.writeCorrection=0;}
                 if(!have)std::fill_n(routed.data(),frames,RoutedSample{});
                 const auto currentEpoch=effectEpoch.load();
                 for(unsigned i=0;i<frames;++i){output[i]=have?routed[i].value:0;sources[i]=have?routed[i].discord:0;modified[i]=have?routed[i].modified:0;microphone[i]=have?routed[i].microphone:0;sound[i]=have?routed[i].sound:0;echoMic[i]=have&&routed[i].epoch==currentEpoch?routed[i].echoMic:0;echoDiscord[i]=have&&routed[i].epoch==currentEpoch?routed[i].echoDiscord:0;}
@@ -1639,13 +1653,22 @@ void Engine::tagLoop(Config c) {
                     // The host dropped us during a stall and filled it with silence: discard the
                     // clock debt and re-prime exactly as on a client transition.
                     ++stats.tagReconnects;
-                    releaseEffects();cleaned_.trim(0);primed=false;fade=0;clock={};drift={};correction=0;
+                    releaseEffects();cleaned_.trim(0);primed=false;fade=0;clock={};drift={};correction=0;pacer.lead={};pacer.writeCorrection=0;
                     lastAdjustment=now;
                 }
             }
+            if(primed) pacer.observeQueue(captured_.size()+cleaned_.size());
             if(primed && now-lastAdjustment>=std::chrono::milliseconds(100)) {
+                // The old pacing keeps learning the microphone's offset: the fallback, and the
+                // resampler's starting ratio when the pacer engages.
                 correction=drift.update(static_cast<double>(cleaned_.size())-target);
-                stats.driftPpm=static_cast<float>(correction*1e6); lastAdjustment=now;
+                // In flight is the output reserve plus, on average, half a DSP block still queued for input.
+                if(reported && pacer.update(static_cast<double>(target+block/2),tag.capacity(),correction)) {
+                    resampler.reset();stats.tagPaced=pacer.engaged;
+                }
+                stats.driftPpm=static_cast<float>((pacer.engaged?pacer.inputCorrection:correction)*1e6);
+                stats.tagWritePpm=static_cast<float>((pacer.engaged?pacer.writeCorrection:correction)*1e6);
+                lastAdjustment=now;
             }
         }
         stats.outputQueue=static_cast<unsigned>(cleaned_.size());
