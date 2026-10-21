@@ -780,7 +780,7 @@ impl App {
         .padding([14, 10])
         .width(196)
         .height(Length::Fill);
-        if self.update_ready || self.ready_preview.is_some() {
+        if self.update_notice() || self.ready_preview.is_some() {
             // The celebration's layer only while it plays: the card keeps its widget state.
             let mut card = widget::stack![self.ready_card()];
             if self.ready_clock().present() {
@@ -3170,11 +3170,12 @@ impl App {
         } else {
             device
         };
-        // The version stands in the title bar; a ready update restarts from the rail's card, so
-        // this block only says where the check stands.
+        // The version stands in the title bar; manual restart stays in the rail's ready card.
         // «Анимация обновления» plays «Перезапустить» → update window → restart for real,
         // without installing; «Карточка обновления» shows the ready card's celebration.
         let updates = column![
+            row![frame(switch(self.auto_update, Msg::AutoUpdate, true), self.focus == AUTO_UPDATE), label("Обновлять автоматически", 13, INK)].spacing(8).align_y(iced::Center),
+            label("Установка с перезапуском программы", 12, FAINT),
             label(&self.update_status, 12, if self.update_ready { GREEN } else { FAINT }),
             action(medium(if self.update_checking { "Проверка…" } else { "Проверить обновления" }, 13, if self.update_checking { FAINT } else { INK }), Msg::UpdateCheck, self.focus == UPDATE, false)
                 .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
@@ -4275,6 +4276,15 @@ mod tests {
         app.rvc_page = false;
         app.details = true;
         render(&app, "settings");
+        app.auto_update = true;
+        app.focus = focus::settings::AUTO_UPDATE;
+        app.focus_visible = true;
+        scale.set(2.0);
+        render(&app, "settings-auto-update-200pct");
+        window.set((620.0, 440.0));
+        render(&app, "settings-auto-update-small-200pct");
+        window.set((1040.0, 740.0));
+        scale.set(1.0);
         app.details = false;
         app.logs_page = true;
         render(&app, "logs");

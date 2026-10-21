@@ -10,6 +10,8 @@ const RUN_NAME: &str = "MicNoize.RecoverUpdate";
 const LEGACY_HOST_SHA256:&str="0D196EEFF1CFDD6CC2A6E2EC89866A4577019D19DC24A8F100AFE499974BC726";
 static RESUME:std::sync::Mutex<Option<crate::ResumeIntent>>=std::sync::Mutex::new(None);
 pub fn take_resume()->Option<crate::ResumeIntent>{RESUME.lock().ok()?.take()}
+static START_IN_TRAY:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+pub fn start_in_tray()->bool{START_IN_TRAY.load(std::sync::atomic::Ordering::Relaxed)}
 unsafe extern "C" {
     fn mnr_replace_file(from: *const u8, fl: u32, to: *const u8, tl: u32) -> i32;
     fn mnr_tag_stop_host(error: *mut c_char, capacity: u32) -> i32;
@@ -347,6 +349,15 @@ fn run_recovery(exe: Option<&Path>, runtime: &Path) -> Result<(), String> {
         .map_err(|e| format!("Автозапуск восстановления {RUN_NAME}: {e}"))
 }
 fn folder(j: &Journal) -> PathBuf { j.runtime.join(".update").join(&j.transaction) }
+fn background_update(j:&Journal)->bool {
+    j.phase!=Phase::Complete && folder(j).join("start-tray").is_file()
+}
+fn updated_app(j:&Journal)->Command {
+    let mut command=Command::new(j.install.join("current/MicNoize.exe"));
+    command.current_dir(&j.runtime).creation_flags(0x08000000);
+    if background_update(j){command.arg("--start-tray");}
+    command
+}
 fn legacy_guard()->Result<Lock,String> {
     let name:Vec<u16>="Local\\MicNoize.SingleInstance\0".encode_utf16().collect();
     let handle=unsafe{CreateMutexW(std::ptr::null(),1,name.as_ptr())};
@@ -649,21 +660,25 @@ fn restore_update_metadata(j:&Journal)->Result<(),String> {
     if !updater.exists(){atomic(&updater,&fs::read(folder(j).join("Update.exe")).map_err(|e|e.to_string())?)?;}
     Ok(())
 }
-/// `window`: where the watcher shows the app's own update window ("x,y" centre in logical px, or
-/// "centered"); Velopack then runs silently. Without it Velopack shows its standard dialog.
+fn apply_command(j:&Journal,previous:bool,window:Option<&str>)->Command {
+    let files=folder(j);
+    // Windows keeps a handle to a process's working directory. Helpers must not
+    // inherit replaceable `current`, or their own lifetime prevents rollback.
+    let mut child=Command::new(files.join("Update.exe"));
+    child.current_dir(&files).creation_flags(0x08000000);
+    if window.is_some() || background_update(j){child.arg("--silent");}
+    child.arg("apply").arg("--norestart").arg("--package")
+        .arg(files.join(if previous {"previous.nupkg"} else {"candidate.nupkg"})).arg("--root").arg(&j.install)
+        .arg("--waitPid").arg(std::process::id().to_string());
+    child
+}
+/// A background transaction suppresses both installation and rollback dialogs.
 fn apply(j: &mut Journal, previous: bool, window: Option<&str>) -> Result<(), String> {
     let files = folder(j); let package = files.join(if previous {"previous.nupkg"} else {"candidate.nupkg"});
     check_hash(&package, if previous {&j.previous_hash} else {&j.candidate_hash})?;
     check_hash(&files.join("Update.exe"),&j.updater_hash)?;
     if previous {restore_update_metadata(j)?;}
-    // Windows keeps a handle to a process's working directory. Helpers must not
-    // inherit replaceable `current`, or their own lifetime prevents rollback.
-    let mut child=Command::new(files.join("Update.exe"));
-    child.current_dir(&files).creation_flags(0x08000000);
-    if window.is_some(){child.arg("--silent");}
-    let mut child=child
-        .arg("apply").arg("--norestart").arg("--package").arg(package).arg("--root").arg(&j.install)
-        .arg("--waitPid").arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
+    let mut child=apply_command(j,previous,window).spawn().map_err(|e|e.to_string())?;
     let created=process_created(child.as_raw_handle() as isize);
     if let Some(created)=created {j.applier=Some((child.id(),created));}
     if let Err(error)=created.ok_or("Updater identity unavailable".into()).and_then(|_|save(j)) {
@@ -716,7 +731,7 @@ pub fn prepare(candidate: &velopack::VelopackAsset) -> Result<(), String> {
     j.updater_hash = hash(&mut File::open(files.join("Update.exe")).map_err(|e|e.to_string())?)?;
     save(&j)
 }
-pub fn apply_prepared(intent:Option<crate::ResumeIntent>,window:Option<String>) -> Result<(), String> {
+pub fn apply_prepared(intent:Option<crate::ResumeIntent>,window:Option<String>,background:bool) -> Result<(), String> {
     use velopack::locator::{auto_locate_app_manifest,LocationContext};
     let _lock=Lock::acquire()?;
     let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|e.to_string())?;
@@ -726,6 +741,8 @@ pub fn apply_prepared(intent:Option<crate::ResumeIntent>,window:Option<String>) 
     j.before.installed(&location.get_root_dir())?;
     j.resume=intent;save(&j)?;
     let files=folder(&j);
+    // Keep the journal readable by the previous version if rollback is needed.
+    if background {atomic(&files.join("start-tray"),b"background")?;}
     let ready=crate::update_window::ready_file(&j.runtime);let _=fs::remove_file(&ready);
     if let Err(error) = (|| { run_recovery(Some(&files.join("Recovery.exe")),&j.runtime)?; atomic(&state.join("hold"),b"update")?; stop()?; task(0)?;
         j.phase=Phase::Applying; save(&j)?; apply(&mut j,false,window.as_deref()) })() { if !applier_alive(&j){release(&mut j)?;} return Err(error); }
@@ -825,6 +842,7 @@ pub fn startup() -> Result<bool,String> {
     if !runtime.join(".update/journal.json").exists() {return Ok(recovery.is_none());}
     let _lock = match Lock::wait(10000) {Ok(lock)=>lock,Err(_)=>return Ok(false)};
     let mut j=read(&runtime)?;
+    START_IN_TRAY.store(background_update(&j),std::sync::atomic::Ordering::Relaxed);
     crate::logs::note(&runtime,&format!("Восстановление обновления: {:?}, {} -> {}",j.phase,j.before.version,j.after.version));
     for _ in 0..100 {if !applier_alive(&j){break;}std::thread::sleep(std::time::Duration::from_millis(100));}
     if applier_alive(&j){return Ok(false);}
@@ -835,12 +853,12 @@ pub fn startup() -> Result<bool,String> {
         let previous_ui=legacy_ui_matches(&j).is_ok();
         if previous_ui {
             restore_legacy(&mut j)?;
-            Command::new(current.join("MicNoize.exe")).current_dir(&runtime).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {} из {}: {e}",current.join("MicNoize.exe").display(),runtime.display()))?;
+            updated_app(&j).spawn().map_err(|e|format!("Запуск {} из {}: {e}",current.join("MicNoize.exe").display(),runtime.display()))?;
             return Ok(false);
         }
         if j.phase!=Phase::RollingBack && j.after.installed(&j.install).is_ok() {
             if recovery.is_some() {
-                Command::new(current.join("MicNoize.exe")).current_dir(&runtime).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {} из {}: {e}",current.join("MicNoize.exe").display(),runtime.display()))?;
+                updated_app(&j).spawn().map_err(|e|format!("Запуск {} из {}: {e}",current.join("MicNoize.exe").display(),runtime.display()))?;
                 return Ok(false);
             }
             let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
@@ -857,11 +875,11 @@ pub fn startup() -> Result<bool,String> {
     }
     // The copied recovery executable must not validate a newer protocol with its old native ABI.
     if recovery.is_some() && j.after.installed(&j.install).is_ok() && j.phase!=Phase::RollingBack {
-        Command::new(current.join("MicNoize.exe")).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {}: {e}",current.join("MicNoize.exe").display()))?; return Ok(false);
+        updated_app(&j).spawn().map_err(|e|format!("Запуск {}: {e}",current.join("MicNoize.exe").display()))?; return Ok(false);
     }
     if j.before.installed(&j.install).is_ok() {
         if recovery.is_some() {
-            Command::new(current.join("MicNoize.exe")).creation_flags(0x08000000).spawn().map_err(|e|format!("Запуск {}: {e}",current.join("MicNoize.exe").display()))?;return Ok(false);
+            updated_app(&j).spawn().map_err(|e|format!("Запуск {}: {e}",current.join("MicNoize.exe").display()))?;return Ok(false);
         }
         if j.phase!=Phase::Prepared {
             let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
@@ -888,6 +906,31 @@ pub fn startup() -> Result<bool,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn background_transactions_are_silent_and_restart_only_in_the_tray() {
+        let t=temp();let mut j=Journal{schema:1,transaction:uuid::Uuid::new_v4().to_string(),install:t.0.join("install"),runtime:t.0.join("runtime"),
+            phase:Phase::Prepared,before:bundle("1.0.0",b"old",b"old host"),after:bundle("1.1.0",b"new",b"new host"),
+            previous_hash:"a".repeat(64),candidate_hash:"b".repeat(64),updater_hash:"c".repeat(64),task_enabled:true,applier:None,rollback_attempts:0,resume:None,legacy:None};
+        assert!(!background_update(&j));
+        assert!(!updated_app(&j).get_args().any(|arg|arg=="--start-tray"));
+        assert!(!apply_command(&j,false,None).get_args().any(|arg|arg=="--silent"));
+        assert!(apply_command(&j,false,Some("centered")).get_args().any(|arg|arg=="--silent"));
+        fs::create_dir_all(folder(&j)).unwrap();atomic(&folder(&j).join("start-tray"),b"background").unwrap();
+        for phase in [Phase::Prepared,Phase::Applying,Phase::RollingBack] {
+            j.phase=phase;save(&j).unwrap();let loaded=read(&j.runtime).unwrap();
+            assert!(background_update(&loaded));
+            let app=updated_app(&loaded);assert!(app.get_args().any(|arg|arg=="--start-tray"));
+            assert_eq!(app.get_current_dir(),Some(j.runtime.as_path()));
+            for previous in [false,true] {
+                let command=apply_command(&loaded,previous,None);
+                assert!(command.get_args().any(|arg|arg=="--silent"));
+                assert!(command.get_args().any(|arg|arg=="--norestart"));
+            }
+        }
+        j.phase=Phase::Complete;assert!(!background_update(&j));
+        j.phase=Phase::Prepared;j.transaction=uuid::Uuid::new_v4().to_string();
+        assert!(!background_update(&j),"a retained marker cannot hide a later manual update");
+    }
     #[test]
     fn startup_file_errors_identify_paths() {
         let t=temp();let missing=t.0.join("missing.nupkg");let copy=t.0.join("copy.nupkg");

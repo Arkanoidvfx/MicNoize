@@ -339,6 +339,7 @@ mod focus {
         pub const QUIT: usize = 7;
         pub const APP_AUTOSTART: usize = 79;
         pub const UPDATE: usize = 57;
+        pub const AUTO_UPDATE: usize = 99;
         pub const DRIVER: usize = 72;
         pub const REPAIR: usize = 90;
         pub const REPAIR_REINSTALL: usize = 91;
@@ -570,6 +571,7 @@ enum Msg {
     Refresh,
     AutostartUpdated(Result<bool, String>),
     AppAutostart(bool),
+    AutoUpdate(bool),
     /// Визуальные эффекты: the page-switch pixelation and the sliders' idle wave + warm-up.
     PixelShift(bool),
     SliderIdle(bool),
@@ -631,6 +633,7 @@ enum Msg {
     UpdatePrepared(Result<(),String>),
     UpdateApplied(Result<(),String>),
     ApplyUpdate,
+    ApplyAutoUpdate,
     CancelPhrase,
     Bind(usize),
     SoundpadFolder,
@@ -983,6 +986,9 @@ struct App {
     update_checking: bool,
     last_update_check: Instant,
     update_ready: bool,
+    auto_update: bool,
+    auto_update_pending: bool,
+    background_update: bool,
     update_status: String,
     apply_after_quit: bool,
     update_resume: Option<ResumeIntent>,
@@ -1307,6 +1313,7 @@ impl App {
         let slider_idle = settings.number("ui", "slider_idle", 1, 0, 1) != 0;
         // On by default: a fresh install starts with Windows until the user unticks it.
         let app_autostart = settings.number("ui", "app_autostart", 1, 0, 1) != 0;
+        let auto_update = settings.number("ui", "auto_update", 0, 0, 1) != 0;
         if !cfg!(test) {
             let _ = set_app_autostart(app_autostart);
         }
@@ -1323,7 +1330,7 @@ impl App {
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 2.0)
             .unwrap_or(1.0);
-        let tray_start = cfg!(test) || args.iter().any(|s| s == "--start-tray");
+        let tray_start = cfg!(test) || args.iter().any(|s| s == "--start-tray") || maintenance::start_in_tray();
         // After an update the watcher's window waits for this one to take over.
         let intro = if cfg!(test) { None } else { update_window::take_handoff(&runtime_root) };
         // Without a hand-over to play, a waiting update window may close right away.
@@ -1553,6 +1560,9 @@ impl App {
                 tray_badged: false,
                 icon_window: None,
                 update_ready: false,
+                auto_update,
+                auto_update_pending: false,
+                background_update: false,
                 update_status: if cfg!(test) {
                     String::new()
                 } else {
@@ -1741,6 +1751,7 @@ impl App {
         }
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
         self.settings.set("ui", "app_autostart", self.app_autostart as i32);
+        self.settings.set("ui", "auto_update", self.auto_update as i32);
         self.settings.set("ui", "page_pixelate", self.pixel_shift as i32);
         self.settings.set("ui", "effects_group", self.effects_group);
         self.settings.set("ui", "slider_idle", self.slider_idle as i32);
@@ -1895,8 +1906,11 @@ impl App {
         tacho::ReadyClock { start: self.ready_fx,
             paused: self.ready_fx_paused.or(self.ready_fx_due.then_some(Duration::ZERO)) }
     }
+    fn update_notice(&self) -> bool {
+        self.update_ready && !self.auto_update
+    }
     fn sync_ready_fx(&mut self, now: Instant) {
-        if !self.update_ready && self.ready_preview.is_none() {
+        if !self.update_notice() && self.ready_preview.is_none() {
             self.ready_fx = None;
             self.ready_fx_paused = None;
             self.ready_fx_due = false;
@@ -1986,8 +2000,9 @@ impl App {
     /// window (centred on screen when the app window is not shown).
     fn apply_update(&self, center: Option<iced::Point>) -> Task<Msg> {
         let intent = self.update_resume;
-        let at = center.map_or("centered".to_owned(), |c| format!("{:.1},{:.1}", c.x, c.y));
-        Task::batch([perform(async move { updater::apply_and_restart(intent, Some(at)) }, Msg::UpdateApplied), timer(false)])
+        let background = self.background_update;
+        let at = (!background).then(|| center.map_or("centered".to_owned(), |c| format!("{:.1},{:.1}", c.x, c.y)));
+        Task::batch([perform(async move { updater::apply_and_restart(intent, at, background) }, Msg::UpdateApplied), timer(false)])
     }
     /// The window background. tiny-skia repaints every damaged region separately with all
     /// that overlaps it; a page swap damages 7–30 regions and cost 10–120 ms a frame, against
@@ -2394,15 +2409,28 @@ impl App {
     /// Every message, then the update badge follows `update_ready` in the tray and the taskbar.
     fn update(&mut self, msg: Msg) -> Task<Msg> {
         let task = self.update_state(msg);
-        if self.tray_badged != self.update_ready {
-            self.tray_badged = self.update_ready;
+        let background_ready = !self.quitting && !self.driver_installing && !self.core_installing
+            && !self.rvc_runtime_installing && !self.rvc_importing && !self.ui_active();
+        let task = if background_ready && self.background_update && self.apply_after_quit {
+            Task::batch([task, self.update_state(Msg::Quit)])
+        } else if background_ready && self.auto_update_pending && self.update_ready && !self.update_checking
+        {
+            // Consume once: a failed check/preparation waits for an explicit retry.
+            self.auto_update_pending = false;
+            Task::batch([task, self.update_state(Msg::ApplyAutoUpdate)])
+        } else {
+            task
+        };
+        let notice = self.update_notice();
+        if self.tray_badged != notice {
+            self.tray_badged = notice;
             let (rgba, w, h) = icon_rgba(true);
-            self.engine.tray_icon(self.update_ready.then_some((&rgba[..], w, h)));
+            self.engine.tray_icon(notice.then_some((&rgba[..], w, h)));
         }
         let Some(id) = self.window else { return task };
-        if self.icon_window.map_or(self.update_ready, |(window, badge)| window != id || badge != self.update_ready) {
-            self.icon_window = Some((id, self.update_ready));
-            return Task::batch([task, window::set_icon(id, window_icon(self.update_ready))]);
+        if self.icon_window.map_or(notice, |(window, badge)| window != id || badge != notice) {
+            self.icon_window = Some((id, notice));
+            return Task::batch([task, window::set_icon(id, window_icon(notice))]);
         }
         task
     }
@@ -2593,7 +2621,7 @@ impl App {
                             );
                             if self.apply_after_quit || self.rehearse_after_quit {
                                 // Shrink into the update window first when the window is on screen.
-                                if let Some(id)=self.window.filter(|_|!cfg!(test)) {
+                                if let Some(id)=self.window.filter(|_|!cfg!(test) && !self.background_update) {
                                     return window::position(id).then(move |position| window::size(id).map(move |size| Msg::DecayGeometry(position,size)));
                                 }
                                 return self.hand_over(None);
@@ -3001,6 +3029,8 @@ impl App {
                 // disk when the check itself failed (offline). Current means the release is gone.
                 let apply = std::mem::take(&mut self.apply_pending)
                     && matches!(status, updater::Status::Ready(_) | updater::Status::Unavailable(_));
+                self.auto_update_pending = self.auto_update
+                    && matches!(status, updater::Status::Ready(_));
                 match status {
                     updater::Status::Current => {
                         self.update_ready = false;
@@ -3026,7 +3056,9 @@ impl App {
                             };
                     }
                 }
-                if apply && !self.quitting && !self.driver_installing && !self.core_installing {
+                if apply && !self.quitting && !self.driver_installing && !self.core_installing
+                    && !self.rvc_runtime_installing && !self.rvc_importing {
+                    self.auto_update_pending=false;
                     self.apply_pending=true;self.update_checking=true;
                     self.update_status="Проверяем и сохраняем комплект для отката…".into();
                     if let Some(restart)=&mut self.restart {restart.advance(1,Instant::now());}
@@ -3037,8 +3069,12 @@ impl App {
             Msg::UpdatePrepared(result) => {
                 self.apply_pending=false;self.update_checking=false;
                 match result {
-                    Ok(()) if !self.quitting && !self.driver_installing && !self.core_installing => {
+                    Ok(()) if !self.quitting && (self.background_update || (!self.driver_installing && !self.core_installing)) => {
                         self.apply_after_quit=true;
+                        if self.background_update && (self.ui_active() || self.driver_installing || self.core_installing
+                            || self.rvc_runtime_installing || self.rvc_importing) {
+                            return Task::none();
+                        }
                         if let Some(restart)=&mut self.restart {restart.advance(2,Instant::now());}
                         // A quick check and copy still let the button fall and the air blow in.
                         let wait=self.restart.map_or(Duration::ZERO,|r|tacho::restart::HOLD.saturating_sub(r.start.elapsed()));
@@ -3063,14 +3099,16 @@ impl App {
                     if let Some(intent)=self.update_resume.take(){self.resume_processing(intent);}
                 } else {return exit_ui();}
             }
-            Msg::ApplyUpdate => {
+            Msg::ApplyUpdate | Msg::ApplyAutoUpdate => {
                 // The download may be days old in a tray app: fetch the newest release first,
                 // so one click lands on the latest version instead of the next one.
-                if self.update_ready && !self.quitting && !self.update_checking && !self.driver_installing && !self.core_installing {
+                if self.update_ready && !self.quitting && !self.update_checking && !self.driver_installing && !self.core_installing
+                    && !self.rvc_runtime_installing && !self.rvc_importing {
                     self.update_checking = true;
                     self.apply_pending = true;
+                    self.background_update = matches!(msg, Msg::ApplyAutoUpdate);
                     self.update_status = "Проверяем последнюю версию…".into();
-                    self.start_restart_fx();
+                    if !self.background_update {self.start_restart_fx();}
                     return perform(
                         async { updater::check_and_download() },
                         Msg::UpdateChecked,
@@ -3283,6 +3321,12 @@ impl App {
                     }
                     Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
                 }
+            }
+            Msg::AutoUpdate(enabled) => {
+                self.focus = focus::settings::AUTO_UPDATE;
+                self.auto_update = enabled;
+                self.auto_update_pending = enabled && self.update_ready && !self.update_checking;
+                self.save();
             }
             Msg::PixelShift(enabled) => {
                 self.focus = focus::settings::PIXEL_SHIFT;
@@ -4955,7 +4999,7 @@ live:{}", self.engine.session_report());
                     items.extend([REPAIR_LINES, REPAIR_REINSTALL, REPAIR_CONFIRM, REPAIR_CANCEL]);
                 }
                 items.extend([APP_AUTOSTART, PIXEL_SHIFT, SLIDER_IDLE]);
-                items.extend([UPDATE, REHEARSE, READY_PREVIEW]);
+                items.extend([AUTO_UPDATE, UPDATE, REHEARSE, READY_PREVIEW]);
                 items.extend([LOGS, QUIT]);
                 items.extend(tabs);
                 items
@@ -5052,7 +5096,7 @@ live:{}", self.engine.session_report());
                 items
             };
             let mut order = order;
-            if self.update_ready {
+            if self.update_notice() {
                 order.insert(0, focus::UPDATE_BANNER);
             }
             self.focus = match order.iter().position(|&v| v == self.focus) {
@@ -5104,7 +5148,7 @@ live:{}", self.engine.session_report());
             return self.update(Msg::Page(0));
         }
         let activate = matches!(key, Key::Named(Named::Enter | Named::Space)) && !repeat;
-        if activate && self.focus == focus::UPDATE_BANNER && self.update_ready {
+        if activate && self.focus == focus::UPDATE_BANNER && self.update_notice() {
             return self.update(Msg::ApplyUpdate);
         }
         if activate {
@@ -5325,6 +5369,7 @@ live:{}", self.engine.session_report());
                 DONE if activate => Msg::Settings,
                 QUIT if activate => Msg::Quit,
                 APP_AUTOSTART if activate => Msg::AppAutostart(!self.app_autostart),
+                AUTO_UPDATE if activate => Msg::AutoUpdate(!self.auto_update),
                 PIXEL_SHIFT if activate => Msg::PixelShift(!self.pixel_shift),
                 SLIDER_IDLE if activate => Msg::SliderIdle(!self.slider_idle),
                 LOGS if activate => Msg::Page(5),
@@ -6315,6 +6360,125 @@ page_pixelate=0")).unwrap().unwrap();
         assert!(!app.quitting && app.apply_pending,"preparation must finish before stopping audio");
         let _ = app.update(Msg::UpdatePrepared(Ok(())));
         assert!(app.apply_after_quit, "Enter on the banner must apply the newest update");
+    }
+    #[test]
+    fn automatic_updates_are_opt_in_saved_and_keyboard_accessible() {
+        use keyboard::{Key, Modifiers, key::Named};
+        for value in ["", "[ui]\nauto_update=0", "[ui]\nauto_update=invalid", "[ui]\nauto_update=2"] {
+            let (app, _) = App::from_settings(Settings::for_test(value)).unwrap().unwrap();
+            assert!(!app.auto_update && !app.auto_update_pending);
+        }
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(window::Id::unique());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".tmp/auto-update-settings-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        app.settings.path = dir.join("settings.ini");
+        app.benchmark = false;
+        app.details = true;
+        app.focus = focus::settings::SLIDER_IDLE;
+        drop(app.key(Key::Named(Named::Tab), Modifiers::empty(), false));
+        assert_eq!(app.focus, focus::settings::AUTO_UPDATE);
+        drop(app.key(Key::Named(Named::Space), Modifiers::empty(), false));
+        assert!(app.auto_update);
+        assert_eq!(app.settings.get("ui", "auto_update"), Some("1"));
+        let (restored, _) = App::from_settings(Settings::for_test(&app.settings.text())).unwrap().unwrap();
+        assert!(restored.auto_update);
+        drop(app.update(Msg::AutoUpdate(false)));
+        assert_eq!(app.settings.get("ui", "auto_update"), Some("0"));
+    }
+    #[test]
+    fn automatic_update_in_tray_uses_the_verified_restart_flow() {
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]\nauto_update=1")).unwrap().unwrap();
+        assert!(app.window.is_none());
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        assert!(app.update_checking && app.apply_pending && !app.auto_update_pending);
+        assert!(app.background_update && app.restart.is_none() && !app.update_notice() && !app.tray_badged);
+        assert!(!app.quitting && !app.apply_after_quit);
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.10".into()))));
+        assert!(app.apply_pending && !app.quitting);
+        assert_eq!(app.update_version.as_deref(), Some("9.9.10"));
+        drop(app.update(Msg::UpdatePrepared(Ok(()))));
+        assert!(app.apply_after_quit && app.quitting);
+    }
+    #[test]
+    fn automatic_update_waits_for_installation_and_can_be_disabled() {
+        for installer in 0..4 {
+            let (mut app, _) = App::from_settings(Settings::for_test("[ui]\nauto_update=1")).unwrap().unwrap();
+            match installer {
+                0 => app.core_installing = true,
+                1 => app.driver_installing = true,
+                2 => app.rvc_runtime_installing = true,
+                _ => app.rvc_importing = true,
+            }
+            drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+            assert!(app.auto_update_pending && !app.apply_pending && !app.quitting);
+            if installer == 0 {
+                drop(app.update(Msg::AutoUpdate(false)));
+                assert!(!app.auto_update_pending);
+            }
+            app.core_installing = false;
+            app.driver_installing = false;
+            app.rvc_runtime_installing = false;
+            app.rvc_importing = false;
+            drop(app.update(Msg::Noop));
+            assert_eq!(app.apply_pending, installer != 0);
+        }
+    }
+    #[test]
+    fn automatic_update_failure_does_not_loop_and_ready_update_can_be_opted_in() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        assert!(!app.apply_pending && !app.quitting);
+        drop(app.update(Msg::AutoUpdate(true)));
+        assert!(app.apply_pending && app.update_checking);
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        drop(app.update(Msg::UpdatePrepared(Err("invalid bundle".into()))));
+        drop(app.update(Msg::Noop));
+        assert!(!app.apply_pending && !app.auto_update_pending && !app.quitting);
+        assert!(app.update_status.contains("invalid bundle"));
+        drop(app.update(Msg::UpdateChecked(updater::Status::Unavailable("offline".into()))));
+        assert!(!app.apply_pending && !app.auto_update_pending);
+        drop(app.update(Msg::UpdateChecked(updater::Status::Current)));
+        assert!(!app.apply_pending && !app.auto_update_pending);
+    }
+    #[test]
+    fn automatic_update_defers_when_installation_starts_during_the_recheck() {
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]\nauto_update=1")).unwrap().unwrap();
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        assert!(app.apply_pending);
+        app.core_installing = true;
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        assert!(app.auto_update_pending && !app.apply_pending && !app.quitting);
+        app.core_installing = false;
+        drop(app.update(Msg::Noop));
+        assert!(app.apply_pending && app.update_checking);
+    }
+    #[test]
+    fn automatic_update_waits_while_the_user_is_working_in_the_window() {
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]\nauto_update=1")).unwrap().unwrap();
+        let id=window::Id::unique();app.window=Some(id);app.window_focused=true;
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        app.sync_ready_fx(Instant::now());
+        assert!(app.auto_update_pending && !app.apply_pending && !app.quitting);
+        assert!(!app.update_notice() && !app.tray_badged && !app.ready_clock().present());
+        assert_eq!(app.icon_window,None,"no taskbar icon change is needed for an automatic update");
+        drop(app.update(Msg::WindowFocus(id,false)));
+        assert!(app.apply_pending && app.background_update && app.restart.is_none());
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        drop(app.update(Msg::UpdatePrepared(Err("invalid bundle".into()))));
+        assert!(!app.quitting && app.window==Some(id) && app.restart.is_none());
+        assert!(app.update_status.contains("invalid bundle"));
+    }
+    #[test]
+    fn automatic_update_does_not_close_a_window_reopened_during_preparation() {
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]\nauto_update=1")).unwrap().unwrap();
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
+        let id=window::Id::unique();app.window=Some(id);app.window_focused=true;
+        drop(app.update(Msg::UpdatePrepared(Ok(()))));
+        assert!(app.apply_after_quit && !app.quitting && app.restart.is_none());
+        drop(app.update(Msg::WindowFocus(id,false)));
+        assert!(app.quitting && app.background_update);
     }
     #[test]
     fn update_check_repeats_in_tray_after_interval() {

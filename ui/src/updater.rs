@@ -53,7 +53,7 @@ pub fn prepare() -> Result<(), String> {
 
 /// `window`: where the watcher shows the update window (see `maintenance::apply`), or Velopack's
 /// own dialog when `None`.
-pub fn apply_and_restart(intent:Option<crate::ResumeIntent>,window:Option<String>) -> Result<(), String> {crate::maintenance::apply_prepared(intent,window)}
+pub fn apply_and_restart(intent:Option<crate::ResumeIntent>,window:Option<String>,background:bool) -> Result<(), String> {crate::maintenance::apply_prepared(intent,window,background)}
 
 /// Explicit developer check: use the same verifier/transaction against a local full package.
 pub fn check_local_package(path:&std::path::Path)->Result<(),String> {
@@ -65,5 +65,5 @@ pub fn check_local_package(path:&std::path::Path)->Result<(),String> {
     let (_,manifest)=find_local_full_packages(&packages).into_iter().find(|(candidate,_)|candidate.canonicalize().ok().as_ref()==Some(&path)).ok_or("Full package manifest missing")?;
     let asset=velopack::VelopackAsset{FileName:path.file_name().and_then(|s|s.to_str()).ok_or("Invalid package filename")?.into(),Version:manifest.version.to_string(),..Default::default()};
     crate::maintenance::prepare(&asset)?;
-    apply_and_restart(Some(crate::ResumeIntent{microphone:false,headphones:false,monitor:0,full_monitor:false}),None)
+    apply_and_restart(Some(crate::ResumeIntent{microphone:false,headphones:false,monitor:0,full_monitor:false}),None,false)
 }
