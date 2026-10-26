@@ -8,6 +8,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+#[path = "telemetry_support.rs"]
+mod support;
+#[path = "telemetry_network.rs"]
+mod network;
+
+pub fn start(data: &Path, runtime: &Path) { support::start(data, runtime); }
+pub fn status(data: &Path, message: &str, failed: bool, recovered: bool) { support::status(data, message, failed, recovered); }
+pub fn result<T>(data: &Path, feature: &str, value: &Result<T,String>) { support::feature_result(data,feature,value.as_ref().err().cloned()); }
 
 // Mic Noize has its own Worker and its own D1 database; the Moment Player Worker keeps
 // accepting `app_id = mic_noize` only as a fallback while the new one is being deployed.
@@ -24,19 +32,36 @@ fn enabled() -> bool {
 }
 
 pub fn record(data: &Path, name: &str, details: serde_json::Value) {
-    if !enabled() {
+    if !enabled() || cfg!(test) {
         return;
     }
+    if name == "session-start" || name == "session-end" { return; }
     let data = data.to_path_buf();
     let name = name.to_owned();
     std::thread::spawn(move || {
-        let _ = send(&data, vec![event("app-lifecycle", &name, details)], Duration::from_secs(4));
+        let marker=data.join("telemetry-update-failure.json");
+        if name=="check-none" && std::fs::remove_file(&marker).is_err(){return;}
+        let mut details=details;
+        if name=="update-check-error" {
+            let mut previous:serde_json::Value=std::fs::read(&marker).ok().and_then(|v|serde_json::from_slice(&v).ok()).unwrap_or(json!({}));
+            let current=SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|d|d.as_secs());
+            let fingerprint=hex::encode(Sha256::digest(details.to_string().as_bytes()));
+            let repeated=previous["fingerprint"].as_str()==Some(&fingerprint);
+            let count=previous["count"].as_u64().unwrap_or(0)+1;
+            if repeated && current.saturating_sub(previous["sent_at"].as_u64().unwrap_or(0))<3600 {
+                previous["count"]=json!(count);let _=std::fs::write(marker,previous.to_string());return;
+            }
+            details["occurrences"]=json!(if repeated {count} else {1});
+            let _=std::fs::write(marker,json!({"fingerprint":fingerprint,"sent_at":current,"count":0}).to_string());
+        }
+        let _ = send(&data, vec![event(&name, &name, details)], Duration::from_secs(4));
     });
 }
 
 /// Sent on the UI thread while quitting, so it is capped short: a stalled connection used to
 /// freeze the window for good (ureq has no timeout by default) and only killing the process helped.
 pub fn record_blocking(data: &Path, name: &str, details: serde_json::Value) {
+    if name == "session-end" { return; }
     if enabled() {
         let _ = send(data, vec![event("app-lifecycle", name, details)], Duration::from_millis(1500));
     }
@@ -140,26 +165,8 @@ pub fn startup_failure(data: &Path, runtime: &Path, error: &str) -> Result<(), S
     send(data, events, Duration::from_secs(3))
 }
 
-fn startup_events(data: &Path, runtime: &Path, app: &Path, error: &str) -> Vec<serde_json::Value> {
-    let mut events = report_events(data, runtime, app, error);
-    events[0] = error_event("startup-failure", error);
-    let mut inventory = vec![format!("app={}\ndata={}\nruntime={}", app.display(), data.display(), runtime.display())];
-    if let Ok(exe) = std::env::current_exe() { inventory.push(format!("exe={}", exe.display())); }
-    for path in [app.join("MicNoize.exe"), app.join("mic_tag_host.exe"), app.join("micnoize-bundle.json"), app.join("sq.version"),
-        runtime.join(".update/journal.json"), runtime.join(".update/repair.json"), runtime.join(".update/hold")] {
-        let state = match path.metadata() {
-            Ok(meta) => format!("exists; bytes={}", meta.len()),
-            Err(e) => format!("{:?}; os={:?}", e.kind(), e.raw_os_error()),
-        };
-        inventory.push(format!("{}: {state}", path.display()));
-    }
-    if let Ok(text) = crate::logs::read_tail(&runtime.join(".update/journal.json"), 16384)
-        && let Ok(journal) = serde_json::from_str::<serde_json::Value>(&text) {
-        inventory.push(format!("journal phase={} before={} after={} install={}",
-            journal["phase"], journal["before"]["version"], journal["after"]["version"], journal["install"]));
-    }
-    events.push(error_event("startup-files", &inventory.join("\n")));
-    events
+fn startup_events(_data: &Path, _runtime: &Path, _app: &Path, error: &str) -> Vec<serde_json::Value> {
+    vec![error_event("startup-failure", error)]
 }
 
 fn report_events(data: &Path, runtime: &Path, app: &Path, note: &str) -> Vec<serde_json::Value> {
@@ -265,8 +272,12 @@ fn support_label(user: &str, computer: &str) -> Option<String> {
 }
 
 fn send(data: &Path, events: Vec<serde_json::Value>, timeout: Duration) -> Result<(), String> {
+    send_with_control(data, events, timeout, false, None).map(|_| ())
+}
+
+fn send_with_control(data: &Path, events: Vec<serde_json::Value>, timeout: Duration, control_only: bool, diagnostic_id: Option<&str>) -> Result<serde_json::Value, String> {
     let install_path = data.join("install-id.txt");
-    let install_id = std::fs::read_to_string(&install_path)
+    let _install_id = std::fs::read_to_string(&install_path)
         .ok()
         .and_then(|s| Uuid::parse_str(s.trim()).ok())
         .unwrap_or_else(|| {
@@ -274,21 +285,28 @@ fn send(data: &Path, events: Vec<serde_json::Value>, timeout: Duration) -> Resul
             let _ = std::fs::write(&install_path, id.to_string());
             id
         });
-    let timestamp = SystemTime::now()
+    let sampled = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
+        .map_err(|e| e.to_string())?;
+    let timestamp=sampled.as_secs();
     let (session, started_at) = SESSION.get_or_init(|| (Uuid::new_v4(), timestamp));
-    let iso = format!("{}Z", chrono_free_utc(timestamp));
+    let millis=sampled.subsec_millis();
+    let iso = format!("{}.{millis:03}Z", chrono_free_utc(timestamp));
     let started_iso = format!("{}Z", chrono_free_utc(*started_at));
     let events: Vec<serde_json::Value> = events
         .into_iter()
         .map(|mut e| {
             e["ts"] = json!(iso);
+            if let Some(fields)=e["data"].as_object_mut(){for value in fields.values_mut(){if let Some(text)=value.as_str(){*value=json!(scrub_text(text));}}}
             e
         })
         .collect();
     let body = serde_json::to_vec(&json!({
+        "batch_id": Uuid::new_v4().to_string(),
+        "capabilities": 1,
+        "network_hint": if control_only { serde_json::Value::Null } else { network::hint() },
+        "control_only": control_only,
+        "diagnostic_id": diagnostic_id,
         "app_id": "mic_noize",
         "session_id": session.to_string(),
         "session_started_at": started_iso,
@@ -300,24 +318,47 @@ fn send(data: &Path, events: Vec<serde_json::Value>, timeout: Duration) -> Resul
         "events": events
     }))
     .map_err(|e| e.to_string())?;
-    let body_hash = hex::encode(Sha256::digest(&body));
+    if control_only { post_body(data, &body, timeout) } else { support::deliver(data, &body, timeout) }
+}
+
+fn scrub_text(text:&str)->String {
+    text.lines().map(|line|{
+        let lower=line.to_ascii_lowercase();
+        if ["password=","password:","token=","token:","secret=","authorization:","api_key=","api-key="].iter().any(|key|lower.contains(key)) {return "<redacted>".to_owned();}
+        let drive=line.as_bytes().windows(3).position(|v|v[0].is_ascii_alphabetic()&&v[1]==b':'&&(v[2]==b'\\'||v[2]==b'/'));
+        let start=[drive,line.find("\\\\"),lower.find("https://"),lower.find("http://")].into_iter().flatten().min();
+        start.map_or_else(||line.to_owned(),|offset|format!("{}<path or url>",&line[..offset]))
+    }).collect::<Vec<_>>().join("\n")
+}
+
+fn post_body(data: &Path, body: &[u8], timeout: Duration) -> Result<serde_json::Value, String> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    let install_id = std::fs::read_to_string(data.join("install-id.txt")).map_err(|e| e.to_string())?;
+    let install_id = Uuid::parse_str(install_id.trim()).map_err(|e| e.to_string())?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs();
+    let body_hash = hex::encode(Sha256::digest(body));
     let signed = format!("{install_id}|{timestamp}|2|{body_hash}");
     let mut mac = Hmac::<Sha256>::new_from_slice(secret().as_bytes()).map_err(|e| e.to_string())?;
     mac.update(signed.as_bytes());
     let hmac = hex::encode(mac.finalize().into_bytes());
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(timeout)).build().into();
-    agent
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).build().into();
+    let mut response = agent
         .post(ENDPOINT)
         .header("Content-Type", "application/json")
         .header("X-App-Id", "mic_noize")
         .header("X-Install-Id", &install_id.to_string())
-        .header("X-App-Version", VERSION)
+        .header("X-App-Version", parsed["app_version"].as_str().unwrap_or(VERSION))
         .header("X-Schema-Version", "2")
         .header("X-Timestamp", &timestamp.to_string())
         .header("X-Hmac", &hmac)
-        .send(&body)
+        .send(body)
         .map_err(|e| e.to_string())?;
-    Ok(())
+    if !response.status().is_success() {
+        let delay=response.headers().get("Retry-After").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);
+        return Err(format!("HTTP {}; retry_after={delay}",response.status()));
+    }
+    let text=response.body_mut().read_to_string().map_err(|e|e.to_string())?;
+    serde_json::from_str(&text).map_err(|e|e.to_string())
 }
 
 // UTC formatting without another time dependency; telemetry accepts ISO-8601.
@@ -350,6 +391,12 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn telemetry_scrubs_paths_and_credentials_but_keeps_failure_reason() {
+        assert_eq!(scrub_text("decode failed C:\\Users\\Private\\clip.mp4"),"decode failed <path or url>");
+        assert_eq!(scrub_text("HTTP 403 https://example.test/private?token=secret"),"<redacted>");
+        assert_eq!(scrub_text("GPU NVIDIA RTX"),"GPU NVIDIA RTX");
+    }
     use super::*;
     #[test]
     fn reports_include_early_host_unpack_errors_and_missing_files() {
@@ -390,9 +437,7 @@ mod tests {
         let startup = startup_events(&root, &runtime, &app, "Восстановление установки: missing file");
         assert_eq!(startup[0]["name"], "startup-failure");
         assert!(startup[0]["data"]["stack_top"].as_str().unwrap().contains("missing file"));
-        let inventory = startup.iter().find(|e|e["name"]=="startup-files").unwrap()["data"]["stack_top"].as_str().unwrap();
-        assert!(inventory.contains("MicNoize.exe: NotFound") && inventory.contains("mic_tag_host.exe: NotFound"));
-        assert!(inventory.contains("Complete") && inventory.contains("0.4.17") && inventory.contains("0.4.20"));
+        assert_eq!(startup.len(),1,"automatic failure reports must not attach the log inventory");
         std::fs::write(runtime.join(".update/journal.json"), b"{torn").unwrap();
         assert!(startup_events(&root, &runtime, &app, "corrupt journal").len() <= 50);
         std::fs::remove_dir_all(root).unwrap();

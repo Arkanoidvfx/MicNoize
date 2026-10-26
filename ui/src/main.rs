@@ -7,6 +7,7 @@ mod engine;
 mod logs;
 mod paths;
 mod rvc;
+mod rtx_voice;
 mod settings;
 mod smooth;
 mod tacho;
@@ -719,8 +720,6 @@ enum Msg {
     DecayGeometry(Option<iced::Point>, Size),
     /// The window's native handle: colour-key it for a morph.
     Keyed(u64),
-    /// Window, HWND, late: after a tray Show, check that Windows really draws the window.
-    ShowCheck(window::Id, u64, bool),
     /// A point in the running morph's timeline.
     MorphStep(MorphStep),
     /// After an update: the hidden window is keyed and shown as the update window; then it grows.
@@ -879,7 +878,6 @@ struct App {
     window_focused: bool,
     /// Set by the title-bar "−": that minimize stays in the taskbar instead of hiding to tray.
     own_minimize: bool,
-    hidden_window: Option<window::Id>,
     /// A tray restore passes through a still-minimized state; that must not hide it again.
     shown_at: Option<Instant>,
     inputs: Vec<Device>,
@@ -1188,7 +1186,7 @@ impl App {
         // Native engine and the RVC worker share this version-independent component root.
         unsafe { std::env::set_var("MNR_RUNTIME_ROOT", &runtime_root) };
         let settings = Settings::load(&paths.data)?;
-        telemetry::record(&paths.data, "session-start", serde_json::json!({}));
+        telemetry::start(&paths.data, &runtime_root);
         Self::from_settings_and_runtime(settings, runtime_root, paths.components)
     }
     #[cfg(test)]
@@ -1313,7 +1311,8 @@ impl App {
         let slider_idle = settings.number("ui", "slider_idle", 1, 0, 1) != 0;
         // On by default: a fresh install starts with Windows until the user unticks it.
         let app_autostart = settings.number("ui", "app_autostart", 1, 0, 1) != 0;
-        let auto_update = settings.number("ui", "auto_update", 0, 0, 1) != 0;
+        // On by default since 0.4.42; a new key, because 0.4.41 saved its old default 0 for everyone.
+        let auto_update = settings.number("ui", "auto_update_on", 1, 0, 1) != 0;
         if !cfg!(test) {
             let _ = set_app_autostart(app_autostart);
         }
@@ -1449,7 +1448,6 @@ impl App {
                 window,
                 window_focused: false,
                 own_minimize: false,
-                hidden_window: None,
                 shown_at: None,
                 inputs: vec![],
                 outputs: vec![],
@@ -1751,7 +1749,7 @@ impl App {
         }
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
         self.settings.set("ui", "app_autostart", self.app_autostart as i32);
-        self.settings.set("ui", "auto_update", self.auto_update as i32);
+        self.settings.set("ui", "auto_update_on", self.auto_update as i32);
         self.settings.set("ui", "page_pixelate", self.pixel_shift as i32);
         self.settings.set("ui", "effects_group", self.effects_group);
         self.settings.set("ui", "slider_idle", self.slider_idle as i32);
@@ -2322,6 +2320,9 @@ impl App {
         if key != self.logged_message {
             if !self.message.is_empty() && !cfg!(test) {
                 logs::note(&self.runtime_root, &self.message);
+                telemetry::status(self.settings.path.parent().unwrap(), &self.message,
+                    self.snapshot.state > 4 || self.snapshot.state < 0,
+                    matches!(self.snapshot.state, 2 | 3));
             }
             self.logged_message = key;
         }
@@ -2949,41 +2950,25 @@ impl App {
                 if let Some(id) = self.window.take() {
                     self.window_focused = false;
                     self.sync_ready_fx(Instant::now());
-                    // Keep the native window alive while audio continues in the tray.
-                    self.hidden_window = Some(id);
-                    return window::set_mode(id, window::Mode::Hidden);
+                    // Audio continues in the tray; Show opens a fresh window.
+                    return window::close(id);
                 }
             }
             Msg::Show => {
                 self.shown_at = Some(Instant::now());
                 self.own_minimize = false;
-                if let Some(id) = self.window {
-                    // An in-flight hide/Opened callback may leave a tracked window hidden.
+                if let Some(id) = self.window.filter(|_| self.morph.is_some() || self.restart.is_some()) {
+                    // An update animation owns this window.
                     return window::set_mode(id,window::Mode::Windowed)
-                        .chain(Task::batch([window::minimize(id,false),window::gain_focus(id)]))
-                        .chain(window::raw_id::<Msg>(id).map(move |hwnd| Msg::ShowCheck(id, hwnd, false)));
+                        .chain(Task::batch([window::minimize(id,false),window::gain_focus(id)]));
                 }
-                if let Some(id) = self.hidden_window.take() {
-                    self.window = Some(id);
-                    return window::set_mode(id, window::Mode::Windowed)
-                        .chain(Task::batch([window::minimize(id, false),window::gain_focus(id)]))
-                        .chain(window::raw_id::<Msg>(id).map(move |hwnd| Msg::ShowCheck(id, hwnd, false)));
-                }
+                // Always a new native window, like the tray restart: one kept for hours could stop
+                // drawing (empty or one-line taskbar preview) in ways no HWND state check caught.
+                let old = self.window.take().map_or_else(Task::none, window::close);
+                self.window_focused = false;
                 let (id, t) = Self::open(self.qa_scale, None);
                 self.window = Some(id);
-                return t;
-            }
-            Msg::ShowCheck(id, hwnd, late) => {
-                // Skip a window hidden again on purpose and the update morph's deliberate keying.
-                if self.window == Some(id) && self.morph.is_none() && !self.own_minimize {
-                    if let Some(wrong) = update_window::force_visible(hwnd) {
-                        logs::note(&self.runtime_root, &format!("Окно из трея не показалось ({wrong}{}); восстановлено", if late { ", через 1,6 с" } else { "" }));
-                    }
-                    if !late {
-                        // Once more after the restore guard: a late hide must not leave a ghost window.
-                        return perform(async { std::thread::sleep(Duration::from_millis(1600)) }, move |_| Msg::ShowCheck(id, hwnd, true));
-                    }
-                }
+                return Task::batch([old, t]);
             }
             Msg::Minimize => {
                 self.window_focused = false;
@@ -3523,6 +3508,7 @@ impl App {
                 }
             }
             Msg::CoreInstalled(result) => {
+                telemetry::result(self.settings.path.parent().unwrap(),"components",&result);
                 self.core_installing = false;
                 self.transfer.clear();
                 // The setup card shows the outcome; app.log keeps it.
@@ -3602,6 +3588,7 @@ impl App {
                 }
             }
             Msg::Repaired(result) => {
+                telemetry::result(self.settings.path.parent().unwrap(),"repair",&result);
                 let intent=self.repair_resume.take();self.driver_installing=false;self.repair_started=false;self.busy=false;
                 self.snapshot.state=0;self.headphone_state=0;self.headphone_busy=false;
                 self.driver_ready=cfg!(test)||components::driver_installed();
@@ -3685,6 +3672,7 @@ live:{}", self.engine.session_report());
                 }
             }
             Msg::DriverInstalled(result) => {
+                telemetry::result(self.settings.path.parent().unwrap(),"driver",&result);
                 self.driver_installing = false;
                 match result {
                     // The virtual microphone appears only after the driver exists; the host
@@ -5650,6 +5638,9 @@ fn main() {
         let Some((app, task)) = App::new().map_err(|e| format!("Инициализация приложения: {e}"))? else {
             return Ok(());
         };
+        if !args.iter().any(|arg| arg == "--ui-benchmark") {
+            rtx_voice::warn_if_running(&app.runtime_root);
+        }
         let state = std::cell::RefCell::new(Some((app, task)));
         iced::daemon(
             move || state.borrow_mut().take().expect("boot once"),
@@ -6285,41 +6276,49 @@ page_pixelate=0")).unwrap().unwrap();
         let _ = app.update(Msg::Restored(id));
         assert!(!app.own_minimize, "restoring through the taskbar clears the title-bar minimize latch");
         let _ = app.update(Msg::Minimized(id));
-        assert_eq!(app.hidden_window, Some(id), "the next taskbar click hides even without a focus event");
+        assert_eq!(app.window, None, "the next taskbar click hides even without a focus event");
         let _ = app.update(Msg::Show);
+        let id = app.window.unwrap();
         let _ = app.update(Msg::MinimizedState(id, Some(true)));
         let _ = app.update(Msg::Minimized(id));
         assert_eq!(app.window, Some(id), "a tray restore still passing through minimized is not hidden again");
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
         let _ = app.update(Msg::MinimizedState(id, Some(true)));
-        assert_eq!(app.hidden_window, Some(id), "a missed focus and resize event still hides to tray");
+        assert_eq!(app.window, None, "a missed focus and resize event still hides to tray");
         let _ = app.update(Msg::Show);
+        let id = app.window.unwrap();
         let _ = app.update(Msg::WindowFocus(id, true));
         let _ = app.update(Msg::WindowFocus(id, false));
         let _ = app.update(Msg::MinimizedState(id, Some(false)));
         assert_eq!(app.window, Some(id), "losing focus alone does not hide the window");
         let _ = app.update(Msg::MinimizedState(id, Some(true)));
-        assert_eq!(app.hidden_window, Some(id), "a missed resize still hides to tray");
+        assert_eq!(app.window, None, "a missed resize still hides to tray");
         let _ = app.update(Msg::Show);
+        let id = app.window.unwrap();
         let _ = app.update(Msg::WindowFocus(id, true));
         let _ = app.update(Msg::Minimized(id));
-        assert_eq!(app.hidden_window, Some(id), "a taskbar-click minimize hides to tray");
+        assert_eq!(app.window, None, "a taskbar-click minimize hides to tray");
         let _ = app.update(Msg::Show);
+        let id = app.window.unwrap();
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
         let _ = app.update(Msg::Hide);
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(!app.ui_active()); // Late focus event cannot wake the hidden UI.
         let _ = app.update(Msg::Show);
+        let id = app.window.unwrap();
         assert!(!app.ui_active());
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
+        let _ = app.update(Msg::Show);
+        assert!(app.window.is_some_and(|new| new != id), "tray Open replaces even a shown window, like a restart");
     }
     #[test]
     fn ready_update_is_reachable_from_any_page() {
         use keyboard::{Key, Modifiers, key::Named};
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]
+auto_update_on=0")).unwrap().unwrap();
         app.window = Some(App::open(1.0, None).0);
         let tab = |app: &mut App| {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
@@ -6362,13 +6361,14 @@ page_pixelate=0")).unwrap().unwrap();
         assert!(app.apply_after_quit, "Enter on the banner must apply the newest update");
     }
     #[test]
-    fn automatic_updates_are_opt_in_saved_and_keyboard_accessible() {
+    fn automatic_updates_default_on_saved_and_keyboard_accessible() {
         use keyboard::{Key, Modifiers, key::Named};
-        for value in ["", "[ui]\nauto_update=0", "[ui]\nauto_update=invalid", "[ui]\nauto_update=2"] {
+        for value in ["", "[ui]\nauto_update=0", "[ui]\nauto_update_on=invalid", "[ui]\nauto_update_on=2"] {
             let (app, _) = App::from_settings(Settings::for_test(value)).unwrap().unwrap();
-            assert!(!app.auto_update && !app.auto_update_pending);
+            assert!(app.auto_update && !app.auto_update_pending, "on by default, also over the old saved 0: {value:?}");
         }
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]\nauto_update_on=0")).unwrap().unwrap();
+        assert!(!app.auto_update, "a saved choice to turn it off stays off");
         app.window = Some(window::Id::unique());
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".tmp/auto-update-settings-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -6380,11 +6380,11 @@ page_pixelate=0")).unwrap().unwrap();
         assert_eq!(app.focus, focus::settings::AUTO_UPDATE);
         drop(app.key(Key::Named(Named::Space), Modifiers::empty(), false));
         assert!(app.auto_update);
-        assert_eq!(app.settings.get("ui", "auto_update"), Some("1"));
+        assert_eq!(app.settings.get("ui", "auto_update_on"), Some("1"));
         let (restored, _) = App::from_settings(Settings::for_test(&app.settings.text())).unwrap().unwrap();
         assert!(restored.auto_update);
         drop(app.update(Msg::AutoUpdate(false)));
-        assert_eq!(app.settings.get("ui", "auto_update"), Some("0"));
+        assert_eq!(app.settings.get("ui", "auto_update_on"), Some("0"));
     }
     #[test]
     fn automatic_update_in_tray_uses_the_verified_restart_flow() {
@@ -6426,7 +6426,8 @@ page_pixelate=0")).unwrap().unwrap();
     }
     #[test]
     fn automatic_update_failure_does_not_loop_and_ready_update_can_be_opted_in() {
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]
+auto_update_on=0")).unwrap().unwrap();
         drop(app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into()))));
         assert!(!app.apply_pending && !app.quitting);
         drop(app.update(Msg::AutoUpdate(true)));
@@ -6509,7 +6510,8 @@ page_pixelate=0")).unwrap().unwrap();
     }
     #[test]
     fn ready_reveal_waits_for_focus_and_preserves_visible_time() {
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]
+auto_update_on=0")).unwrap().unwrap();
         let id = window::Id::unique();
         app.window = Some(id);
         let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("9.9.9".into())));
@@ -6539,7 +6541,8 @@ page_pixelate=0")).unwrap().unwrap();
     }
     #[test]
     fn ready_reveal_waits_for_intro_and_survives_the_tray() {
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]
+auto_update_on=0")).unwrap().unwrap();
         let id = window::Id::unique();
         app.window = Some(id);
         app.window_focused = true;
@@ -6556,6 +6559,7 @@ page_pixelate=0")).unwrap().unwrap();
         app.sync_ready_fx(Instant::now() + Duration::from_secs(600));
         let _ = app.update(Msg::Show);
         assert_eq!(app.ready_fx_paused, played, "show without focus cannot consume the reveal");
+        let id = app.window.unwrap();
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ready_fx.is_some() && app.ready_fx_paused.is_none());
         let _ = app.update(Msg::WindowFocus(id, false));
@@ -6600,7 +6604,8 @@ page_pixelate=0")).unwrap().unwrap();
         assert_eq!(pixel(7, 38), [255, 255, 255, 255], "the N of «NEW»");
         assert_eq!(pixel(32, 62), [0x1F, 0xB0, 0x4C, 255], "the green plate");
         assert_eq!(pixel(32, 10), plain[(10 * 64 + 32) * 4..(10 * 64 + 32) * 4 + 4].to_vec(), "the logo above stays");
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]
+auto_update_on=0")).unwrap().unwrap();
         let _ = app.update(Msg::Page(0));
         assert!(!app.tray_badged);
         app.update_ready = true;
