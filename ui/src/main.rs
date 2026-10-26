@@ -744,7 +744,7 @@ enum Msg {
     ClipPicked(usize, bool, Result<Vec<PathBuf>, String>),
     ClipName(String),
     /// The sheet's section by name; anything not a section means none.
-    ClipSection(String),
+    ClipSection(SaveTarget),
     /// The sheet's «Сохранить»: copy into the soundpad under the typed name.
     ClipConfirm,
     CancelBind,
@@ -797,6 +797,17 @@ struct SectionItem {
     label: String,
     count: usize,
     selection: Selection,
+}
+/// Where the soundpad save sheet puts a recording: any sidebar entry, `All` meaning none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SaveTarget {
+    label: String,
+    selection: Selection,
+}
+impl std::fmt::Display for SaveTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 #[derive(Clone,Copy,serde::Serialize,serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -872,7 +883,7 @@ struct App {
     /// The soundpad save sheet of `clip_menu`: the file name being typed, prefilled with the
     /// generated one, and the section the copy joins. Kept while the folder dialog is open.
     clip_name: Option<String>,
-    clip_section: Option<usize>,
+    clip_section: Selection,
     clip_pending_play: Option<(usize, bool)>,
     clip_note: String,
     /// Decayed peak of the monitor's own output: shows that "hear sounds" really renders.
@@ -1483,7 +1494,7 @@ impl App {
                 clip_live: Arc::new(AtomicU32::new(0)),
                 clip_menu: None,
                 clip_name: None,
-                clip_section: None,
+                clip_section: Selection::All,
                 clip_pending_play: None,
                 clip_note: String::new(),
                 monitor_peak: 0.0,
@@ -2217,7 +2228,7 @@ impl App {
         )
     }
     /// Copy recording `index` into `folder` as `name` (its own name when `None`); a soundpad copy
-    /// may join `section`.
+    /// may join the user's section `section` (a group joins by the name alone).
     fn copy_clip(&mut self, index: usize, folder: &Path, name: Option<&str>, section: Option<usize>) {
         let Some(clip) = self.clips.get(index) else {
             return;
@@ -2355,6 +2366,38 @@ impl App {
             selection: Selection::Custom(i),
         }));
         items
+    }
+    /// The save sheet's choices, as the sidebar lists them: automatic groups join by the
+    /// file-name prefix, the user's sections by reference.
+    fn save_targets(&self) -> Vec<SaveTarget> {
+        self.section_items()
+            .into_iter()
+            .map(|item| SaveTarget {
+                label: if item.selection == Selection::All { "Без раздела".into() } else { item.label },
+                selection: item.selection,
+            })
+            .collect()
+    }
+    /// The group label the sheet adds in front of the typed name ("gerych - "), unless the
+    /// name already starts with it.
+    fn clip_group_prefix(&self) -> Option<String> {
+        let Selection::Group(key) = &self.clip_section else {
+            return None;
+        };
+        let typed = self.clip_name.as_deref().unwrap_or_default();
+        if soundpad::prefix(typed).is_some_and(|(_, k)| k == *key) {
+            return None;
+        }
+        soundpad::groups(&self.sounds).into_iter().find(|g| g.key == *key).map(|g| g.label)
+    }
+    /// The soundpad file name for recording `i` from the sheet: typed name, group prefix.
+    fn clip_save_name(&self, i: usize) -> Option<String> {
+        let typed = self.clip_name.as_deref()?;
+        let name = clip_file_name(typed, &self.clips.get(i)?.name);
+        Some(match self.clip_group_prefix() {
+            Some(label) => format!("{label} - {name}"),
+            None => name,
+        })
     }
     fn custom_section(&self) -> Option<usize> {
         match self.section {
@@ -4583,7 +4626,10 @@ live:{}", self.engine.session_report());
                 self.clip_menu = Some(i);
                 self.clip_note.clear();
                 self.clip_name = Some(clip_default_name(&clip.name));
-                self.clip_section = self.custom_section();
+                self.clip_section = match &self.section {
+                    Selection::Custom(i) if *i >= self.sections.len() => Selection::All,
+                    selection => selection.clone(),
+                };
                 self.focus = focus::effects::CLIP_NAME;
                 return Task::batch([
                     iced::widget::operation::focus("clip-name"),
@@ -4596,8 +4642,8 @@ live:{}", self.engine.session_report());
                     self.focus = focus::effects::CLIP_NAME;
                 }
             }
-            Msg::ClipSection(name) => {
-                self.clip_section = self.sections.iter().position(|s| s.name == name);
+            Msg::ClipSection(target) => {
+                self.clip_section = target.selection;
                 self.focus = focus::effects::CLIP_SECTION;
             }
             save @ (Msg::ClipConfirm | Msg::ClipSave(_, false)) => {
@@ -4618,8 +4664,10 @@ live:{}", self.engine.session_report());
                 self.focus = focus::effects::CLIP_BASE + 3 * i + 2;
                 match self.sound_folder.clone().filter(|_| to_soundpad) {
                     Some(folder) => {
-                        let name = self.clip_name.take().map(|typed| clip_file_name(&typed, &self.clips[i].name));
-                        self.copy_clip(i, &folder, name.as_deref(), self.clip_section);
+                        let name = self.clip_save_name(i);
+                        self.clip_name = None;
+                        let section = match self.clip_section { Selection::Custom(s) => Some(s), _ => None };
+                        self.copy_clip(i, &folder, name.as_deref(), section);
                         return self.rescan_sounds();
                     }
                     None => {
@@ -4638,7 +4686,8 @@ live:{}", self.engine.session_report());
             }
             Msg::ClipPicked(i, to_soundpad, result) => {
                 self.sound_dialog = false;
-                let typed = self.clip_name.take();
+                let name = self.clip_save_name(i).filter(|_| to_soundpad);
+                self.clip_name = None;
                 let folder = match result {
                     Ok(paths) => match paths.into_iter().next() {
                         Some(folder) => folder,
@@ -4654,10 +4703,8 @@ live:{}", self.engine.session_report());
                         return Task::none();
                     }
                 };
-                let name = typed
-                    .filter(|_| to_soundpad)
-                    .and_then(|typed| self.clips.get(i).map(|c| clip_file_name(&typed, &c.name)));
-                self.copy_clip(i, &folder, name.as_deref(), self.clip_section.filter(|_| to_soundpad));
+                let section = match self.clip_section { Selection::Custom(s) if to_soundpad => Some(s), _ => None };
+                self.copy_clip(i, &folder, name.as_deref(), section);
                 if to_soundpad {
                     // The picked folder becomes the library, with the copy already inside it.
                     self.sound_folder = Some(folder);
@@ -5141,7 +5188,7 @@ live:{}", self.engine.session_report());
                     if self.clip_menu == Some(i) {
                         if self.clip_name.is_some() {
                             items.push(CLIP_NAME);
-                            if !self.sections.is_empty() {
+                            if self.save_targets().len() > 1 {
                                 items.push(CLIP_SECTION);
                             }
                             items.extend([CLIP_CANCEL, CLIP_CONFIRM]);
@@ -5603,11 +5650,11 @@ live:{}", self.engine.session_report());
                     None => Msg::Noop,
                 },
                 CLIP_SECTION if delta != 0 || activate => {
-                    // No section, then every section, round.
-                    let count = self.sections.len() + 1;
-                    let at = self.clip_section.map_or(0, |i| i + 1);
-                    let next = (at + if delta < 0 { count - 1 } else { 1 }) % count;
-                    Msg::ClipSection(next.checked_sub(1).map(|i| self.sections[i].name.clone()).unwrap_or_default())
+                    // No section, then every group and section, round.
+                    let targets = self.save_targets();
+                    let at = targets.iter().position(|t| t.selection == self.clip_section).unwrap_or(0);
+                    let next = (at + if delta < 0 { targets.len() - 1 } else { 1 }) % targets.len();
+                    Msg::ClipSection(targets[next].clone())
                 }
                 CLIP_CANCEL if activate => Msg::ClipMenu(None),
                 CLIP_CONFIRM if activate => Msg::ClipConfirm,
@@ -6961,11 +7008,31 @@ auto_update_on=0")).unwrap().unwrap();
         let _ = app.update(Msg::ClipName("  Ой: всё?.WAV ".into()));
         app.focus = focus::effects::CLIP_SECTION;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
-        assert_eq!(app.clip_section, Some(0));
+        assert_eq!(app.clip_section, Selection::Custom(0));
         let _ = app.update(Msg::ClipConfirm);
         assert!(library.join("Ой всё.wav").exists());
         assert_eq!(app.sections[0].files, ["Ой всё.wav"]);
         assert!(app.clip_note.contains("«Мемы»"));
+        // Automatic groups are offered too: choosing one adds its prefix to the file name.
+        for name in ["Gerych - a.wav", "gerych - b.wav"] {
+            soundpad::write_wav(&library.join(name), &[0.25; 480]).unwrap();
+        }
+        let _ = app.rescan_sounds();
+        let targets = app.save_targets();
+        assert_eq!(targets[0].label, "Без раздела");
+        let gerych = targets.iter().find(|t| t.selection == Selection::Group("gerych".into())).unwrap().clone();
+        let _ = app.update(Msg::ClipSave(2, true));
+        let _ = app.update(Msg::ClipSection(gerych.clone()));
+        let _ = app.update(Msg::ClipName("смех".into()));
+        assert!(app.clip_group_prefix().is_some());
+        let _ = app.update(Msg::ClipConfirm);
+        assert!(library.join(format!("{} - смех.wav", gerych.label)).exists(), "{}", app.clip_note);
+        let _ = app.update(Msg::ClipSave(2, true));
+        let _ = app.update(Msg::ClipSection(gerych.clone()));
+        let _ = app.update(Msg::ClipName("gerych - ржака".into()));
+        assert_eq!(app.clip_group_prefix(), None, "a name already in the group keeps its prefix once");
+        let _ = app.update(Msg::ClipConfirm);
+        assert!(library.join("gerych - ржака.wav").exists());
         assert_eq!(clip_file_name("   ", "Запись 2026-10-26 17-43-59 (mix).wav"), "Запись 2026-10-26 17-43-59.wav");
         assert_eq!(clip_file_name(r"a/b\c..", "x.wav"), "abc.wav");
         let _ = app.update(Msg::ClipSave(9, true));

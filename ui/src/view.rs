@@ -2208,7 +2208,11 @@ impl App {
         let sheet = |i: usize, name: &'a str| -> Element<'a, Msg> {
             let extension = self.clips[i].name.rsplit_once('.').map_or("wav", |(_, e)| e);
             let folder = self.sound_folder.as_ref().and_then(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned());
-            let mut fields = row![
+            let mut fields = row![];
+            if let Some(group) = self.clip_group_prefix() {
+                fields = fields.push(label(format!("{group} -"), 13, DIM));
+            }
+            let fields = fields.push(row![
                 container(frame(
                     repaint(name, text_input(&super::clip_default_name(&self.clips[i].name), name)
                         .id("clip-name")
@@ -2223,17 +2227,21 @@ impl App {
                 numbers(format!(".{extension}"), 12, FAINT),
             ]
             .spacing(6)
+            .align_y(iced::Center)
+            .width(Length::Fill))
+            .spacing(6)
             .align_y(iced::Center);
-            if !self.sections.is_empty() {
-                let none = "Без раздела".to_string();
-                let mut options = vec![none.clone()];
-                options.extend(self.sections.iter().map(|s| s.name.clone()));
-                let chosen = self.clip_section.and_then(|i| self.sections.get(i)).map_or(none, |s| s.name.clone());
-                fields = fields.push(frame(
-                    repaint(&chosen, pick_list(options, Some(chosen.clone()), Msg::ClipSection)
+            // The section sits with the buttons, so the name keeps the row's whole width.
+            let targets = self.save_targets();
+            let mut buttons = row![].spacing(6).align_y(iced::Center);
+            if targets.len() > 1 {
+                let chosen = targets.iter().find(|t| t.selection == self.clip_section).cloned();
+                buttons = buttons.push(frame(
+                    repaint(chosen.as_ref().map(|t| t.label.clone()), pick_list(targets, chosen, Msg::ClipSection)
+                        .placeholder("Раздел")
                         .text_size(13)
                         .padding([6, 10])
-                        .width(140)
+                        .width(170)
                         .style(device_style)),
                     self.focus == CLIP_SECTION,
                 ));
@@ -2248,13 +2256,10 @@ impl App {
                 ]
                 .align_y(iced::Center),
                 fields,
-                row![
-                    Space::new().width(Length::Fill),
-                    action(medium("Отмена", 12, INK), Msg::ClipMenu(None), self.focus == CLIP_CANCEL, false),
-                    action(medium("Сохранить", 12, ORANGE_DARK), Msg::ClipConfirm, self.focus == CLIP_CONFIRM, true),
-                ]
-                .spacing(6)
-                .align_y(iced::Center),
+                buttons
+                    .push(Space::new().width(Length::Fill))
+                    .push(action(medium("Отмена", 12, INK), Msg::ClipMenu(None), self.focus == CLIP_CANCEL, false))
+                    .push(action(medium("Сохранить", 12, ORANGE_DARK), Msg::ClipConfirm, self.focus == CLIP_CONFIRM, true)),
             ])
         };
         if let Some(i) = opened {
@@ -4342,6 +4347,12 @@ mod tests {
         render(&app, "effects-clip-sheet");
         window.set((960.0, 680.0));
         render(&app, "effects-clip-sheet-min");
+        app.sounds = ["gerych - a.mp3", "gerych - b.mp3", "nastya - c.mp3", "nastya - d.mp3"].map(|name| Sound {
+            name: name.into(), path: PathBuf::new(), key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Unloaded,
+        }).into();
+        app.clip_section = super::Selection::Group("gerych".into());
+        render(&app, "effects-clip-sheet-group-min");
+        (app.sounds, app.clip_section) = (vec![], super::Selection::All);
         app.clip_name = None;
         render(&app, "effects-clip-menu-min");
         app.clip_menu = None;
