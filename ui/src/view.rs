@@ -2091,8 +2091,9 @@ impl App {
         )
     }
 
-    /// Recent recordings as equal tiles, newest first, three per row; each plays, reverses and saves.
-    fn clips_view(&self) -> Element<'_, Msg> {
+    /// Recent recordings as equal tiles, newest first, two per row so the time never runs into the
+    /// buttons; each plays, reverses and saves.
+    fn clips_view<'a>(&'a self) -> Element<'a, Msg> {
         use focus::effects::*;
         if self.clips.is_empty() {
             return caption("Появятся после удержания голосового эффекта.").into();
@@ -2128,7 +2129,7 @@ impl App {
         let live_style = |live: bool, radius: f32| {
             move |_: &Theme| container::Style {
                 background: Some((if live { LIVE_BG } else { CARD2 }).into()),
-                border: Border { color: if live { Color { a: 0.6, ..ORANGE } } else { Color::from_rgb8(0x2E, 0x2F, 0x34) }, width: 1.0, radius: radius.into() },
+                border: Border { color: if live { Color { a: 0.6, ..ORANGE } } else { LINE }, width: 1.0, radius: radius.into() },
                 ..Default::default()
             }
         };
@@ -2138,26 +2139,31 @@ impl App {
             let forward = p.is_some_and(|(_, reverse)| !reverse);
             let focused = self.focus == CLIP_BASE + 3 * i;
             let failed = matches!(clip.state, SoundState::Failed(_));
+            // The play mark sits in its own round badge, lit while the recording sounds.
+            let badge = container(icon(if forward { glyph::STOP } else { glyph::PLAY }, 8, if p.is_some() { ORANGE_DARK } else { DIM }))
+                .center(22)
+                .style(move |_| container::Style {
+                    background: Some((if p.is_some() { ORANGE } else { HOVER }).into()),
+                    border: Border { radius: 11.0.into(), ..Border::default() },
+                    ..Default::default()
+                });
             let play = button(focus_target(
-                row![
-                    icon(if forward { glyph::STOP } else { glyph::PLAY }, 9, if p.is_some() { ORANGE } else { DIM }),
-                    numbers(super::clip_label(&clip.name), 13, if failed { RED } else if p.is_some() { ORANGE } else { INK }),
-                ]
-                .spacing(7)
-                .align_y(iced::Center),
+                row![badge, numbers(super::clip_label(&clip.name), 13, if failed { RED } else if p.is_some() { ORANGE } else { INK })]
+                    .spacing(9)
+                    .align_y(iced::Center),
                 focused,
-            ))
+            ).center_y(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding([0, 9])
+            .padding([0, 6])
             .on_press(Msg::ClipPlay(i, false))
             .style(move |_, status| button::Style {
                 background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
                 text_color: INK,
-                border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
+                border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 7.0.into() },
                 ..Default::default()
             });
-            // Playback under the tile: forward fills from the left, reverse from the right.
+            // Playback along the tile's bottom edge: forward fills from the left, reverse from the right.
             let bar: Element<'_, Msg> = match p {
                 Some((fraction, reverse)) => {
                     let done = (fraction * 1000.0).round() as u16;
@@ -2171,46 +2177,132 @@ impl App {
                 }
                 None => Space::new().height(2).into(),
             };
-            container(column![row![play, reverse_button(i, 28.0), save_button(i, 28.0)].height(32), container(bar).padding([0, 6])])
-                .style(live_style(p.is_some(), 7.0))
+            let divider = container(Space::new().width(1).height(16)).style(|_| container::Style {
+                background: Some(LINE.into()),
+                ..Default::default()
+            });
+            let controls = row![play, divider, reverse_button(i, 30.0), save_button(i, 30.0)]
+                .height(38)
+                .padding(2)
+                .spacing(1)
+                .align_y(iced::Center);
+            container(widget::stack![controls, container(bar).padding([0, 10]).align_bottom(38)])
+                .style(live_style(p.is_some(), 9.0))
                 .width(Length::Fill)
                 .into()
         };
-        // The save menu opens right under the row of the recording it belongs to.
+        // Saving takes the tiles' place instead of pushing the page down: the main window never
+        // scrolls. «В саундпад» turns the choice into a sheet with the file name and the section.
         let opened = self.clip_menu.filter(|i| *i < self.clips.len());
-        let menu = |i: usize| {
-            row![
-                label(format!("Сохранить «{}»", super::clip_label(&self.clips[i].name)), 12, DIM),
-                action(medium("В саундпад", 12, INK), Msg::ClipSave(i, true), self.focus == CLIP_TO_SOUNDPAD, false),
-                action(medium("В папку…", 12, INK), Msg::ClipSave(i, false), self.focus == CLIP_TO_FOLDER, false),
-                caption_button(glyph::CLOSE, Msg::ClipMenu(None), false).width(30).height(30),
+        let panel = |content: widget::Column<'a, Msg>| -> Element<'a, Msg> {
+            container(content.spacing(8))
+                .padding([10, 12])
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(CARD2.into()),
+                    border: Border { color: EDGE, width: 1.0, radius: 9.0.into() },
+                    ..Default::default()
+                })
+                .into()
+        };
+        let sheet = |i: usize, name: &'a str| -> Element<'a, Msg> {
+            let extension = self.clips[i].name.rsplit_once('.').map_or("wav", |(_, e)| e);
+            let folder = self.sound_folder.as_ref().and_then(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned());
+            let mut fields = row![
+                container(frame(
+                    repaint(name, text_input(&super::clip_default_name(&self.clips[i].name), name)
+                        .id("clip-name")
+                        .size(13)
+                        .padding([6, 9])
+                        .on_input(Msg::ClipName)
+                        .on_submit(Msg::ClipConfirm)
+                        .style(input_style)),
+                    self.focus == CLIP_NAME,
+                ))
+                .width(Length::Fill),
+                numbers(format!(".{extension}"), 12, FAINT),
             ]
             .spacing(6)
-            .align_y(iced::Center)
+            .align_y(iced::Center);
+            if !self.sections.is_empty() {
+                let none = "Без раздела".to_string();
+                let mut options = vec![none.clone()];
+                options.extend(self.sections.iter().map(|s| s.name.clone()));
+                let chosen = self.clip_section.and_then(|i| self.sections.get(i)).map_or(none, |s| s.name.clone());
+                fields = fields.push(frame(
+                    repaint(&chosen, pick_list(options, Some(chosen.clone()), Msg::ClipSection)
+                        .text_size(13)
+                        .padding([6, 10])
+                        .width(140)
+                        .style(device_style)),
+                    self.focus == CLIP_SECTION,
+                ));
+            }
+            panel(column![
+                row![
+                    label(format!("В саундпад «{}»", super::clip_label(&self.clips[i].name)), 12, DIM).width(Length::Fill),
+                    label(match folder {
+                        Some(folder) => format!("папка: {folder}"),
+                        None => "папку выберете дальше".into(),
+                    }, 11, FAINT),
+                ]
+                .align_y(iced::Center),
+                fields,
+                row![
+                    Space::new().width(Length::Fill),
+                    action(medium("Отмена", 12, INK), Msg::ClipMenu(None), self.focus == CLIP_CANCEL, false),
+                    action(medium("Сохранить", 12, ORANGE_DARK), Msg::ClipConfirm, self.focus == CLIP_CONFIRM, true),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
+            ])
         };
+        if let Some(i) = opened {
+            return match &self.clip_name {
+                Some(name) => sheet(i, name),
+                None => panel(column![
+                    row![
+                        label(format!("Сохранить «{}»", super::clip_label(&self.clips[i].name)), 12, DIM).width(Length::Fill),
+                        caption_button(glyph::CLOSE, Msg::ClipMenu(None), false).width(30).height(30),
+                    ]
+                    .align_y(iced::Center),
+                    row![
+                        action(container(medium("В саундпад", 12, INK)).center_x(Length::Fill), Msg::ClipSave(i, true), self.focus == CLIP_TO_SOUNDPAD, false).width(Length::Fill),
+                        action(container(medium("В папку…", 12, INK)).center_x(Length::Fill), Msg::ClipSave(i, false), self.focus == CLIP_TO_FOLDER, false).width(Length::Fill),
+                    ]
+                    .spacing(6),
+                ]),
+            };
+        }
         let mut list = column![].spacing(6);
         let all: Vec<usize> = (0..self.clips.len()).collect();
-        for line in all.chunks(3) {
+        for line in all.chunks(2) {
             let mut cells = row![].spacing(6);
             for &i in line {
                 cells = cells.push(tile(i));
             }
-            for _ in line.len()..3 {
+            for _ in line.len()..2 {
                 cells = cells.push(Space::new().width(Length::Fill));
             }
             list = list.push(cells);
-            if let Some(i) = opened.filter(|i| line.contains(i)) {
-                list = list.push(menu(i));
-            }
         }
-        if opened.is_none() && !self.clip_note.is_empty() {
+        if !self.clip_note.is_empty() {
             let saved = self.clip_note.starts_with("Сохранено");
             let hint = self.clip_note.starts_with("Выберите");
             let tone = if saved { GREEN } else if hint { DIM } else { RED };
             list = list.push(
-                row![icon(if saved { glyph::CHECK } else { glyph::WARNING }, 12, tone), label(&self.clip_note, 12, tone)]
-                    .spacing(8)
-                    .align_y(iced::Center),
+                container(
+                    row![icon(if saved { glyph::CHECK } else { glyph::WARNING }, 11, tone), label(&self.clip_note, 12, tone).wrapping(text::Wrapping::None)]
+                        .spacing(8)
+                        .align_y(iced::Center),
+                )
+                .padding([5, 10])
+                .clip(true)
+                .style(move |_| container::Style {
+                    background: Some(Color { a: 0.08, ..tone }.into()),
+                    border: Border { radius: 7.0.into(), ..Border::default() },
+                    ..Default::default()
+                }),
             );
         }
         list.into()
@@ -4237,6 +4329,27 @@ mod tests {
             key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
         }).collect();
         render(&app, "effects");
+        app.sound_playing = (super::App::clip_id(1, false), 1.0, 2.4);
+        app.clip_note = "Сохранено: Запись 2026-09-25 14-20-00 (mix).wav".into();
+        render(&app, "effects-clips-playing-saved");
+        app.sound_playing = (0, 0.0, 0.0);
+        app.clip_note.clear();
+        app.sections = vec![crate::soundpad::Section { name: "Мемы".into(), files: vec![] }];
+        app.sound_folder = Some(PathBuf::from("Саундпад"));
+        app.clip_menu = Some(1);
+        app.clip_name = Some("Запись 2026-09-25 14-21-01".into());
+        app.focus = focus::effects::CLIP_NAME;
+        render(&app, "effects-clip-sheet");
+        window.set((960.0, 680.0));
+        render(&app, "effects-clip-sheet-min");
+        app.clip_name = None;
+        render(&app, "effects-clip-menu-min");
+        app.clip_menu = None;
+        app.clip_note = "Сохранено: Запись 2026-09-25 14-21-01.wav в «Мемы»".into();
+        render(&app, "effects-clip-note-min");
+        window.set((1040.0, 740.0));
+        app.clip_note.clear();
+        (app.clip_menu, app.clip_name, app.sections, app.sound_folder) = (None, None, vec![], None);
         app.effects_group = 1;
         render(&app, "effects-phrases");
         app.effects_group = 0;

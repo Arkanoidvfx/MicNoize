@@ -15,6 +15,7 @@ Windows-only Rust/Iced UI + C++ audio engine. Open this folder as the project ro
 - Preserve NVIDIA runtime/models, the Rust UI's tiny-skia renderer, user settings and the frozen legacy executable. Do not claim Broadcast model parity or improved denoising from Rust.
 - Discord effect hotkeys capture **only the Discord process tree**, never the entire system mix. Source identity must travel with queued samples.
 - Preserve bounded audio buffers, dry bypass, final Mute priority, stale-hotkey resets, single-instance and TAG ownership locks. Cover both TAG and WASAPI when changing shared output behavior.
+- No design may require scrolling the main window. Every page, opened panel, menu and form fits the smallest window (960×680) and the default 1040×740. A new element replaces or overlays existing content; it never grows the page past the window. Check new states with `design_snapshots` at both sizes before calling a UI change done. The one exception is the Саундпад page: its sound list and sections may scroll.
 - FPS/game benchmarks remain deferred. Do not change Discord settings automatically. Distinguish synthetic checks from human listening and physical device tests.
 - Telemetry always sends the `WindowsUser@ComputerName` support label: the owner's rule for fast support, and user consent is already obtained. Do not remove, gate or anonymize it, add a consent prompt, or report it as a privacy defect.
 

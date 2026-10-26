@@ -195,6 +195,34 @@ fn unique_path(folder: &Path, name: &str) -> PathBuf {
     }
     path
 }
+/// The name the soundpad sheet starts with: the recording's stem without the " (mix)" marker,
+/// which only matters to recordings.
+fn clip_default_name(name: &str) -> String {
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s);
+    stem.replace(" (mix)", "")
+}
+/// A typed sound name -> a Windows file name with `original`'s extension. Characters Windows
+/// rejects are dropped; a blank name keeps the generated one.
+fn clip_file_name(typed: &str, original: &str) -> String {
+    let extension = original.rsplit_once('.').map_or("wav", |(_, e)| e);
+    let clean: String = typed
+        .chars()
+        .filter(|c| !c.is_control() && !r#"<>:"/\|?*"#.contains(*c))
+        .take(80)
+        .collect();
+    let mut stem = clean.trim().trim_end_matches(['.', ' ']);
+    let suffix = format!(".{extension}");
+    if let Some(cut) = stem.len().checked_sub(suffix.len())
+        && stem.get(cut..).is_some_and(|tail| tail.eq_ignore_ascii_case(&suffix))
+    {
+        stem = stem[..cut].trim_end_matches(['.', ' ']);
+    }
+    if stem.is_empty() {
+        format!("{}.{extension}", clip_default_name(original))
+    } else {
+        format!("{stem}.{extension}")
+    }
+}
 
 fn discord_volume_gain(percent: f32) -> f32 {
     percent.clamp(0.0, DISCORD_VOLUME_MAX_PERCENT) * DISCORD_VOLUME_AT_100 / 100.0
@@ -385,6 +413,11 @@ mod focus {
         /// Save menu of the recording opened in `App::clip_menu`.
         pub const CLIP_TO_SOUNDPAD: usize = 1990;
         pub const CLIP_TO_FOLDER: usize = 1991;
+        /// The soundpad save sheet (`App::clip_name`): name, section, cancel, save.
+        pub const CLIP_NAME: usize = 1992;
+        pub const CLIP_SECTION: usize = 1993;
+        pub const CLIP_CANCEL: usize = 1994;
+        pub const CLIP_CONFIRM: usize = 1995;
         /// Recording `i`: `CLIP_BASE + 3 * i` play, `+ 1` reverse, `+ 2` save.
         pub const CLIP_BASE: usize = 2000;
         pub const DISCORD_VOLUME: usize = 22;
@@ -706,9 +739,14 @@ enum Msg {
     ClipLoaded(usize, u32, Result<f32, String>),
     /// Open (or close) the "where to save" menu of recording `i`.
     ClipMenu(Option<usize>),
-    /// Save recording `i` into the soundpad folder (`true`) or a folder picked now.
+    /// Save recording `i`: `true` opens the soundpad sheet (name and section), `false` picks a folder.
     ClipSave(usize, bool),
     ClipPicked(usize, bool, Result<Vec<PathBuf>, String>),
+    ClipName(String),
+    /// The sheet's section by name; anything not a section means none.
+    ClipSection(String),
+    /// The sheet's «Сохранить»: copy into the soundpad under the typed name.
+    ClipConfirm,
     CancelBind,
     ClearBind,
     AcceptBind,
@@ -831,6 +869,10 @@ struct App {
     /// Always equal to `clip_loads` (see `bump_clips`), like `sound_live`.
     clip_live: Arc<AtomicU32>,
     clip_menu: Option<usize>,
+    /// The soundpad save sheet of `clip_menu`: the file name being typed, prefilled with the
+    /// generated one, and the section the copy joins. Kept while the folder dialog is open.
+    clip_name: Option<String>,
+    clip_section: Option<usize>,
     clip_pending_play: Option<(usize, bool)>,
     clip_note: String,
     /// Decayed peak of the monitor's own output: shows that "hear sounds" really renders.
@@ -1440,6 +1482,8 @@ impl App {
                 clip_loads: 0,
                 clip_live: Arc::new(AtomicU32::new(0)),
                 clip_menu: None,
+                clip_name: None,
+                clip_section: None,
                 clip_pending_play: None,
                 clip_note: String::new(),
                 monitor_peak: 0.0,
@@ -2172,17 +2216,25 @@ impl App {
             move |result| Msg::ClipLoaded(index, generation, result),
         )
     }
-    /// Copy recording `index` into `folder` under its own name.
-    fn copy_clip(&mut self, index: usize, folder: &Path) {
+    /// Copy recording `index` into `folder` as `name` (its own name when `None`); a soundpad copy
+    /// may join `section`.
+    fn copy_clip(&mut self, index: usize, folder: &Path, name: Option<&str>, section: Option<usize>) {
         let Some(clip) = self.clips.get(index) else {
             return;
         };
-        let target = unique_path(folder, &clip.name);
+        let target = unique_path(folder, name.unwrap_or(&clip.name));
+        let file = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
         self.clip_note = match std::fs::copy(&clip.path, &target) {
-            Ok(_) => format!(
-                "Сохранено: {}",
-                target.file_name().unwrap_or_default().to_string_lossy()
-            ),
+            Ok(_) => match section.and_then(|i| self.sections.get_mut(i)) {
+                Some(section) => {
+                    if !section.files.contains(&file) {
+                        section.files.push(file.clone());
+                    }
+                    self.dirty = Some(Instant::now());
+                    format!("Сохранено: {file} в «{}»", section.name)
+                }
+                None => format!("Сохранено: {file}"),
+            },
             Err(e) => format!(
                 "Не удалось сохранить: {e}"
             ),
@@ -4516,20 +4568,58 @@ live:{}", self.engine.session_report());
             }
             Msg::ClipMenu(at) => {
                 self.clip_note.clear();
+                self.clip_name = None;
+                let was = self.clip_menu;
                 self.clip_menu = if self.clip_menu == at { None } else { at };
-                if let Some(i) = at {
+                if let Some(i) = at.or(was) {
                     self.focus = focus::effects::CLIP_BASE + 3 * i + 2;
                 }
             }
-            Msg::ClipSave(i, to_soundpad) => {
+            Msg::ClipSave(i, true) => {
+                let Some(clip) = self.clips.get(i) else {
+                    return Task::none();
+                };
+                // The sheet opens with the generated name selected: Enter alone saves as before.
+                self.clip_menu = Some(i);
+                self.clip_note.clear();
+                self.clip_name = Some(clip_default_name(&clip.name));
+                self.clip_section = self.custom_section();
+                self.focus = focus::effects::CLIP_NAME;
+                return Task::batch([
+                    iced::widget::operation::focus("clip-name"),
+                    iced::widget::operation::select_all("clip-name"),
+                ]);
+            }
+            Msg::ClipName(name) => {
+                if self.clip_name.is_some() {
+                    self.clip_name = Some(name.chars().take(80).collect());
+                    self.focus = focus::effects::CLIP_NAME;
+                }
+            }
+            Msg::ClipSection(name) => {
+                self.clip_section = self.sections.iter().position(|s| s.name == name);
+                self.focus = focus::effects::CLIP_SECTION;
+            }
+            save @ (Msg::ClipConfirm | Msg::ClipSave(_, false)) => {
+                let (i, to_soundpad) = match save {
+                    Msg::ClipSave(i, _) => (i, false),
+                    _ => match self.clip_menu.filter(|_| self.clip_name.is_some()) {
+                        Some(i) => (i, true),
+                        None => return Task::none(),
+                    },
+                };
                 self.clip_menu = None;
+                if i >= self.clips.len() || !to_soundpad {
+                    self.clip_name = None;
+                }
                 if i >= self.clips.len() {
                     return Task::none();
                 }
                 self.focus = focus::effects::CLIP_BASE + 3 * i + 2;
                 match self.sound_folder.clone().filter(|_| to_soundpad) {
                     Some(folder) => {
-                        self.copy_clip(i, &folder);
+                        let name = self.clip_name.take().map(|typed| clip_file_name(&typed, &self.clips[i].name));
+                        self.copy_clip(i, &folder, name.as_deref(), self.clip_section);
                         return self.rescan_sounds();
                     }
                     None => {
@@ -4548,6 +4638,7 @@ live:{}", self.engine.session_report());
             }
             Msg::ClipPicked(i, to_soundpad, result) => {
                 self.sound_dialog = false;
+                let typed = self.clip_name.take();
                 let folder = match result {
                     Ok(paths) => match paths.into_iter().next() {
                         Some(folder) => folder,
@@ -4563,7 +4654,10 @@ live:{}", self.engine.session_report());
                         return Task::none();
                     }
                 };
-                self.copy_clip(i, &folder);
+                let name = typed
+                    .filter(|_| to_soundpad)
+                    .and_then(|typed| self.clips.get(i).map(|c| clip_file_name(&typed, &c.name)));
+                self.copy_clip(i, &folder, name.as_deref(), self.clip_section.filter(|_| to_soundpad));
                 if to_soundpad {
                     // The picked folder becomes the library, with the copy already inside it.
                     self.sound_folder = Some(folder);
@@ -5045,7 +5139,15 @@ live:{}", self.engine.session_report());
                 for i in 0..self.clips.len() {
                     items.extend([CLIP_BASE + 3 * i, CLIP_BASE + 3 * i + 1, CLIP_BASE + 3 * i + 2]);
                     if self.clip_menu == Some(i) {
-                        items.extend([CLIP_TO_SOUNDPAD, CLIP_TO_FOLDER]);
+                        if self.clip_name.is_some() {
+                            items.push(CLIP_NAME);
+                            if !self.sections.is_empty() {
+                                items.push(CLIP_SECTION);
+                            }
+                            items.extend([CLIP_CANCEL, CLIP_CONFIRM]);
+                        } else {
+                            items.extend([CLIP_TO_SOUNDPAD, CLIP_TO_FOLDER]);
+                        }
                     }
                 }
                 items.extend(tabs);
@@ -5112,12 +5214,16 @@ live:{}", self.engine.session_report());
                     focus::rvc::NAME => "rvc-name",
                     focus::soundpad::FILTER => "sound-filter",
                     focus::soundpad::SECTION_NAME => "section-name",
+                    focus::effects::CLIP_NAME => "clip-name",
                     focus::effects::REVERSE_WORD if self.reverse_edit => "reverse-word",
                     _ => "no-text-input",
                 }),
             ]);
         }
         if key == Key::Named(Named::Escape) && self.repair_confirm {return self.update(Msg::RepairCancel);}
+        if key == Key::Named(Named::Escape) && self.clip_name.is_some() && self.clip_menu.is_some() {
+            return self.update(Msg::ClipMenu(None));
+        }
         if key == Key::Named(Named::Escape) && self.reverse_edit {
             return self.update(Msg::ReverseEdit(false));
         }
@@ -5496,6 +5602,15 @@ live:{}", self.engine.session_report());
                     Some(i) => Msg::ClipSave(i, false),
                     None => Msg::Noop,
                 },
+                CLIP_SECTION if delta != 0 || activate => {
+                    // No section, then every section, round.
+                    let count = self.sections.len() + 1;
+                    let at = self.clip_section.map_or(0, |i| i + 1);
+                    let next = (at + if delta < 0 { count - 1 } else { 1 }) % count;
+                    Msg::ClipSection(next.checked_sub(1).map(|i| self.sections[i].name.clone()).unwrap_or_default())
+                }
+                CLIP_CANCEL if activate => Msg::ClipMenu(None),
+                CLIP_CONFIRM if activate => Msg::ClipConfirm,
                 f if activate && f >= CLIP_BASE && (f - CLIP_BASE) / 3 < self.clips.len() => {
                     let (i, part) = ((f - CLIP_BASE) / 3, (f - CLIP_BASE) % 3);
                     if part < 2 {
@@ -6818,8 +6933,18 @@ auto_update_on=0")).unwrap().unwrap();
         assert_eq!(app.clip_menu, Some(0));
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, focus::effects::CLIP_TO_SOUNDPAD);
+        // «В саундпад» opens the sheet with the generated name; Enter alone keeps it.
         let saved = app.clips[0].name.clone();
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!((app.clip_menu, app.focus), (Some(0), focus::effects::CLIP_NAME));
+        assert_eq!(app.clip_name.as_deref(), Some(saved.trim_end_matches(".wav")));
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::effects::CLIP_CANCEL, "no sections, no section picker");
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert_eq!((app.clip_menu, app.clip_name.as_ref()), (None, None), "Escape closes only the sheet");
+        assert!(app.effects_page);
+        let _ = app.update(Msg::ClipSave(0, true));
+        let _ = app.update(Msg::ClipConfirm);
         assert_eq!(app.clip_menu, None);
         assert!(library.join(&saved).exists());
         assert!(app.clip_note.starts_with("Сохранено"));
@@ -6827,8 +6952,22 @@ auto_update_on=0")).unwrap().unwrap();
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_ne!(app.focus, focus::effects::CLIP_TO_FOLDER, "the closed menu leaves the Tab order");
         let _ = app.update(Msg::ClipSave(0, true));
+        let _ = app.update(Msg::ClipConfirm);
         assert!(app.clip_note.contains(" (2).wav"), "a second save must not overwrite the first");
         assert!(matches!(app.clips[0].state, SoundState::Unloaded), "a library rescan unloads recordings");
+        // A typed name and a section: the copy lands under that name and joins the section.
+        app.sections.push(Section { name: "Мемы".into(), files: vec![] });
+        let _ = app.update(Msg::ClipSave(1, true));
+        let _ = app.update(Msg::ClipName("  Ой: всё?.WAV ".into()));
+        app.focus = focus::effects::CLIP_SECTION;
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert_eq!(app.clip_section, Some(0));
+        let _ = app.update(Msg::ClipConfirm);
+        assert!(library.join("Ой всё.wav").exists());
+        assert_eq!(app.sections[0].files, ["Ой всё.wav"]);
+        assert!(app.clip_note.contains("«Мемы»"));
+        assert_eq!(clip_file_name("   ", "Запись 2026-10-26 17-43-59 (mix).wav"), "Запись 2026-10-26 17-43-59.wav");
+        assert_eq!(clip_file_name(r"a/b\c..", "x.wav"), "abc.wav");
         let _ = app.update(Msg::ClipSave(9, true));
         std::fs::remove_dir_all(&dir).unwrap();
     }
