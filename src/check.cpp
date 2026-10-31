@@ -245,6 +245,27 @@ static void denoiseWorkerTest() {
     catch(const std::runtime_error&) {threw=true;}
     require(threw,"Inference errors must propagate on the waiting call");
 }
+static void cpuFxTest() {
+    static std::atomic<int> failing{0};
+    static const mic::CpuDenoiserApi api{
+        []()->void*{return &failing;},
+        [](void*,const float* in,float* out,float strength)->int32_t{for(unsigned i=0;i<mic::block;++i)out[i]=in[i]*strength;return failing>0?(--failing,0):1;},
+        [](void*){}};
+    mic::CpuFx fx{&api,api.create(),0.5f};
+    mic::Stats stats;
+    mic::DenoiseWorker<mic::CpuFx> worker(fx,stats,0.5f);
+    std::array<float,mic::block> in{},out{};in.fill(0.8f);
+    using std::chrono::milliseconds;
+    require(worker.process(in.data(),out.data(),0.5f,false,milliseconds(200)) && !fx.failed && out[0]==0.4f,"DeepFilterNet block runs on the worker");
+    failing=1;
+    require(worker.process(in.data(),out.data(),0.25f,false,milliseconds(200)) && fx.failed,"A failed DeepFilterNet frame is consumed and reported");
+    require(worker.process(in.data(),out.data(),0.25f,false,milliseconds(200)) && !fx.failed && out[0]==0.2f,"The frame after a failure is wet again at the new strength");
+    failing=50;
+    bool threw=false;
+    try {for(int i=0;i<50;++i) worker.process(in.data(),out.data(),0.25f,false,milliseconds(200));}
+    catch(const std::runtime_error&) {threw=true;}
+    require(threw,"50 failed DeepFilterNet frames in a row end the session");
+}
 static void stereoDenoiseWorkerTest() {
     using Clock=std::chrono::steady_clock;using std::chrono::milliseconds;
     constexpr unsigned delay=mic::block*2;
@@ -706,7 +727,7 @@ int main(int argc,char** argv) {
             mic::checkHeadphones(outputs[index].id,std::stoi(argv[3])!=0);return 0;
         }
         if(argc==2 && std::string(argv[1])=="--discord-capture") { mic::checkDiscordCapture(5); return 0; }
-        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoisePlayoutTest(); denoiseWorkerTest(); stereoDenoiseWorkerTest(); mic::checkDenoiseCancellation(); protocolTest(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); denoisePlayoutTest(); denoiseWorkerTest(); cpuFxTest(); stereoDenoiseWorkerTest(); mic::checkDenoiseCancellation(); protocolTest(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }
