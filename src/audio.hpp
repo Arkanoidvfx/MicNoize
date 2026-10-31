@@ -329,10 +329,12 @@ class DenoisePlayout {
     float last_=0,offset_=0;
 public:
     explicit DenoisePlayout(unsigned delay):dry_(delay),warming_(delay) {}
-    void process(const float* in,float* out,bool processed,bool reset=false) {
+    // `consumed`: the model received this input although its result is unavailable (late, discarded),
+    // so its history stays continuous and only this block is dry; a skipped input restarts warm-up.
+    void process(const float* in,float* out,bool processed,bool reset=false,bool consumed=false) {
         if(reset) {std::fill(dry_.begin(),dry_.end(),0.0f);warming_=static_cast<unsigned>(dry_.size());}
         const bool wet=processed && warming_==0;
-        if(!processed) warming_=static_cast<unsigned>(dry_.size());
+        if(!processed && !consumed) warming_=static_cast<unsigned>(dry_.size());
         else warming_-=std::min(warming_,block);
         for(unsigned i=0;i<block;++i) {
             float dry=in[i];
@@ -365,7 +367,8 @@ public:
         std::unique_lock lock(mutex_);
         if(error_) std::rethrow_exception(error_);
         resetPending_|=reset;
-        if(busy_ || skip) return false;
+        consumed_=!busy_ && !skip;
+        if(!consumed_) return false;
         std::copy_n(in,samples,input_.begin());strength_=strength;busy_=true;
         const uint64_t mine=++submitted_;
         wake_.notify_all();
@@ -375,6 +378,8 @@ public:
         std::copy_n(output_.begin(),samples,out);
         return true;
     }
+    // Whether the last process() handed its input to the model (true for a late, discarded result).
+    bool consumed() const {return consumed_;}
 private:
     void run() {
         AudioPriority priority;
@@ -419,7 +424,7 @@ private:
     std::condition_variable wake_;
     std::array<float,samples> input_{},output_{};
     float strength_=1;
-    bool busy_=false,resetPending_=false;
+    bool busy_=false,resetPending_=false,consumed_=false;
     std::stop_source stop_;
     uint64_t submitted_=0,started_=0,finished_=0;
     std::exception_ptr error_;
@@ -632,7 +637,7 @@ class Engine {
     std::mutex studioMutex_;
     std::vector<float> studioClip_;
     uint64_t soundSerial_=0,soundPressTick_=0;unsigned soundPressId_=0;
-    std::atomic<bool> resetEffect_{false}, running_{false};
+    std::atomic<bool> running_{false};
     mutable std::mutex statusMutex_;
     std::wstring status_ = L"Stopped";
     std::wstring desktopMessage_,denoiserMessage_;

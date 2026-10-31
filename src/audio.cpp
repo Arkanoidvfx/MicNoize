@@ -1094,7 +1094,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
             if(c.input==tagMicrophone().id)throw std::runtime_error("Select the physical microphone, not TAG's own output");
         } catch(...) {CloseHandle(tagOwner_);tagOwner_=nullptr;throw;}
     }
-    captured_.reset(); cleaned_.reset(); desktop_.reset();resetEffect_=false;
+    captured_.reset(); cleaned_.reset(); desktop_.reset();
     config_=c;
     ResetEvent(stop_); ResetEvent(data_); ResetEvent(ready_);
     stats.outputActive=false;
@@ -1239,7 +1239,7 @@ void Engine::dspLoop(Config c) {
         std::array<uint8_t,block> modified{},recording{},captureFlags{};
         std::array<float,block+1> discord{};SourceRouting routing;Drift discordDrift;
         bool discordPrimed=false,wasDiscord=false;Ramp sourceFade{1};
-        float applied=c.intensity;
+        float applied=c.intensity;unsigned cpuFailures=0;
         // Build lazy CUDA/graph state before opening the microphone or output stream.
         for(unsigned j=0;j<block;++j) in[j]=0.02f*std::sin(j*0.07f)+0.01f*std::sin(j*0.21f);
         if(fx) {
@@ -1271,10 +1271,9 @@ void Engine::dspLoop(Config c) {
                 const bool catchUp=dspBehind(captured_.size(),c.bufferMs);
                 if(catchUp) stats.catchUpBlocks.fetch_add(1,std::memory_order_relaxed);
                 auto begin=std::chrono::steady_clock::now();
-                // v1 has no cheap reset (SDK Reset adds 10 ms each; the flush is 20 GPU runs). Capture
-                // gaps come in hundreds per session and more under a game: per-gap flushes made 0.4.34
-                // load the GPU and stutter games. Its history clears itself within the model delay.
-                const bool reset=resetEffect_.exchange(false) && !(gpu && c.version==1);
+                // A capture gap resets nothing: v1 has no cheap reset (per-gap flushes made 0.4.34 load
+                // the GPU and stutter games), and resetting v2 or the playout replaced 70 ms of already
+                // captured speech with zeros on every gap. Each model's history clears itself within its delay.
                 const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
                     effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
                 bool denoised=false;
@@ -1282,7 +1281,7 @@ void Engine::dspLoop(Config c) {
                     // Wait while the output reserve lasts, keeping 10 ms of it; never under 8 ms.
                     const auto reserve=std::chrono::microseconds(cleaned_.size()*1000/48);
                     const auto budget=std::max<std::chrono::microseconds>(std::chrono::milliseconds(8),reserve-std::chrono::milliseconds(10));
-                    denoised=gpu->process(in.data(),out.data(),wanted,reset,budget,catchUp);
+                    denoised=gpu->process(in.data(),out.data(),wanted,false,budget,catchUp);
                     if(!denoised) {
                         out=in;
                         if(!catchUp) stats.lateBlocks.fetch_add(1,std::memory_order_relaxed);
@@ -1291,8 +1290,10 @@ void Engine::dspLoop(Config c) {
                     const auto runBegin=std::chrono::steady_clock::now();
                     if(catchUp) out=in;
                     else if(cpu.state) {
-                        if(!cpuApi->process(cpu.state,in.data(),out.data(),wanted)) throw std::runtime_error("DeepFilterNet failed");
-                        denoised=true;
+                        // One failed frame passes dry; only a model that keeps failing ends the session.
+                        denoised=cpuApi->process(cpu.state,in.data(),out.data(),wanted)!=0;
+                        if(denoised) cpuFailures=0;
+                        else {out=in;if(++cpuFailures>=50) throw std::runtime_error("DeepFilterNet failed 50 blocks in a row");}
                     }
                     else out=in;
                     const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
@@ -1304,13 +1305,13 @@ void Engine::dspLoop(Config c) {
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 stats.processMs=ms;
                 trace.write(AudioTrace::Input,in.data(),block);trace.write(AudioTrace::Denoiser,out.data(),block);
-                trace.mark({static_cast<uint8_t>((denoised?AudioTrace::Denoised:0)|(catchUp?AudioTrace::CatchUp:0)|(reset?AudioTrace::Reset:0)|(gpu?AudioTrace::Gpu:0)),
+                trace.mark({static_cast<uint8_t>((denoised?AudioTrace::Denoised:0)|(catchUp?AudioTrace::CatchUp:0)|(gpu?AudioTrace::Gpu:0)),
                     static_cast<uint16_t>(std::min(ms*1000.0f,65535.0f)),static_cast<uint16_t>(std::min<size_t>(captured_.size(),65535)),
                     static_cast<uint16_t>(std::min<size_t>(cleaned_.size(),65535)),stats.blockBufferedMin.exchange(UINT_MAX),stats.blockBufferedMax.exchange(0)});
                 second.inMaxMs=std::max(second.inMaxMs,captured_.size()/48.0f);
                 second.outMinMs=std::min(second.outMinMs,cleaned_.size()/48.0f);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
-                if(gpu || cpu.state) denoisePlayout.process(in.data(),out.data(),denoised,reset);
+                if(gpu || cpu.state) denoisePlayout.process(in.data(),out.data(),denoised,false,gpu?gpu->consumed():denoised);
                 for(float& v:out) v=std::clamp(v,-1.0f,1.0f);
                 trace.write(AudioTrace::Playout,out.data(),block);
                 // RVC belongs to the microphone path only: it runs before the Discord source switch, so
@@ -1592,7 +1593,7 @@ void Engine::tagLoop(Config c) {
             BYTE* bytes=nullptr; DWORD flags=0;
             check(capture->GetBuffer(&bytes,&n,&flags,nullptr,nullptr),"TAG capture buffer");
             if(n>mono.size()){capture->ReleaseBuffer(n);throw std::runtime_error("TAG capture packet exceeds allocation");}
-            if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY){++stats.discontinuities;resetEffect_=true;}
+            if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)++stats.discontinuities;
             downmix.process(reinterpret_cast<const float*>(bytes),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
             stats.inputFlipped=downmix.sign<0;
             check(capture->ReleaseBuffer(n),"TAG release capture");
@@ -1717,7 +1718,7 @@ void Engine::ioLoop(Config c) {
                 BYTE* data=nullptr; UINT32 n=0; DWORD flags=0;
                 check(capture->GetBuffer(&data,&n,&flags,nullptr,nullptr),"Capture buffer");
                 if(n>mono.size()) { capture->ReleaseBuffer(n); throw std::runtime_error("Capture packet exceeds allocated capacity"); }
-                if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) { ++stats.discontinuities; resetEffect_=true; }
+                if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) ++stats.discontinuities;
                 // QuadCast exposes two channels: average rather than amplify correlated stereo.
                 downmix.process(reinterpret_cast<const float*>(data),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
                 stats.inputFlipped=downmix.sign<0;
@@ -1859,8 +1860,8 @@ void Headphones::dspLoop(bool denoise) {
                     const auto budget=std::max<std::chrono::microseconds>(std::chrono::milliseconds(8),reserve-std::chrono::milliseconds(10));
                     const bool denoised=gpu->process(input.data(),output.data(),intensity,reset,budget,dspBehind(captured_.size(),bufferMs));
                     if(!denoised)output=input;
-                    leftPlayout.process(input.data(),output.data(),denoised,reset);
-                    rightPlayout.process(input.data()+block,output.data()+block,denoised,reset);
+                    leftPlayout.process(input.data(),output.data(),denoised,reset,gpu->consumed());
+                    rightPlayout.process(input.data()+block,output.data()+block,denoised,reset,gpu->consumed());
                 } else output=input;
                 const int tone=pitch;
                 leftPitch.process(output.data(),block,tone,tone!=0);

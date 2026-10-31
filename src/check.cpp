@@ -178,6 +178,16 @@ static void denoisePlayoutTest() {
             }
         }
         require(unaligned>6,"Regression exercises raw jumps and stale delayed model output");
+        // A late result (input consumed, output discarded) costs one dry block, not a warm-up.
+        for(unsigned frame=90;frame<92;++frame) {
+            for(unsigned i=0;i<mic::block;++i) in[i]=0.1f+(frame*mic::block+i)*0.00001f;
+            fx.process(in.data(),out.data());
+            const bool late=frame==90;
+            if(late) out=in;
+            playout.process(in.data(),out.data(),!late,false,true);
+            if(!late) for(unsigned i=mic::block/2;i<mic::block;++i)
+                require(std::abs(out[i]-(0.1f+(frame*mic::block+i-delay)*0.00001f))<0.000001f,"A consumed late block must not restart the warm-up");
+        }
         // Reset after speech must drain both histories, not leak the pre-reset voice.
         fx.reset();in.fill(0);
         for(unsigned frame=0;frame<10;++frame) {
@@ -206,12 +216,15 @@ static void denoiseWorkerTest() {
     using Clock=std::chrono::steady_clock;using std::chrono::milliseconds;
     mic::DenoiseWorker<SlowFx> worker(fx,stats,1);
     require(worker.process(in.data(),out.data(),1,false,milliseconds(200)) && out[0]==0.4f,"Idle GPU worker denoises the block");
+    require(worker.consumed(),"A denoised block was consumed");
     constexpr int stallMs=224;fx.delayMs=stallMs;
     auto begin=Clock::now();
     require(!worker.process(in.data(),out.data(),1,false,milliseconds(20)),"A stalled GPU run reports a late block");
     require(Clock::now()-begin<milliseconds(120),"A stalled GPU run held the DSP past its budget");
+    require(worker.consumed(),"A late block was still consumed by the model");
     begin=Clock::now();
     require(!worker.process(in.data(),out.data(),1,true,milliseconds(20)) && Clock::now()-begin<milliseconds(15),"A busy GPU worker must not make the DSP wait");
+    require(!worker.consumed(),"A busy worker skipped the block");
     std::this_thread::sleep_for(milliseconds(300));
     fx.delayMs=0;
     out.fill(0);
@@ -219,6 +232,7 @@ static void denoiseWorkerTest() {
     require(fx.resets.load()==1,"Resets requested while busy collapse into one, run on the worker");
     require(stats.maxRunMs>stallMs*0.9f,"Worker records the 224 ms synthetic stalled run");
     require(!worker.process(in.data(),out.data(),1,true,milliseconds(200),true),"Catch-up defers model work");
+    require(!worker.consumed(),"Catch-up skips the block");
     require(worker.process(in.data(),out.data(),1,false,milliseconds(200)),"Worker processes after catch-up");
     require(fx.resets.load()==2,"Catch-up must retain a pending model reset");
     struct FailingFx {
