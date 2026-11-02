@@ -55,22 +55,6 @@ struct CpuDenoiserApi {
     void (*destroy)(void* state);
 };
 void setCpuDenoiser(const CpuDenoiserApi* api);
-// DeepFilterNet behind `DenoiseWorker`, like NVIDIA: the DSP thread keeps its per-block wait
-// budget, so a slow frame under a game's CPU load passes dry instead of the DSP falling behind
-// and dropping captured input. A failed frame also passes dry (`failed`, read by the DSP after
-// the worker handed that result over); only a model that keeps failing ends the session.
-struct CpuFx {
-    const CpuDenoiserApi* api;void* state;float strength_;
-    unsigned failures=0;
-    bool failed=false;
-    void process(const float* in,float* out,std::stop_token) {
-        failed=api->process(state,in,out,strength_)==0;
-        if(!failed) failures=0;
-        else if(++failures>=50) throw std::runtime_error("DeepFilterNet failed 50 blocks in a row");
-    }
-    void strength(float value,std::stop_token) {strength_=value;}
-    void reset(std::stop_token) {}
-};
 // NVIDIA model folder for CUDA device 0 (turing/ampere/ada/blackwell); `name` gets the GPU name.
 std::string gpuArch(std::string& name);
 

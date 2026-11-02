@@ -308,9 +308,7 @@ void checkRvc() {
 // Audio threads run without the realtime boost when MMCSS refuses (service off, task edited):
 // a CPU-bound game then starves them. Reported in the session line.
 static std::atomic<unsigned> mmcssFailures{0};
-// Every audio thread flushes denormals: DeepFilterNet's recurrent state decays into them on quiet
-// input, and older CPUs take a large penalty per denormal operation.
-AudioPriority::AudioPriority() {_mm_setcsr(_mm_getcsr()|0x8040);DWORD task=0;h=AvSetMmThreadCharacteristicsW(L"Audio",&task);if(!h)++mmcssFailures;}
+AudioPriority::AudioPriority() {DWORD task=0;h=AvSetMmThreadCharacteristicsW(L"Audio",&task);if(!h)++mmcssFailures;}
 AudioPriority::~AudioPriority() {if(h)AvRevertMmThreadCharacteristics(h);}
 using Mmcss=AudioPriority;
 std::string utf8(const std::wstring& s) {
@@ -1220,7 +1218,9 @@ void Engine::dspLoop(Config c) {
             // No usable NVIDIA: DeepFilterNet on the CPU when the host supplied it, else no denoiser.
             {std::lock_guard lock(statusMutex_);denoiserMessage_=wide(e.what());}
             cpuApi=cpuDenoiser.load();
-            if(cpuApi) cpu.state=cpuApi->create();
+            // Flush denormals on this thread: DeepFilterNet's recurrent state decays into them on
+            // quiet input, and older CPUs take a large penalty per denormal operation.
+            if(cpuApi) {_mm_setcsr(_mm_getcsr()|0x8040);cpu.state=cpuApi->create();}
             stats.denoiser=cpu.state?3:2;
             stats.denoiseDelaySamples=cpu.state?1440:0; // DeepFilterNet's fixed 30 ms lookahead.
         }
@@ -1239,22 +1239,16 @@ void Engine::dspLoop(Config c) {
         std::array<uint8_t,block> modified{},recording{},captureFlags{};
         std::array<float,block+1> discord{};SourceRouting routing;Drift discordDrift;
         bool discordPrimed=false,wasDiscord=false;Ramp sourceFade{1};
-        float applied=c.intensity;
+        float applied=c.intensity;unsigned cpuFailures=0;
         // Build lazy CUDA/graph state before opening the microphone or output stream.
         for(unsigned j=0;j<block;++j) in[j]=0.02f*std::sin(j*0.07f)+0.01f*std::sin(j*0.21f);
         if(fx) {
             for(unsigned i=0;i<20;++i) { if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) return; fx->process(in.data(),out.data()); }
             fx->reset();
         }
-        // From here only the worker touches the NVIDIA handle or the DFN state; destroyed before them.
-        struct ModelFx {
-            Afx* nv;CpuFx cpu;
-            void process(const float* in,float* out,std::stop_token stop) {if(nv) nv->process(in,out,stop); else cpu.process(in,out,stop);}
-            void strength(float value,std::stop_token stop) {if(nv) nv->strength(value,stop); else cpu.strength(value,stop);}
-            void reset(std::stop_token stop) {if(nv) nv->reset(stop);}
-        } modelFx{fx.get(),{cpuApi,cpu.state,applied}};
-        std::unique_ptr<DenoiseWorker<ModelFx>> model;
-        if(fx || cpu.state) model=std::make_unique<DenoiseWorker<ModelFx>>(modelFx,stats,applied);
+        // From here only the worker touches the NVIDIA handle; destroyed before `fx`.
+        std::unique_ptr<DenoiseWorker<Afx>> gpu;
+        if(fx) gpu=std::make_unique<DenoiseWorker<Afx>>(*fx,stats,applied);
         soundRequest=0;soundSeekRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
         // Developer-report history: cumulative counters become per-second deltas every 100 blocks.
         struct Totals {unsigned late,catchUp,gaps,underruns,drops,resets,tagGaps,lateTicks,reconnects;};
@@ -1283,26 +1277,41 @@ void Engine::dspLoop(Config c) {
                 const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
                     effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
                 bool denoised=false;
-                if(model) {
+                if(gpu) {
                     // Wait while the output reserve lasts, keeping 10 ms of it; never under 8 ms.
                     const auto reserve=std::chrono::microseconds(cleaned_.size()*1000/48);
                     const auto budget=std::max<std::chrono::microseconds>(std::chrono::milliseconds(8),reserve-std::chrono::milliseconds(10));
-                    denoised=model->process(in.data(),out.data(),wanted,false,budget,catchUp) && !modelFx.cpu.failed;
+                    denoised=gpu->process(in.data(),out.data(),wanted,false,budget,catchUp);
                     if(!denoised) {
                         out=in;
                         if(!catchUp) stats.lateBlocks.fetch_add(1,std::memory_order_relaxed);
                     }
-                } else out=in;
+                } else {
+                    const auto runBegin=std::chrono::steady_clock::now();
+                    if(catchUp) out=in;
+                    else if(cpu.state) {
+                        // One failed frame passes dry; only a model that keeps failing ends the session.
+                        denoised=cpuApi->process(cpu.state,in.data(),out.data(),wanted)!=0;
+                        if(denoised) cpuFailures=0;
+                        else {out=in;if(++cpuFailures>=50) throw std::runtime_error("DeepFilterNet failed 50 blocks in a row");}
+                    }
+                    else out=in;
+                    const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
+                    if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
+                    if(runMs>5) stats.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
+                    if(runMs>10) stats.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
+                    if(runMs>stats.secondRunMaxMs.load(std::memory_order_relaxed)) stats.secondRunMaxMs.store(runMs,std::memory_order_relaxed);
+                }
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 stats.processMs=ms;
                 trace.write(AudioTrace::Input,in.data(),block);trace.write(AudioTrace::Denoiser,out.data(),block);
-                trace.mark({static_cast<uint8_t>((denoised?AudioTrace::Denoised:0)|(catchUp?AudioTrace::CatchUp:0)|(fx?AudioTrace::Gpu:0)),
+                trace.mark({static_cast<uint8_t>((denoised?AudioTrace::Denoised:0)|(catchUp?AudioTrace::CatchUp:0)|(gpu?AudioTrace::Gpu:0)),
                     static_cast<uint16_t>(std::min(ms*1000.0f,65535.0f)),static_cast<uint16_t>(std::min<size_t>(captured_.size(),65535)),
                     static_cast<uint16_t>(std::min<size_t>(cleaned_.size(),65535)),stats.blockBufferedMin.exchange(UINT_MAX),stats.blockBufferedMax.exchange(0)});
                 second.inMaxMs=std::max(second.inMaxMs,captured_.size()/48.0f);
                 second.outMinMs=std::min(second.outMinMs,cleaned_.size()/48.0f);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");
-                if(model) denoisePlayout.process(in.data(),out.data(),denoised,false,model->consumed());
+                if(gpu || cpu.state) denoisePlayout.process(in.data(),out.data(),denoised,false,gpu?gpu->consumed():denoised);
                 for(float& v:out) v=std::clamp(v,-1.0f,1.0f);
                 trace.write(AudioTrace::Playout,out.data(),block);
                 // RVC belongs to the microphone path only: it runs before the Discord source switch, so
