@@ -883,10 +883,11 @@ void Engine::desktopLoop() {
             Stream input;input.client=completion->client;input.channels=2;Event event;
             WAVEFORMATEX format{WAVE_FORMAT_IEEE_FLOAT,2,rate,rate*8,8,32,0};
             check(input.client->Initialize(AUDCLNT_SHAREMODE_SHARED,AUDCLNT_STREAMFLAGS_LOOPBACK|AUDCLNT_STREAMFLAGS_EVENTCALLBACK|AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM|AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,0,0,&format,nullptr),"Initialize Discord loopback");
-            check(input.client->GetBufferSize(&input.capacity),"Discord capture capacity");
+            // No GetBufferSize here: for a process-loopback client it has reported 3.5e9 frames, and
+            // the buffer sized from it held 14 GB. Packets are downmixed one block at a time instead.
             check(input.client->SetEventHandle(event.h),"Discord capture event");
             ComPtr<IAudioCaptureClient> capture;check(input.client->GetService(IID_PPV_ARGS(&capture)),"Discord capture service");
-            std::vector<float> mono(std::max(input.capacity,block));
+            std::array<float,block> mono;
             input.start();stats.desktopState=2;
             {std::lock_guard lock(statusMutex_);desktopMessage_=L"Discord · готов";}
             HANDLE events[]={stop_,process,event.h};
@@ -898,11 +899,13 @@ void Engine::desktopLoop() {
                 UINT32 n=0;check(capture->GetNextPacketSize(&n),"Discord packet");
                 while(n){
                     BYTE* bytes=nullptr;DWORD flags=0;check(capture->GetBuffer(&bytes,&n,&flags,nullptr,nullptr),"Discord buffer");
-                    if(n>mono.size()){capture->ReleaseBuffer(n);throw std::runtime_error("Discord packet exceeds allocation");}
                     const auto samples=reinterpret_cast<const float*>(bytes);
-                    for(unsigned i=0;i<n;++i){const float v=(flags&AUDCLNT_BUFFERFLAGS_SILENT)?0:0.5f*samples[i*2]+0.5f*samples[i*2+1];mono[i]=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;}
+                    for(unsigned at=0;at<n;at+=block){
+                        const unsigned count=std::min<unsigned>(n-at,block);
+                        for(unsigned i=0;i<count;++i){const float v=(flags&AUDCLNT_BUFFERFLAGS_SILENT)?0:0.5f*samples[(at+i)*2]+0.5f*samples[(at+i)*2+1];mono[i]=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;}
+                        desktop_.push(mono.data(),count); // Bounded; DSP drains even when its source is the microphone.
+                    }
                     check(capture->ReleaseBuffer(n),"Discord release");
-                    desktop_.push(mono.data(),n); // Bounded; DSP drains even when its source is the microphone.
                     check(capture->GetNextPacketSize(&n),"Discord next packet");
                 }
             }
@@ -919,7 +922,7 @@ void Engine::desktopLoop() {
 }
 void checkDiscordCapture(unsigned seconds) {
     if(seconds<1 || seconds>30)throw std::runtime_error("Discord capture check duration must be 1..30 seconds");
-    Engine engine;engine.desktopEnabled=true;
+    const auto owner=std::make_unique<Engine>();Engine& engine=*owner;engine.desktopEnabled=true; // too large for the stack
     engine.desktopThread_=std::thread([&]{engine.desktopLoop();});
     for(unsigned i=0;i<100 && engine.stats.desktopState!=2;++i){
         if(engine.stats.desktopState==3)throw std::runtime_error(utf8(engine.desktopMessage()));
