@@ -850,7 +850,8 @@ std::string Engine::sessionLine() const {
         log<<" tag_buffer_frames="<<stats.tagBufferFrames<<" tag_buffered_min="<<low<<" tag_buffered_max="<<stats.tagBufferedMax
            <<" tag_stream_overflows="<<stats.tagStreamOverflows<<" tag_stream_underflows="<<stats.tagStreamUnderflows;
     // buffer: writes follow Windows' reads and drift_ppm is the input resampling; microphone: the old pacing.
-    if(config_.tag) log<<" tag_pacing="<<(stats.tagPaced?"buffer":"microphone")<<" tag_write_ppm="<<stats.tagWritePpm;
+    if(config_.tag) log<<" tag_pacing="<<(stats.tagPaced?"buffer":"microphone")<<" tag_write_ppm="<<stats.tagWritePpm
+        <<" tag_write_holds="<<stats.tagWriteHolds<<" tag_room="<<(stats.tagRoomOff?"off":"on");
     if(const LONG priority=gpuPriorityStatus;priority==unsetPriority) log<<" gpu_priority=unset";
     else if(priority==0) log<<" gpu_priority=high";
     else log<<" gpu_priority=failed:0x"<<std::hex<<static_cast<unsigned long>(priority)<<std::dec;
@@ -1111,7 +1112,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
     stats.tagBufferedMin=UINT_MAX; stats.tagBufferedMax=0; stats.secondBufferedMin=UINT_MAX; stats.secondBufferedMax=0;
     stats.blockBufferedMin=UINT_MAX; stats.blockBufferedMax=0; stats.tagStreamOverflows=0; stats.tagStreamUnderflows=0;
-    stats.tagPaced=false; stats.tagWritePpm=0;
+    stats.tagPaced=false; stats.tagWritePpm=0; stats.tagWriteHolds=0; stats.tagRoomOff=false;
     stats.pitchActive=false; stats.boostActive=false; stats.pitchDelayMs=0; stats.pitchMaxMs=0;stats.phraseState=0;stats.phraseSeconds=0;
     stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;stats.denoiseDelaySamples=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
@@ -1552,6 +1553,7 @@ void Engine::tagLoop(Config c) {
     // reading fixed periods on the system clock; then TagPacer paces writes and resamples the input.
     DriftResampler resampler(mono.size());std::vector<float> resampled(mono.size()*2+64);
     TagPacer pacer;ULONGLONG bufferSeen=0;
+    TagRoom room;unsigned roomBuffered=0,roomCursor=0,roomFrames=0;
     // Allocate once before rendering: these buffers exceed the audio thread's stack budget.
     constexpr unsigned capacity=16384;
     std::vector<float> output(capacity);
@@ -1585,6 +1587,7 @@ void Engine::tagLoop(Config c) {
             const auto raise=[queued](std::atomic<unsigned>& at){unsigned v=at.load(std::memory_order_relaxed);while(queued>v && !at.compare_exchange_weak(v,queued,std::memory_order_relaxed)){}};
             lower(stats.tagBufferedMin);lower(stats.secondBufferedMin);lower(stats.blockBufferedMin);
             pacer.observe(queued,buffer.underflows);bufferSeen=GetTickCount64();
+            roomBuffered=queued;roomCursor=buffer.devicePos;roomFrames=buffer.bufferFrames;
             raise(stats.tagBufferedMax);raise(stats.secondBufferedMax);raise(stats.blockBufferedMax);
             stats.tagStreamOverflows.store(buffer.overflows,std::memory_order_relaxed);stats.tagStreamUnderflows.store(buffer.underflows,std::memory_order_relaxed);
         }
@@ -1628,7 +1631,11 @@ void Engine::tagLoop(Config c) {
             if(elapsed*rate>maxFrames) ++stats.tagLateTicks;
             // Keep overdue frames for the next tick. A late wake must neither lose
             // device-clock time nor discard/re-prime already processed audio.
-            const unsigned frames=clock.take(elapsed,pacer.engaged?pacer.writeCorrection:correction,maxFrames);
+            // Never write into audio Windows has not read yet (TagRoom); the rest waits in the clock.
+            const unsigned space=reported?room.room(roomBuffered,roomCursor,roomFrames,elapsed):UINT_MAX;
+            const unsigned frames=clock.take(elapsed,pacer.engaged?pacer.writeCorrection:correction,std::min(maxFrames,space));
+            if(space<maxFrames && clock.pending>=1) ++stats.tagWriteHolds;
+            stats.tagRoomOff=room.off;
             if(frames) {
                 if(cleaned_.size()>target+rate/20){cleaned_.trim(target);++stats.drops;fade=0;drift={};correction=0;pacer.lead={};pacer.writeCorrection=0;}
                 if(!primed && cleaned_.size()>=target+frames) primed=true;
@@ -1649,7 +1656,7 @@ void Engine::tagLoop(Config c) {
                 const float compensation=tagLevelCompensation_.load();
                 for(unsigned i=0;i<frames;++i) output[i]*=compensation;
                 if(tag.write(output.data(),frames)) {
-                    stats.tagFrames+=frames;
+                    stats.tagFrames+=frames;room.wrote(frames,roomFrames);
                     preview(effectOnly.data(),echoOnly.data(),routed.data(),modified.data(),frames);
                     if(muted && fade==0) stats.outputPeak=0;
                     else peakHold(stats.outputPeak,outputPeak);

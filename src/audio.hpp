@@ -198,6 +198,29 @@ struct TagPacer {
     }
     double step() const {return 1+inputCorrection;}
 };
+// Room for the next TAG write. On some PCs Windows reads the capture buffer a whole 480-frame packet
+// behind the writes whatever their pace: written-but-unread peaks at the full buffer, and a write
+// arriving before that late read lands in the packet Windows is about to copy (its capture then
+// starts every packet with a chunk from one buffer lap ahead: crackle). So a write never exceeds
+// what the host reports free; held frames stay in TagClock and go out after the read. A report from
+// before our last write (its cursor is that write short) does not count it yet. Full for 30 ms lets
+// one write through; three of those within a second mean reads on this driver need the overwrite,
+// and the limit stays off for the session.
+struct TagRoom {
+    unsigned expected=UINT_MAX,last=0,streak=0; double full=0,sinceTrip=1e9; bool off=false;
+    // `buffered` and write `cursor` from the host's report; `elapsed` seconds since the last call.
+    unsigned room(unsigned buffered,unsigned cursor,unsigned capacity,double elapsed) {
+        if(off || !capacity) return UINT_MAX;
+        sinceTrip+=elapsed;
+        if(last && cursor!=expected && (cursor+last)%capacity==expected) buffered+=last;
+        else {expected=cursor;last=0;}
+        if(buffered<capacity){full=0;return capacity-buffered;}
+        if((full+=elapsed)<0.03) return 0;
+        streak=sinceTrip<1?streak+1:1;sinceTrip=0;full=0;off=streak>=3;
+        return UINT_MAX;
+    }
+    void wrote(unsigned frames,unsigned capacity){if(expected!=UINT_MAX && capacity){expected=(expected+frames)%capacity;last=frames;}}
+};
 struct Config {
     std::wstring input, output;
     int version = 1;
@@ -256,6 +279,8 @@ struct Stats {
     std::atomic<unsigned> blockBufferedMin{UINT_MAX}, blockBufferedMax{0}, tagStreamOverflows{0}, tagStreamUnderflows{0};
     // TAG writes follow the reported buffer (TagPacer) instead of the microphone; their correction.
     std::atomic<bool> tagPaced{false}; std::atomic<float> tagWritePpm{0};
+    // TagRoom: ticks that held frames back for a full buffer, and whether the limit gave up.
+    std::atomic<unsigned> tagWriteHolds{0}; std::atomic<bool> tagRoomOff{false};
     std::atomic<float> tagMaxWakeMs{0};
     // Per-second maxima for PerfHistory: writers raise them, the DSP takes them once a second.
     std::atomic<float> secondRunMaxMs{0}, secondWakeMaxMs{0};

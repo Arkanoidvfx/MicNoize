@@ -545,11 +545,54 @@ static void tagPacingTest() {
         std::cout<<std::endl;
     }
 }
+// TagRoom against three readers of the 960-frame buffer, in 0.5 ms steps with tagLoop's wakes (2 ms
+// timer plus the microphone event): Windows reading a packet behind the writes, 2.5 ms after the
+// write that completes the next packet (the 1080 Ti report); a fixed-rate reader slower than the
+// writes; and a driver that only reads after a write overflows the buffer, where the limit must
+// give up. The engine sees the host's report, optionally one publication old.
+static void tagRoomTest() {
+    struct Case {const char* name;int reader;bool limit,stale,overwrites,off;};
+    for(const auto c:{Case{"reads a packet behind, no limit",0,false,false,true,false},Case{"reads a packet behind",0,true,false,false,false},
+                      Case{"reads a packet behind, old report",0,true,true,false,false},Case{"slow fixed reads",1,true,false,false,false},
+                      Case{"reads need the overwrite",2,true,false,true,true}}) {
+        mic::TagRoom room;mic::TagClock clock;
+        constexpr unsigned capacity=960,steps=120000; // 60 s
+        unsigned unread=480,cursor=0,overwritten=0,readDue=UINT_MAX,holds=0;uint64_t written=0;
+        unsigned report[2]={unread,cursor},old[2]={unread,cursor};
+        const auto publish=[&]{old[0]=report[0];old[1]=report[1];report[0]=unread;report[1]=cursor;};
+        double sinceWake=0;
+        for(unsigned step=0;step<steps;++step) {
+            sinceWake+=0.0005;
+            if(c.reader==1?step%20==7:step==readDue) if(unread>=480) unread-=480;
+            if(step%4==2) publish(); // the host's own 2 ms timer
+            if(step%4 && step%20!=1) continue;
+            const double elapsed=sinceWake;sinceWake=0;
+            const unsigned* seen=c.stale?old:report;
+            const unsigned space=c.limit?room.room(seen[0],seen[1],capacity,elapsed):UINT_MAX;
+            const unsigned frames=clock.take(elapsed,c.reader==1?0.002:0,std::min(480u,space));
+            if(space<480 && clock.pending>=1) ++holds;
+            if(!frames) continue;
+            const bool over=unread+frames>capacity;
+            if(over) overwritten+=unread+frames-capacity;
+            unread=std::min(unread+frames,capacity);cursor=(cursor+frames)%capacity;
+            const uint64_t before=written;written+=frames;room.wrote(frames,capacity);
+            // Reader 2 only reads once a write has overflowed the buffer.
+            if(c.reader==0?written/480>before/480:c.reader==2 && over) readDue=step+5;
+            publish();
+        }
+        const uint64_t expected=uint64_t{steps}*24;
+        if((overwritten!=0)!=c.overwrites || room.off!=c.off || (c.reader!=1 && written+9600<expected))
+            throw std::runtime_error(std::string("TAG room, ")+c.name+": overwritten="+std::to_string(overwritten)+" off="+std::to_string(room.off)+
+                " written="+std::to_string(written)+" of "+std::to_string(expected));
+        std::cout<<"PASS: TAG room, "<<c.name<<": overwritten "<<overwritten<<", holds "<<holds<<", limit "<<(!c.limit?"none":room.off?"gave up":"on")<<std::endl;
+    }
+}
 static void selfTest() {
     perfFormatTest();
     tagBufferTest();
     driftResamplerTest();
     tagPacingTest();
+    tagRoomTest();
     audioTraceTest();
     const std::vector<mic::Device> choices={{L"one",L"HyperX A"},{L"two",L"HyperX B"}};
     require(mic::preferredDevice(choices,L"two",L"HyperX")==1,"Saved endpoint wins over name hint");
