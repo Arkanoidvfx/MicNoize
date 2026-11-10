@@ -67,6 +67,43 @@ int main() {try {
         for(float v:out)require(v==0,"Silent capture packet is not silence");
     }
     {
+        // USB microphone that lost one byte of its 16-bit stereo stream, then recovered.
+        auto truth=[](unsigned frame) {
+            uint32_t seed=frame;seed^=seed>>16;seed*=0x7feb352du;seed^=seed>>15;seed*=0x846ca68bu;seed^=seed>>16;
+            const int noise=static_cast<int>(seed>>24)%41-20;
+            const bool speech=frame>=24000 && frame<33600;
+            return static_cast<int16_t>(noise+(speech?static_cast<int>(9000*std::sin(frame*0.05)):0));
+        };
+        auto byteAt=[&](unsigned index) {const uint16_t v=static_cast<uint16_t>(truth(index/4));return static_cast<uint8_t>(index%2?v>>8:v);};
+        mic::Downmix d;std::array<float,960> in{};std::array<float,480> out{};
+        for(unsigned p=0;p<160;++p) {
+            const bool slipped=p<100;
+            for(unsigned k=0;k<960;++k) {
+                const unsigned at=(p*960+k)*2+(slipped?1:0);
+                in[k]=static_cast<int16_t>(static_cast<uint16_t>(byteAt(at)|byteAt(at+1)<<8))/32768.0f;
+            }
+            d.process(in.data(),2,480,false,out.data());
+            if((p>=30 && p<100) || p>=130) {
+                require(d.slip.on==slipped,"Byte-shifted microphone stream was not detected or not released");
+                for(unsigned i=0;i<480;++i)require(out[i]==truth(p*480+i)/32768.0f,"Byte-shifted microphone stream was not restored exactly");
+            }
+        }
+        // Loud ordinary 16-bit audio, and an 8-bit source scaled to 16 bits, must pass untouched.
+        for(unsigned kind=0;kind<2;++kind) {
+            mic::Downmix plain;uint32_t seed=7;
+            for(unsigned p=0;p<100;++p) {
+                for(unsigned k=0;k<960;++k) {
+                    seed=seed*1664525u+1013904223u;
+                    const int v=static_cast<int>(12000*std::sin((p*480+k/2)*0.05))+static_cast<int>(seed>>24)%41-20;
+                    in[k]=(kind?v/256*256:v)/32768.0f;
+                }
+                plain.process(in.data(),2,480,false,out.data());
+                require(!plain.slip.on && out[7]==(in[14]+in[15])/2,"Ordinary 16-bit audio was treated as a byte-shifted stream");
+            }
+        }
+        std::cout<<"byte_shifted_microphone=passed exact_restore_release_no_false_repair=passed\n";
+    }
+    {
         mic::NoiseGate gate;std::array<float,480> data{};
         data.fill(0.001f);
         require(gate.process(data.data(),data.size(),-40)==0.001f,"Gate lost its pre-gate meter");

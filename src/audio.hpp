@@ -245,6 +245,7 @@ struct Stats {
     std::atomic<float> inputPeriodMs{0}, outputPeriodMs{0}, driftPpm{0};
     std::atomic<unsigned> inputChannels{0};
     std::atomic<bool> inputFlipped{false}; // Downmix inverted an anti-phase second channel
+    std::atomic<unsigned> inputRepaired{0}; // capture packets ByteSlip rejoined
     std::atomic<unsigned> tagBufferFrames{0}, tagDriverGaps{0};
     std::atomic<uint64_t> tagFrames{0};
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};

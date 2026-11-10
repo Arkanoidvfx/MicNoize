@@ -21,6 +21,43 @@ struct Ramp {
         return value;
     }
 };
+// A USB microphone can drop one byte of its 16-bit stream under system load (HyperX QuadCast S,
+// 2026-11-10, 30+ s while Unreal was loading): every sample then arrives as the high byte of one
+// value joined to the low byte of the next, which is the quiet room amplified 256 times with
+// wrap-around, and the denoiser turns it into crackle. Speech pauses expose it: the samples are
+// loud, their low bytes read 00/FF, and rejoining the bytes gives a signal 24+ dB quieter. That
+// rejoined signal is the original audio, bit for bit. Ordinary audio cannot qualify, its low bytes
+// are noise. The same test in reverse returns to the raw stream once the device recovers.
+// No allocation. ponytail: 16-bit devices only; a 24-bit stream fails the exact-PCM test and passes untouched.
+struct ByteSlip {
+    bool on=false;
+    int16_t last=0,carry=0; // final raw sample of this packet / of the one before it
+    unsigned streak=0;      // samples in a row that voted to switch
+    static int16_t pcm(float v) {return static_cast<int16_t>(std::lround(v*32768.0f));}
+    static int16_t join(int16_t before,int16_t now) {
+        return static_cast<int16_t>(static_cast<uint16_t>((static_cast<uint16_t>(before)>>8)|(static_cast<uint16_t>(now)<<8)));
+    }
+    // Once per packet, before at(): `count` interleaved samples.
+    void observe(const float* in,unsigned count) {
+        double raw=0,joined=0;unsigned edge=0,negative=0;int16_t before=carry=last;
+        for(unsigned i=0;i<count;++i) {
+            const float scaled=in[i]*32768.0f;
+            if(!(scaled>=-32768.0f && scaled<=32767.0f) || scaled!=std::floor(scaled)) {on=false;streak=0;last=carry=0;return;}
+            const int16_t now=static_cast<int16_t>(scaled),fixed=join(before,now);
+            raw+=double(now)*now;joined+=double(fixed)*fixed;
+            const unsigned low=static_cast<uint16_t>(now)&0xffu;
+            edge+=low==0 || low==0xff;negative+=low==0xff;
+            before=now;
+        }
+        last=before;
+        const double loud=count*328.0*328.0; // -40 dBFS
+        const bool vote=on?joined>loud && joined>raw*250
+            :raw>loud && raw>joined*250 && edge*10>=count*9 && negative*10>=count && (edge-negative)*10>=count;
+        streak=vote?streak+count:0;
+        if(streak>=9600) {on=!on;streak=0;}
+    }
+    float at(const float* in,unsigned i) const {return on?join(i?pcm(in[i-1]):carry,pcm(in[i]))/32768.0f:in[i];}
+};
 // Capture downmix to mono. Some inputs (Realtek jacks, two-capsule arrays) deliver channel 2
 // phase-inverted: in stereo they sound right, averaged to mono the voice cancels and only the
 // uncorrelated noise survives, which any denoiser (ours or RTX Voice) turns into a robotic voice.
@@ -29,10 +66,13 @@ struct Ramp {
 struct Downmix {
     double xy=0, xx=0, yy=0;
     float sign=1;
+    ByteSlip slip;
     void process(const float* in,unsigned channels,unsigned n,bool silent,float* out) {
+        // The shifted stream is 48 dB louder: left in the sums it would hold the polarity for seconds.
+        if(const bool was=slip.on;!silent) {slip.observe(in,n*channels);if(slip.on!=was) xy=xx=yy=0;}
         if(channels>=2 && !silent && n) {
             double pxy=0, pxx=0, pyy=0;
-            for(unsigned i=0;i<n;++i) {const double l=in[i*channels], r=in[i*channels+1]; pxy+=l*r; pxx+=l*l; pyy+=r*r;}
+            for(unsigned i=0;i<n;++i) {const double l=slip.at(in,i*channels), r=slip.at(in,i*channels+1); pxy+=l*r; pxx+=l*l; pyy+=r*r;}
             if(std::isfinite(pxy+pxx+pyy)) {
                 const double keep=std::pow(0.98,n/480.0);
                 xy=xy*keep+pxy; xx=xx*keep+pxx; yy=yy*keep+pyy;
@@ -42,7 +82,7 @@ struct Downmix {
         }
         for(unsigned i=0;i<n;++i) {
             float v=0;
-            if(!silent) for(unsigned ch=0;ch<channels;++ch) v+=(ch==1?sign:1.0f)*in[i*channels+ch];
+            if(!silent) for(unsigned ch=0;ch<channels;++ch) v+=(ch==1?sign:1.0f)*slip.at(in,i*channels+ch);
             v/=static_cast<float>(channels);
             out[i]=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
         }

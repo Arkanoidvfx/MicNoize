@@ -839,7 +839,7 @@ std::string Engine::sessionLine() const {
         // What a remote report needs to tell a bad input from a bad pipeline: capture gaps, clock drift,
         // and which device with how many channels (all of them are averaged to mono).
         <<" capture_gaps="<<stats.discontinuities<<" drift_ppm="<<stats.driftPpm<<" input_period_ms="<<stats.inputPeriodMs
-        <<" input_channels="<<stats.inputChannels<<" input_flip="<<stats.inputFlipped
+        <<" input_channels="<<stats.inputChannels<<" input_flip="<<stats.inputFlipped<<" input_repaired_packets="<<stats.inputRepaired
         // Thread starvation, the whole DSP block, and gate/denoiser settings that sound like an
         // over-eager denoiser when they cut syllables.
         <<" catch_up_blocks="<<stats.catchUpBlocks<<" gpu_late_blocks="<<stats.lateBlocks<<" wake_max_ms="<<stats.tagMaxWakeMs<<" process_max_ms="<<stats.maxProcessMs<<" mmcss_failures="<<mmcssFailures
@@ -1106,7 +1106,7 @@ void Engine::start(const Config& c,uint64_t expectedOperation) {
     stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; stats.catchUpBlocks=0; stats.lateBlocks=0; failedAt_=0;
     stats.inputQueue=0; stats.outputQueue=0; stats.renderPadding=0;
     stats.underruns=0; stats.drops=0; stats.discontinuities=0; stats.processed=0;
-    stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0; stats.inputChannels=0; stats.inputFlipped=false;
+    stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0; stats.inputChannels=0; stats.inputFlipped=false; stats.inputRepaired=0;
     stats.tagBufferFrames=0; stats.tagDriverGaps=0; stats.tagFrames=0;
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
     stats.tagBufferedMin=UINT_MAX; stats.tagBufferedMax=0; stats.secondBufferedMin=UINT_MAX; stats.secondBufferedMax=0;
@@ -1598,7 +1598,7 @@ void Engine::tagLoop(Config c) {
             if(n>mono.size()){capture->ReleaseBuffer(n);throw std::runtime_error("TAG capture packet exceeds allocation");}
             if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)++stats.discontinuities;
             downmix.process(reinterpret_cast<const float*>(bytes),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
-            stats.inputFlipped=downmix.sign<0;
+            stats.inputFlipped=downmix.sign<0;if(downmix.slip.on)stats.inputRepaired.fetch_add(1,std::memory_order_relaxed);
             check(capture->ReleaseBuffer(n),"TAG release capture");
             peakHold(stats.inputPeak,peak(mono.data(),n));
             if(pacer.engaged) {
@@ -1724,7 +1724,7 @@ void Engine::ioLoop(Config c) {
                 if(flags&AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) ++stats.discontinuities;
                 // QuadCast exposes two channels: average rather than amplify correlated stereo.
                 downmix.process(reinterpret_cast<const float*>(data),input.channels,n,flags&AUDCLNT_BUFFERFLAGS_SILENT,mono.data());
-                stats.inputFlipped=downmix.sign<0;
+                stats.inputFlipped=downmix.sign<0;if(downmix.slip.on)stats.inputRepaired.fetch_add(1,std::memory_order_relaxed);
                 check(capture->ReleaseBuffer(n),"Release capture buffer");
                 peakHold(stats.inputPeak,peak(mono.data(),n));
                 if(!captured_.push(mono.data(),n)) ++stats.drops;
