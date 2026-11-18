@@ -496,7 +496,36 @@ fn release(j: &mut Journal) -> Result<(), String> {
     let hold = j.runtime.join(".update/hold"); if hold.exists() { fs::remove_file(hold).map_err(|e| e.to_string())?; }
     task(i32::from(j.task_enabled))?;
     if j.legacy.is_some(){return complete_legacy(j,false);}
-    j.phase = Phase::Complete; save(j)?; run_recovery(None,&j.runtime)
+    j.phase = Phase::Complete; save(j)?; run_recovery(None,&j.runtime)?; prune(j); Ok(())
+}
+/// Each update leaves an ~80 MB transaction and a retained package; without this `.update` grows
+/// by ~0.1 GB per release. Only a Complete journal prunes: its own transaction, `legacy` and every
+/// unrecognised entry stay, as do packages and signatures of its versions or newer (pending) ones.
+/// Failures are logged, never fatal; the next startup retries.
+fn prune(j:&Journal) {
+    if j.phase!=Phase::Complete {return;}
+    let state=j.runtime.join(".update");
+    let version=crate::updater::version_parts;
+    let Some(oldest)=version(&j.before.version).zip(version(&j.after.version)).map(|(a,b)|a.min(b)) else {return};
+    let Ok(entries)=fs::read_dir(&state) else {return};
+    let (mut removed,mut failed)=(0,Vec::new());
+    for entry in entries.flatten() {
+        let name=entry.file_name();let Some(name)=name.to_str() else {continue};
+        let older=|v:&str|version(v).is_some_and(|v|v<oldest);
+        let directory=entry.file_type().is_ok_and(|t|t.is_dir());
+        let stale=if uuid::Uuid::parse_str(name).is_ok() && name.len()==36 {directory && !name.eq_ignore_ascii_case(&j.transaction)}
+            else if let Some(v)=name.strip_prefix("previous-").and_then(|n|n.strip_suffix(".nupkg")) {!directory && older(v)}
+            else if let Some(v)=name.strip_prefix("MicNoize-").and_then(|n|n.strip_suffix("-win-x64-stable-v2-full.nupkg.sig.json")) {!directory && older(v)}
+            else {false};
+        if !stale {continue;}
+        let path=entry.path();
+        match if directory {fs::remove_dir_all(&path)} else {fs::remove_file(&path)} {
+            Ok(())=>removed+=1,
+            Err(e)=>failed.push(format!("{}: {e}",path.display())),
+        }
+    }
+    if removed>0 {crate::logs::note(&j.runtime,&format!("Удалено старых файлов обновления: {removed}"));}
+    if !failed.is_empty() {crate::logs::note(&j.runtime,&format!("Не удалось удалить старые файлы обновления: {}",failed.join("; ")));}
 }
 /// Setup.exe can replace an installation while its persistent update journal survives.
 /// Accept that replacement only as a complete, signed release, never as a mixed pair.
@@ -846,7 +875,7 @@ pub fn startup() -> Result<bool,String> {
     crate::logs::note(&runtime,&format!("Восстановление обновления: {:?}, {} -> {}",j.phase,j.before.version,j.after.version));
     for _ in 0..100 {if !applier_alive(&j){break;}std::thread::sleep(std::time::Duration::from_millis(100));}
     if applier_alive(&j){return Ok(false);}
-    if j.phase==Phase::Complete && j.legacy.is_none() { run_recovery(None,&runtime)?; return Ok(recovery.is_none()); }
+    if j.phase==Phase::Complete && j.legacy.is_none() { run_recovery(None,&runtime)?; prune(&j); return Ok(recovery.is_none()); }
     let current=j.install.join("current");
     unsafe {std::env::set_var("MNR_RUNTIME_ROOT",&runtime);std::env::set_var("MNR_TAG_HOST_PATH",current.join("mic_tag_host.exe"));}
     if j.legacy.is_some() {
@@ -930,6 +959,28 @@ mod tests {
         j.phase=Phase::Complete;assert!(!background_update(&j));
         j.phase=Phase::Prepared;j.transaction=uuid::Uuid::new_v4().to_string();
         assert!(!background_update(&j),"a retained marker cannot hide a later manual update");
+    }
+    #[test]
+    fn completed_update_prunes_old_transactions_packages_and_signatures() {
+        let t=temp();let runtime=t.0.join("runtime");let state=runtime.join(".update");
+        let mut j=Journal{schema:1,transaction:uuid::Uuid::new_v4().to_string(),install:t.0.clone(),runtime,
+            phase:Phase::Applying,before:bundle("0.4.48",b"old",b"old host"),after:bundle("0.4.49",b"new",b"new host"),
+            previous_hash:"a".repeat(64),candidate_hash:"b".repeat(64),updater_hash:"c".repeat(64),task_enabled:true,
+            applier:None,rollback_attempts:0,resume:None,legacy:None};
+        let old=state.join(uuid::Uuid::new_v4().to_string());
+        for dir in [folder(&j),old.clone(),state.join("legacy")] {fs::create_dir_all(&dir).unwrap();fs::write(dir.join("candidate.nupkg"),b"x").unwrap();}
+        let sig=|v:&str|state.join(format!("MicNoize-{v}-win-x64-stable-v2-full.nupkg.sig.json"));
+        // 0.4.9 is numerically older than 0.4.48 although it sorts after it as text.
+        let kept=[state.join("previous-0.4.48.nupkg"),sig("0.4.48"),sig("0.4.49"),sig("0.4.50"),state.join("hold"),state.join("journal.json")];
+        let stale=[state.join("previous-0.4.47.nupkg"),state.join("previous-0.3.10.nupkg"),sig("0.4.9")];
+        for file in kept.iter().chain(&stale) {fs::write(file,b"x").unwrap();}
+        for phase in [Phase::Prepared,Phase::Applying,Phase::RollingBack] {
+            j.phase=phase;prune(&j);
+            assert!(old.exists() && stale.iter().all(|f|f.exists()),"{phase:?} must not prune");
+        }
+        j.phase=Phase::Complete;prune(&j);
+        assert!(!old.exists() && stale.iter().all(|f|!f.exists()));
+        assert!(folder(&j).join("candidate.nupkg").exists() && state.join("legacy/candidate.nupkg").exists() && kept.iter().all(|f|f.exists()));
     }
     #[test]
     fn startup_file_errors_identify_paths() {

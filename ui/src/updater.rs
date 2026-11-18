@@ -76,7 +76,7 @@ pub fn apply_and_restart(intent:Option<crate::ResumeIntent>,window:Option<String
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ReleasePolicy { channel: String, mode: String, pinned_version: Option<String>, release_base_url: Option<String> }
-fn version_parts(value: &str) -> Option<[u32;3]> {
+pub(crate) fn version_parts(value: &str) -> Option<[u32;3]> {
     let values: Vec<_> = value.split('.').map(str::parse::<u32>).collect::<Result<_,_>>().ok()?;
     values.try_into().ok()
 }
