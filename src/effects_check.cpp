@@ -124,6 +124,15 @@ int main() {try {
             data.fill(0.001f);held.process(data.data(),data.size(),-40,nullptr,holdMs*48);
             require(data.front()>0 && data.back()==0,"Gate stayed open after its hold");
         }
+        {
+            // Noise hold forces the gate open with the attack ramp; release falls back to the normal hold.
+            mic::NoiseGate forced;data.fill(0.001f);forced.process(data.data(),data.size(),-40,nullptr,0,true);
+            require(data.front()>0 && data.front()<0.001f && data.back()==0.001f,"Noise hold did not ramp the gate open");
+            data.fill(0.001f);forced.process(data.data(),data.size(),-40,nullptr,0,true);
+            for(float v:data)require(v==0.001f,"Noise hold let the gate chop quiet input");
+            data.fill(0.001f);forced.process(data.data(),data.size(),-40,nullptr,0,false);
+            require(data.front()>0 && data.back()==0,"Gate stayed open after the noise hold");
+        }
         for(unsigned i=0;i<data.size();++i)data[i]=0.2f*std::sin(i*0.1f);
         const auto dry=data;gate.process(data.data(),data.size(),-72);
         require(data==dry,"Disabled gate is not exact dry bypass");

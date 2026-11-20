@@ -95,7 +95,8 @@ struct NoiseGate {
     Ramp gain{0};
     size_t hold=0;
     bool open=false;
-    float process(float* data,size_t n,float db,float* envelope=nullptr,size_t holdSamples=12000) {
+    // forceOpen (noise-hold hotkey) ramps the gate open like detected voice; release keeps the normal hold.
+    float process(float* data,size_t n,float db,float* envelope=nullptr,size_t holdSamples=12000,bool forceOpen=false) {
         float peak=0;
         for(size_t i=0;i<n;++i)peak=std::max(peak,std::abs(data[i]));
         if(!std::isfinite(db) || db<=-72) {
@@ -104,7 +105,7 @@ struct NoiseGate {
             return peak;
         }
         const float threshold=std::pow(10.0f,std::min(db,0.0f)/20.0f);
-        const bool detected=peak>=threshold || (open && peak>=threshold*0.70794578f);
+        const bool detected=forceOpen || peak>=threshold || (open && peak>=threshold*0.70794578f);
         if(detected)hold=holdSamples;
         open=detected || hold!=0;
         if(!detected)hold=hold>n?hold-n:0;

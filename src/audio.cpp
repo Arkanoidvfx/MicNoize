@@ -1278,8 +1278,9 @@ void Engine::dspLoop(Config c) {
                 // A capture gap resets nothing: v1 has no cheap reset (per-gap flushes made 0.4.34 load
                 // the GPU and stutter games), and resetting v2 or the playout replaced 70 ms of already
                 // captured speech with zeros on every gap. Each model's history clears itself within its delay.
-                const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
-                    effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
+                // The noise hold swaps the denoiser level and opens the gate.
+                const bool noiseHeld=(heldFlags(noiseHeldSample.load(),effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted)&1)!=0;
+                const float wanted=noiseHeld?alternateIntensity.load():intensity.load();
                 bool denoised=false;
                 if(gpu) {
                     // Wait while the output reserve lasts, keeping 10 ms of it; never under 8 ms.
@@ -1326,7 +1327,7 @@ void Engine::dspLoop(Config c) {
                 // RVC is still voice: its monitor marks must not bypass the gate.
                 microphoneRaw=out;microphone=out;
                 for(auto& mark:modified)if(mark)mark=ModifiedVoice;
-                peakHold(stats.noisePeak,noiseGate.process(microphone.data(),block,noiseGateDb.load(),gateEnvelope.data(),size_t{gateHoldMs.load()}*48));
+                peakHold(stats.noisePeak,noiseGate.process(microphone.data(),block,noiseGateDb.load(),gateEnvelope.data(),size_t{gateHoldMs.load()}*48,noiseHeld));
                 // Capture processed microphone before Discord source selection. Publication is a
                 // try-lock swap of buffers reserved before this real-time loop.
                 if(studioRecording && !studioActive && !studioPending && !muted) studioActive=true;
