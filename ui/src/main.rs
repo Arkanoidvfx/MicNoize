@@ -2998,6 +2998,10 @@ impl App {
             }
             Msg::WindowFocus(id, focused) => {
                 if self.window == Some(id) {
+                    // Meters froze while inactive: drop the stale reading so the next poll shows live level.
+                    if focused && !self.ui_active() {
+                        (self.peak, self.in_peak, self.noise_peak, self.monitor_peak) = (0.0, 0.0, 0.0, 0.0);
+                    }
                     self.window_focused = focused;
                     self.own_minimize &= !focused;
                     if focused { self.shown_at = None; }
@@ -6425,6 +6429,8 @@ page_pixelate=0")).unwrap().unwrap();
         let _ = app.update(Msg::Tick);
         assert_eq!(app.peak, 0.75); // No meter animation behind another app.
         let _ = app.update(Msg::WindowFocus(id, true));
+        assert_eq!(app.peak, 0.0, "a stale reading is not shown when the window comes back");
+        app.peak = 0.75;
         let _ = app.update(Msg::Tick);
         assert!((app.peak - 0.6).abs() < 0.0001);
         let _ = app.update(Msg::Minimize);
