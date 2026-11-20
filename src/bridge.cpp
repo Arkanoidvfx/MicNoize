@@ -8,7 +8,6 @@
 #include <cmath>
 #include <memory>
 #include <psapi.h>
-#include <rubberband/RubberBandStretcher.h>
 
 struct Mnr {
     mic::Engine engine;
@@ -311,62 +310,9 @@ extern "C" int32_t mnr_sound_gain(Mnr* p,uint32_t id,float gain) {
 }
 extern "C" void mnr_sound_clear(Mnr* p) {p->engine.soundClear();}
 extern "C" void mnr_sound_play(Mnr* p,uint32_t id) {p->engine.soundPlay(id);}
-extern "C" void mnr_sound_restart(Mnr* p,uint32_t id) {if(id)p->engine.soundPlay(id,true);}
 extern "C" int32_t mnr_sound_seek(Mnr* p,uint32_t id,float seconds) {
     if(!p || !id || !std::isfinite(seconds) || seconds<0 || seconds>300)return 0;
     p->engine.soundSeek(id,static_cast<unsigned>(seconds*48000));return 1;
-}
-extern "C" int32_t mnr_studio_load(Mnr* p,uint32_t id,const float* samples,uint32_t count,float gain,uint32_t start,uint32_t end) {
-    if(!p || !id || !samples || !count || count>mic::rate*300 || !std::isfinite(gain) || gain<0 || gain>2
-        || (!end && start) || (end && (start>=end || end>count)))return 0;
-    try {
-        std::vector<float> clip(samples,samples+count);
-        for(auto& v:clip)v=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
-        p->engine.soundLoad(id,std::move(clip),gain,start,end,true);return 1;
-    } catch(...) {return 0;}
-}
-extern "C" int32_t mnr_sound_loop(Mnr* p,uint32_t id,uint32_t start,uint32_t end) {
-    return p && id && p->engine.soundLoop(id,start,end)?1:0;
-}
-extern "C" int32_t mnr_studio_pitch(const float* input,uint32_t count,float scale,float* output) {
-    if(!input || !output || !count || count>mic::rate*20 || !std::isfinite(scale) || scale<0.25f || scale>4
-        || !std::all_of(input,input+count,[](float v){return std::isfinite(v);}))return 0;
-    try {
-        std::vector<float> padded;
-        const float* source=input;
-        size_t frames=count;
-        if(count<8192){
-            padded.resize(std::max<size_t>(8192,count+4096));
-            for(size_t i=0;i<padded.size();++i)padded[i]=input[i%count];
-            source=padded.data();frames=padded.size();
-        }
-        using Stretcher=RubberBand::RubberBandStretcher;
-        Stretcher shifter(mic::rate,1,Stretcher::OptionProcessOffline | Stretcher::OptionThreadingNever
-            | Stretcher::OptionPitchHighQuality,1.0,scale);
-        shifter.setExpectedInputDuration(frames);
-        constexpr size_t chunk=4096;
-        for(size_t pos=0;pos<frames;pos+=chunk){
-            const size_t n=std::min(chunk,frames-pos);const float* block=source+pos;
-            shifter.study(&block,n,pos+n==frames);
-        }
-        std::array<float,chunk> scratch{};
-        std::vector<float> shifted(frames);
-        size_t written=0;
-        for(size_t pos=0;pos<frames;pos+=chunk){
-            const size_t n=std::min(chunk,frames-pos);const float* block=source+pos;
-            shifter.process(&block,n,pos+n==frames);
-            for(int ready=shifter.available();ready>0;ready=shifter.available()){
-                const auto take=std::min<size_t>(chunk,ready);float* target=scratch.data();
-                const auto got=shifter.retrieve(&target,take);
-                if(!got)break;
-                const auto copy=std::min<size_t>(got,frames-written);
-                std::copy_n(scratch.data(),copy,shifted.data()+written);written+=copy;
-            }
-        }
-        const size_t offset=count<8192?4096:0;
-        std::copy_n(shifted.data()+offset,count,output);
-        return 1;
-    } catch(...) {return 0;}
 }
 extern "C" void mnr_sound_volume(Mnr* p,float volume) {if(std::isfinite(volume)&&volume>=0&&volume<=2)p->engine.soundVolume=volume;}
 extern "C" int32_t mnr_sound_bindings(Mnr* p,const uint32_t* ids,const uint32_t* keys,uint32_t count) {
@@ -388,16 +334,6 @@ extern "C" uint32_t mnr_sound_state(Mnr* p,float* position,float* length) {
 extern "C" uint32_t mnr_last_clip(Mnr* p,float* out,uint32_t capacity,uint32_t* generation) {
     if(!p)return 0;
     try {return p->engine.clipCopy(out,capacity,generation);} catch(...) {return 0;}
-}
-extern "C" int32_t mnr_studio_record(Mnr* p,int32_t enabled) {
-    if(!p)return 0;
-    if(enabled && (p->engine.state!=3 || p->engine.muted))return 0;
-    p->engine.studioRecording=enabled!=0;return 1;
-}
-extern "C" int32_t mnr_studio_recording(Mnr* p) {return p && p->engine.studioRecording?1:0;}
-extern "C" uint32_t mnr_studio_clip(Mnr* p,float* out,uint32_t capacity,uint32_t* generation) {
-    if(!p)return 0;
-    try {return p->engine.studioCopy(out,capacity,generation);} catch(...) {return 0;}
 }
 extern "C" int32_t mnr_pick_paths(int32_t mode,char* result,uint32_t capacity) {
     if(mode<0 || mode>1 || !result || !capacity) return -1;

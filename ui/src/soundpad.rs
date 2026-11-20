@@ -20,6 +20,8 @@ pub struct Sound {
     pub played: u64,
     /// File modification time, unix seconds: "newest" order.
     pub modified: u64,
+    /// Seconds from the file header ([`probe_seconds`]), shown before the clip is decoded.
+    pub length: Option<f32>,
     pub state: State,
 }
 /// List order. Persisted as `[soundpad] sort`.
@@ -168,13 +170,7 @@ pub fn scan(folder: &Path, saved: &[Entry]) -> Result<Vec<Sound>, String> {
         .map_err(|e| format!("{}: {e}", folder.display()))?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-        })
+        .filter(|path| path.is_file() && is_audio(path))
         .map(|path| {
             let name = path
                 .file_name()
@@ -198,6 +194,7 @@ pub fn scan(folder: &Path, saved: &[Entry]) -> Result<Vec<Sound>, String> {
                 volume,
                 played,
                 modified,
+                length: None,
                 state: State::Unloaded,
             }
         })
@@ -248,12 +245,101 @@ pub fn serialize(sounds: &[Sound]) -> String {
         .join("\t")
 }
 
+/// Whether the file name has one of the [`EXTENSIONS`].
+pub fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// What a folder holds, as a hash of audio file names and sizes: a changed value means the
+/// list is stale. Modification times are left out, so a sync client touching files is quiet.
+pub fn listing(folder: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut files: Vec<(String, u64)> = std::fs::read_dir(folder)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| is_audio(&entry.path()))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|m| m.is_file())?;
+            Some((entry.file_name().to_string_lossy().into_owned(), meta.len()))
+        })
+        .collect();
+    files.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Clip length in seconds from the container, without decoding: the header when it states
+/// the duration, otherwise the sum of packet durations. Capped like playback.
+pub fn probe_seconds(path: &Path) -> Option<f32> {
+    use symphonia::core::{formats::TrackType, formats::probe::Hint, io::MediaSourceStream, units::Duration};
+    let file = std::fs::File::open(path).ok()?;
+    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, stream, Default::default(), Default::default())
+        .ok()?;
+    let track = format.default_track(TrackType::Audio)?;
+    let (id, base, stated) = (track.id, track.time_base?, track.duration);
+    let duration = match stated {
+        Some(duration) => duration,
+        None => {
+            let mut total = 0u64;
+            while let Ok(Some(packet)) = format.next_packet() {
+                if packet.track_id == id {
+                    total = total.saturating_add(packet.dur.get());
+                }
+            }
+            Duration::new(total)
+        }
+    };
+    let seconds = base.calc_duration(duration)?.as_secs_f64() as f32;
+    (seconds > 0.0).then(|| seconds.min(MAX_SECONDS as f32))
+}
+
+/// Rename a clip file in place, keeping its extension. `stem` is the new name without it.
+/// Returns the new file name.
+pub fn rename(folder: &Path, name: &str, stem: &str) -> Result<String, String> {
+    let stem = stem.trim();
+    let extension = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or_default();
+    // Windows rejects these characters, trailing dots and spaces; `|` and `:` also keep settings lines parseable.
+    if stem.is_empty() || stem.chars().count() > 200 || stem.ends_with('.')
+        || stem.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
+        return Err("Недопустимое имя".into());
+    }
+    let new = format!("{stem}.{extension}");
+    if new == name {
+        return Ok(new);
+    }
+    let target = folder.join(&new);
+    // A case-only change is the same file on Windows; anything else must not overwrite.
+    if target.exists() && new.to_lowercase() != name.to_lowercase() {
+        return Err(format!("«{new}» уже есть в папке"));
+    }
+    std::fs::rename(folder.join(name), &target).map_err(|e| e.to_string())?;
+    Ok(new)
+}
+
+/// Move a clip into the folder's «Удалённые» subfolder, which the list does not read, so a
+/// deletion can be undone in Explorer.
+pub fn remove(folder: &Path, name: &str) -> Result<(), String> {
+    let bin = folder.join("Удалённые");
+    std::fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
+    std::fs::rename(folder.join(name), crate::unique_path(&bin, name)).map_err(|e| e.to_string())
+}
+
 /// Decode a clip to 48 kHz mono, clamped to [-1, 1] and at most [`MAX_SECONDS`].
 pub fn decode(path: &Path) -> Result<Vec<f32>, String> {
     decode_limited(path, MAX_SECONDS)
 }
 
-/// Same decoder with a smaller bound for sequencer samples.
+/// [`decode`] with an explicit bound in seconds, at most [`MAX_SECONDS`].
 pub fn decode_limited(path: &Path, seconds: usize) -> Result<Vec<f32>, String> {
     use symphonia::core::{
         codecs::audio::AudioDecoderOptions, errors::Error, formats::TrackType,
@@ -460,7 +546,8 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Copy picked files into the library folder; a name that already exists is skipped.
+/// Copy picked or dropped files into the library folder; a name that already exists and
+/// anything that is not an audio file is skipped.
 pub fn import(folder: &Path, files: &[PathBuf]) -> Result<(usize, usize), String> {
     let (mut copied, mut skipped) = (0, 0);
     for file in files {
@@ -469,7 +556,7 @@ pub fn import(folder: &Path, files: &[PathBuf]) -> Result<(usize, usize), String
             continue;
         };
         let target = folder.join(name);
-        if target.exists() || !file.is_file() {
+        if target.exists() || !file.is_file() || !is_audio(file) {
             skipped += 1;
             continue;
         }
@@ -556,6 +643,7 @@ mod tests {
                     volume: 100,
                     played: 0,
                     modified: 0,
+                    length: None,
                     state: State::Unloaded,
                 })
                 .collect()
@@ -620,6 +708,30 @@ mod tests {
         assert!(resample(&[], RATE, RATE, usize::MAX).is_empty());
         assert!(resample(&input, 0, RATE, 1).is_empty());
         assert!(resample(&input, RATE, 0, 1).is_empty());
+    }
+    #[test]
+    fn files_rename_remove_listing_and_length() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".tmp/soundpad-files-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        test_wav(&dir.join("a.wav"), 44_100, 2, 88_200);
+        let before = listing(&dir).unwrap();
+        assert!((probe_seconds(&dir.join("a.wav")).unwrap() - 2.0).abs() < 0.01);
+        assert_eq!(rename(&dir, "a.wav", " b ").unwrap(), "b.wav");
+        assert_ne!(listing(&dir).unwrap(), before, "a rename changes the listing");
+        assert!(rename(&dir, "b.wav", "x/y").is_err() && rename(&dir, "b.wav", " ").is_err() && rename(&dir, "b.wav", "b.").is_err());
+        test_wav(&dir.join("c.wav"), RATE, 1, 480);
+        assert!(rename(&dir, "c.wav", "b").unwrap_err().contains("уже есть"), "must not overwrite");
+        assert_eq!(rename(&dir, "b.wav", "B").unwrap(), "B.wav", "a case-only change is allowed");
+        remove(&dir, "B.wav").unwrap();
+        assert!(dir.join("Удалённые").join("B.wav").exists() && !dir.join("B.wav").exists());
+        let kept = listing(&dir).unwrap();
+        std::fs::write(dir.join("src/notes.txt"), "x").unwrap();
+        test_wav(&dir.join("src/d.wav"), RATE, 1, 480);
+        assert_eq!(import(&dir, &[dir.join("src/notes.txt"), dir.join("src/d.wav"), dir.join("src")]).unwrap(), (1, 2));
+        assert_ne!(listing(&dir).unwrap(), kept);
+        assert!(probe_seconds(&dir.join("src/notes.txt")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn decode_bounds_before_allocation() {

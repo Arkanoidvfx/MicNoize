@@ -13,7 +13,6 @@ mod smooth;
 mod tacho;
 mod tune;
 mod soundpad;
-mod studio;
 mod telemetry;
 mod updater;
 mod maintenance;
@@ -300,14 +299,12 @@ mod focus {
     pub const TAB_LOGS: usize = 76;
     /// Page 6 (effects), split from the microphone page in 0.2.8.
     pub const TAB_EFFECTS: usize = 80;
-    pub const TAB_STUDIO: usize = 30000;
     pub const GUIDE: usize = 90000;
     pub fn tab(page: u8) -> usize {
         match page {
             4 => TAB_SOUNDPAD,
             5 => TAB_LOGS,
             6 => TAB_EFFECTS,
-            7 => TAB_STUDIO,
             _ => TAB_BASE + page as usize,
         }
     }
@@ -330,33 +327,19 @@ mod focus {
         pub const SECTION_NAME: usize = 70;
         pub const SECTION_DELETE: usize = 71;
         pub const NORMALIZE: usize = 75;
+        pub const OPEN_FOLDER: usize = 100;
+        /// The now-playing progress bar: arrows jump 5 s.
+        pub const SEEK: usize = 101;
+        /// Inline editor of one clip (rename / delete), opened by its row's `EDIT_BASE + i`.
+        pub const EDIT_NAME: usize = 102;
+        pub const EDIT_SAVE: usize = 103;
+        pub const EDIT_DELETE: usize = 104;
+        pub const EDIT_CANCEL: usize = 105;
+        pub const EDIT_BASE: usize = 50000;
         /// Row `i`: `ROW_BASE + 3 * i` play, `+ 1` volume, `+ 2` hotkey.
         pub const ROW_BASE: usize = 1000;
         /// Sidebar entry `i` of `App::section_items`.
         pub const SECTION_BASE: usize = 20000;
-    }
-    pub mod studio {
-        pub const RECORD: usize = 30001;
-        pub const IMPORT: usize = 30002;
-        pub const BPM: usize = 30003;
-        pub const PLAY: usize = 30004;
-        pub const EXPORT: usize = 30005;
-        pub const CLEAR: usize = 30006;
-        pub const STOP: usize = 30007;
-        pub const HEAR: usize = 30008;
-        pub const CURSOR: usize = 30009;
-        pub const LOOP: usize = 30014;
-        pub const LOOP_START: usize = 30015;
-        pub const LOOP_END: usize = 30016;
-        pub const ZOOM: usize = 30017;
-        pub const VOLUME: usize = 30018;
-        pub const DELETE_CONFIRM: usize = 30019;
-        pub const DELETE_CANCEL: usize = 30020;
-        pub const LIBRARY: usize = 30021;
-        pub const BAR_BASE: usize = 30010;
-        pub const SAMPLE_BASE: usize = 30100;
-        pub const DELETE_BASE: usize = 31000;
-        pub const CELL_BASE: usize = 32000;
     }
     pub mod settings {
         pub const INPUT: usize = 0;
@@ -672,6 +655,7 @@ enum Msg {
     Bind(usize),
     SoundpadFolder,
     SoundpadPicked(bool, Result<Vec<PathBuf>, String>),
+    SoundImported(Result<(usize, usize), String>),
     SoundpadAdd,
     SoundpadRefresh,
     SoundpadVolume(f32),
@@ -689,37 +673,6 @@ enum Msg {
     ScrollProbe(&'static str, Option<(f32, f32, f32)>),
     ScrollFrame(Instant),
     SoundpadStop,
-    StudioBpm(u32),
-    StudioVolume(u32),
-    StudioZoom(usize),
-    StudioLoopEnabled(bool),
-    StudioLoopStart(usize),
-    StudioLoopEnd(usize),
-    StudioLoopGrab(usize),
-    StudioLoopMove(usize),
-    StudioBar(usize),
-    StudioSelect(String),
-    StudioCell(usize, u8),
-    StudioDrawStart(usize, u8),
-    StudioCellEnter(usize, u8),
-    StudioEraseStart(usize, u8),
-    StudioRightEnd,
-    StudioGrab(usize),
-    StudioDrag(usize),
-    StudioScroll(f32, f32),
-    StudioRecord,
-    StudioRecorded(Result<String, String>),
-    StudioImport,
-    StudioPicked(Result<Vec<PathBuf>, String>),
-    StudioImported(Result<(), String>),
-    StudioRender(bool),
-    StudioRendered(bool, Result<Option<PathBuf>, String>),
-    StudioClear,
-    StudioDeleteAsk(String),
-    StudioDeleteConfirm,
-    StudioDeleteCancel,
-    StudioDeleted(String, Result<(), String>),
-    StudioLibraryToggle,
     SectionSelect(usize),
     SectionAdd,
     SectionName(String),
@@ -732,6 +685,22 @@ enum Msg {
     SoundPlay(usize),
     SoundVolume(usize, f32),
     SoundLoaded(usize, u32, Result<f32, String>),
+    /// Header lengths of the clips of list generation `.0`, by file name.
+    SoundLengths(u32, Vec<(String, Option<f32>)>),
+    /// The folder signature from [`soundpad::listing`]; a change rescans the list.
+    SoundFolderChecked(Option<u64>),
+    SoundpadOpenFolder,
+    /// Jump the playing clip to this fraction of its length.
+    SoundSeek(f32),
+    /// Open (or close) the rename / delete editor of clip `i`.
+    SoundEdit(Option<usize>),
+    SoundEditName(String),
+    SoundRename,
+    /// First press arms, the second moves the file to «Удалённые».
+    SoundDelete,
+    /// Files dragged from Explorer over the window (true) or away (false).
+    FilesHovered(bool),
+    FileDropped(PathBuf),
     /// A finished hold-effect recording was written to the recordings folder.
     ClipRecorded(Result<(), String>),
     /// Recording, backwards.
@@ -784,6 +753,13 @@ enum Msg {
     RehearsalReady(Result<(), String>),
     Screenshot(window::Screenshot),
 }
+/// Colour of the soundpad note line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Info,
+    Done,
+    Error,
+}
 /// Which sidebar entry filters the clip list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Selection {
@@ -812,36 +788,8 @@ impl std::fmt::Display for SaveTarget {
 #[derive(Clone,Copy,serde::Serialize,serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResumeIntent {microphone:bool,headphones:bool,monitor:i32,full_monitor:bool}
-struct StudioStroke { anchor: usize, note: u8, sample: String, before: Vec<studio::Event> }
 struct App {
     soundpad_page: bool,
-    studio_page: bool,
-    studio_folder: PathBuf,
-    studio_samples: Vec<String>,
-    studio_selected: Option<String>,
-    studio_events: Vec<studio::Event>,
-    studio_bpm: u32,
-    studio_volume: u32,
-    studio_zoom: usize,
-    studio_loop: bool,
-    studio_live: bool,
-    studio_rebuild: bool,
-    studio_loop_start: usize,
-    studio_loop_end: usize,
-    studio_loop_drag: Option<bool>, // true adjusts the start; false adjusts the end
-    studio_stroke: Option<StudioStroke>,
-    studio_erasing: bool,
-    studio_delete: Option<String>,
-    studio_library_open: bool,
-    studio_bar: usize,
-    studio_cursor: f32,
-    studio_scrubbing: bool,
-    studio_follow: bool,
-    studio_play_bpm: u32,
-    studio_scroll: (f32, f32),
-    studio_generation: u32,
-    studio_busy: bool,
-    studio_note: String,
     sound_folder: Option<PathBuf>,
     sounds: Vec<Sound>,
     sound_volume: f32,
@@ -869,7 +817,18 @@ struct App {
     sound_pending_play: Option<usize>,
     sound_playing: (u32, f32, f32),
     sound_note: String,
+    sound_tone: Tone,
     sound_dialog: bool,
+    /// Signature of the folder as last scanned, and when the watch last looked at it.
+    sound_listing: Option<u64>,
+    sound_checked: Instant,
+    /// Clip whose rename / delete editor is open, the name being typed, and an armed delete.
+    sound_edit: Option<usize>,
+    sound_edit_name: String,
+    sound_delete_armed: bool,
+    /// Files dropped from Explorer, imported together on the next tick; and a drag in progress.
+    sound_drops: Vec<PathBuf>,
+    sound_drop_hover: bool,
     /// The six newest hold-effect recordings, newest first, and their folder.
     clips: Vec<Sound>,
     clips_folder: PathBuf,
@@ -1335,6 +1294,8 @@ impl App {
             },
             None => (vec![], String::new()),
         };
+        let sound_tone = if sound_note.is_empty() { Tone::Info } else { Tone::Error };
+        let sound_listing = sound_folder.as_deref().and_then(soundpad::listing);
         engine.sound_volume(sound_volume * SOUND_VOLUME_AT_100);
         let clips_folder = settings
             .path
@@ -1342,15 +1303,6 @@ impl App {
             .unwrap_or(Path::new("."))
             .join("Записи");
         let clips = newest_clips(&clips_folder);
-        let studio_folder = settings.path.parent().unwrap_or(Path::new(".")).join("Студия").join("Звуки");
-        let studio_samples = studio::scan(&studio_folder);
-        let studio_selected = studio_samples.first().cloned();
-        let (studio_bpm, studio_events) = studio::load(&settings);
-        let studio_volume = settings.number("studio", "volume", 100, 0, 200) as u32;
-        let studio_zoom = studio::ZOOMS.iter().position(|&z| z == settings.number("studio", "zoom", 100, 50, 150) as u8).unwrap_or(2);
-        let studio_loop_start = settings.number("studio", "loop_start", 0, 0, 63) as usize;
-        let studio_loop_end = (settings.number("studio", "loop_end", 64, 1, 64) as usize).max(studio_loop_start + 1);
-        let studio_loop = settings.number("studio", "loop", 0, 0, 1) != 0;
         if !cfg!(test) {
             engine.refresh();
         }
@@ -1434,36 +1386,6 @@ impl App {
             .unwrap_or_default();
         let mut app = Self {
                 soundpad_page: args.iter().any(|s| s == "--ui-soundpad"),
-                studio_page: args.iter().any(|s| s == "--ui-studio"),
-                studio_folder,
-                studio_samples,
-                studio_selected,
-                studio_events,
-                studio_bpm,
-                studio_volume,
-                studio_zoom,
-                studio_loop,
-                studio_live: studio_loop,
-                studio_rebuild: false,
-                studio_loop_start,
-                studio_loop_end,
-                studio_loop_drag: None,
-                studio_stroke: None,
-                studio_erasing: false,
-                studio_delete: None,
-                studio_library_open: false,
-                studio_bar: 0,
-                studio_cursor: 0.0,
-                studio_scrubbing: false,
-                studio_follow: true,
-                studio_play_bpm: studio_bpm,
-                studio_scroll: {
-                    let viewport = if Self::window_size().width < 846.0 { 240.0 } else { 300.0 };
-                    (view::studio_offset(studio::ROOT_NOTE, studio::ZOOMS[studio_zoom], viewport), viewport)
-                },
-                studio_generation: 0,
-                studio_busy: false,
-                studio_note: String::new(),
                 sound_folder,
                 sounds,
                 sound_volume,
@@ -1486,7 +1408,15 @@ impl App {
                 sound_pending_play: None,
                 sound_playing: (0, 0.0, 0.0),
                 sound_note,
+                sound_tone,
                 sound_dialog: false,
+                sound_listing,
+                sound_checked: Instant::now(),
+                sound_edit: None,
+                sound_edit_name: String::new(),
+                sound_delete_armed: false,
+                sound_drops: Vec::new(),
+                sound_drop_hover: false,
                 clips,
                 clips_folder,
                 clip_generation: 0,
@@ -1651,7 +1581,7 @@ impl App {
                 measurements: "state,cpu_one_core_percent,working_set_mb\n".into(),
         };
         app.sanitize_sound_keys();
-        let preload = app.sync_sound_bindings();
+        let preload = Task::batch([app.sync_sound_bindings(), app.probe_lengths()]);
         let logs = if app.logs_page { app.load_logs(false) } else { Task::none() };
         Ok(Some((
             app,
@@ -1830,13 +1760,6 @@ impl App {
         );
         self.settings
             .set("soundpad", "sounds", soundpad::serialize(&self.sounds));
-        self.settings.set("studio", "bpm", self.studio_bpm);
-        self.settings.set("studio", "volume", self.studio_volume);
-        self.settings.set("studio", "zoom", studio::ZOOMS[self.studio_zoom]);
-        self.settings.set("studio", "loop", self.studio_loop as i32);
-        self.settings.set("studio", "loop_start", self.studio_loop_start);
-        self.settings.set("studio", "loop_end", self.studio_loop_end);
-        self.settings.set("studio", "events", serde_json::to_string(&self.studio_events).unwrap_or_default());
         self.controls.rvc_options.save(&mut self.settings);
         self.engine
             .save(self.settings.path.clone(), self.settings.text());
@@ -2071,37 +1994,11 @@ impl App {
         let stamp=motion.map_or(0,|start|((start.elapsed().as_millis() as u32)&255)<<1);
         iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ stamp ^ self.repaint_all as u32), ..view::BG }
     }
-    fn page_key(&self) -> [bool; 7] {
-        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page, self.studio_page, self.guide_page]
+    fn page_key(&self) -> [bool; 6] {
+        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page, self.guide_page]
     }
     fn ui_active(&self) -> bool {
         self.window.is_some() && self.window_focused
-    }
-    fn reveal_studio(&mut self, note: u8) -> Task<Msg> {
-        let zoom = studio::ZOOMS[self.studio_zoom];
-        let viewport = self.studio_scroll.1;
-        self.studio_scroll.0 = view::studio_offset(note, zoom, viewport);
-        view::studio_reveal(note, zoom, viewport)
-    }
-    fn studio_loop_range(&self) -> Option<(usize, usize)> {
-        self.studio_loop.then(|| (studio::frame_at(self.studio_loop_start, self.studio_play_bpm),
-            studio::frame_at(self.studio_loop_end, self.studio_play_bpm)))
-    }
-    fn studio_gain(&self) -> f32 {
-        self.controls.discord_volume * self.studio_volume as f32 / 100.0
-    }
-    fn sync_studio_loop(&self) {
-        self.engine.sound_loop(studio::TRACK_ID, self.studio_loop_range());
-    }
-    fn seek_studio(&mut self, step: usize) {
-        let step = step.min(studio::STEPS - 1);
-        self.studio_cursor = step as f32;
-        self.studio_bar = step / 16;
-        self.studio_follow = true;
-        if self.running() {
-            let bpm = if self.sound_playing.0 == studio::TRACK_ID { self.studio_play_bpm } else { self.studio_bpm };
-            self.engine.sound_seek(studio::TRACK_ID, step as f32 * 15.0 / bpm as f32);
-        }
     }
     /// Native monitor mode: 1 is the full voice, 9 the raw microphone, otherwise 1 + mask
     /// (1 effects, 2 boost, 4 sounds).
@@ -2279,6 +2176,8 @@ impl App {
     fn rescan_sounds(&mut self) -> Task<Msg> {
         self.bump_sounds();
         self.sound_pending_play = None;
+        self.sound_edit = None;
+        self.sound_checked = Instant::now();
         self.engine.sound_clear();
         // sound_clear drops the loaded recordings too; they decode again on the next play, and
         // a recording still decoding must not mark itself loaded.
@@ -2291,6 +2190,7 @@ impl App {
             self.sounds.clear();
             return Task::none();
         };
+        self.sound_listing = soundpad::listing(&folder);
         let saved: Vec<soundpad::Entry> = self
             .sounds
             .iter()
@@ -2303,21 +2203,43 @@ impl App {
             .collect();
         match soundpad::scan(&folder, &saved) {
             Ok(sounds) => {
+                // The empty list explains itself; an old note about the previous list is stale.
                 self.sounds = sounds;
-                self.sound_note = if self.sounds.is_empty() {
-                    "В папке нет mp3, wav или ogg. Нажмите «Добавить звуки».".into()
-                } else {
-                    String::new()
-                };
+                self.say_sound(Tone::Info, "");
             }
             Err(e) => {
-                self.sounds.clear();
-                self.sound_note = format!("Папка недоступна: {e}");
+                // An unplugged drive or offline share must not erase keys and volumes: keep the
+                // rows (unsaved, unbound) until the watch sees the folder again.
+                self.say_sound(Tone::Error, format!("Папка недоступна: {e}"));
+                return Task::none();
             }
         }
         self.sanitize_sound_keys();
         self.dirty = Some(Instant::now());
-        self.sync_sound_bindings()
+        Task::batch([self.sync_sound_bindings(), self.probe_lengths()])
+    }
+    fn say_sound(&mut self, tone: Tone, text: impl Into<String>) {
+        self.sound_note = text.into();
+        self.sound_tone = tone;
+    }
+    /// Read clip lengths from file headers in the background, for rows not yet decoded.
+    fn probe_lengths(&self) -> Task<Msg> {
+        let files: Vec<(String, PathBuf)> = self.sounds.iter()
+            .filter(|s| s.length.is_none())
+            .map(|s| (s.name.clone(), s.path.clone()))
+            .collect();
+        if files.is_empty() || cfg!(test) {
+            return Task::none();
+        }
+        let generation = self.sound_generation;
+        perform(
+            async move { files.into_iter().map(|(name, path)| { let length = soundpad::probe_seconds(&path); (name, length) }).collect() },
+            move |lengths| Msg::SoundLengths(generation, lengths),
+        )
+    }
+    /// A soundpad (not recording) clip is playing.
+    fn sound_busy(&self) -> bool {
+        self.sound_playing.0 != 0 || self.sound_pending_play.is_some()
     }
     /// Indices of the clips shown by the sidebar selection and the text filter, in the
     /// selected order.
@@ -2539,10 +2461,6 @@ impl App {
             self.scroll_anims.clear();
             self.scroll_pending.clear();
             self.sound_hover = None;
-            self.studio_scrubbing = false;
-            self.studio_loop_drag = None;
-            self.studio_stroke = None;
-            self.studio_erasing = false;
             // A rebuilt clip list repaints in one pass, as a page swap does. Not on hiding or
             // focus loss (switching to a game): no extra frame there.
             self.repaint_all ^= !matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize | Msg::WindowFocus(..));
@@ -2814,7 +2732,6 @@ impl App {
                 let (snapshot, error) = self.engine.snapshot(self.ui_active());
                 let noise_peak = if self.ui_active() { self.engine.noise_peak() } else { 0.0 };
                 self.feed_tune(snapshot.input_peak, noise_peak, snapshot.state);
-                let studio_just_started = self.snapshot.state != 3 && snapshot.state == 3;
                 self.snapshot = snapshot;
                 self.effect_activity = self.engine.effect_activity();
                 (self.phrase_state, self.phrase_seconds) = self.engine.phrase();
@@ -2841,21 +2758,7 @@ impl App {
                     sound.played = soundpad::now();
                     self.dirty = Some(Instant::now());
                 }
-                let studio_finished = self.sound_playing.0 == studio::TRACK_ID
-                    && playing.0 != studio::TRACK_ID && !self.studio_loop;
                 self.sound_playing = playing;
-                if studio_finished {
-                    self.studio_live = false;
-                    self.studio_cursor = 0.0;
-                    if self.studio_follow { self.studio_bar = 0; }
-                }
-                if self.studio_page && self.ui_active() && playing.0 == studio::TRACK_ID && !self.studio_scrubbing {
-                    self.studio_cursor = (playing.1 * self.studio_play_bpm as f32 / 15.0)
-                        .clamp(0.0, studio::STEPS as f32);
-                    if self.studio_follow {
-                        self.studio_bar = (self.studio_cursor as usize / 16).min(studio::BARS - 1);
-                    }
-                }
                 let (monitor, monitor_message) = self.engine.monitor_state();
                 if monitor == 3 && self.monitor != 3 {
                     self.message = format!("Прослушивание: {monitor_message}");
@@ -2926,16 +2829,29 @@ impl App {
                     self.save();
                 }
                 let next = timer(self.ui_active() && self.running());
+                // Explorer delivers one event per dropped file: import them together.
+                let next = if !self.sound_drops.is_empty() && !self.sound_dialog {
+                    let drops = std::mem::take(&mut self.sound_drops);
+                    Task::batch([next, self.update(Msg::SoundpadPicked(false, Ok(drops)))])
+                } else {
+                    next
+                };
+                // Folder watch: only while the soundpad is on screen, every two seconds.
+                let next = match &self.sound_folder {
+                    Some(folder) if self.soundpad_page && self.ui_active()
+                        && self.sound_checked.elapsed() >= Duration::from_secs(2) => {
+                        self.sound_checked = Instant::now();
+                        let folder = folder.clone();
+                        Task::batch([next, perform(async move { soundpad::listing(&folder) }, Msg::SoundFolderChecked)])
+                    }
+                    _ => next,
+                };
                 let next = if !self.update_ready && !self.update_checking && !self.quitting
                     && self.last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
                     Task::batch([next, self.update(Msg::UpdateCheck)])
                 } else {
                     next
                 };
-                if studio_just_started && self.studio_page && self.ui_active() && self.studio_loop
-                    && self.studio_live && !self.studio_events.is_empty() {
-                    return Task::batch([next, self.update(Msg::StudioRender(false))]);
-                }
                 if let Some((generation, samples)) = self.engine.last_clip(self.clip_generation) {
                     self.clip_generation = generation;
                     let (folder, name) = (self.clips_folder.clone(), clip_name());
@@ -2949,17 +2865,6 @@ impl App {
                             Msg::ClipRecorded,
                         ),
                     ]);
-                }
-                if let Some((generation, samples)) = self.engine.studio_clip(self.studio_generation) {
-                    self.studio_generation = generation;
-                    let folder = self.studio_folder.clone();
-                    let name = clip_name().replace("Запись", "Сэмпл").replace(" (mix)", "");
-                    return Task::batch([next, perform(async move {
-                        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-                        let path = unique_path(&folder, &name);
-                        soundpad::write_wav(&path, &samples)?;
-                        Ok(path.file_name().unwrap().to_string_lossy().into_owned())
-                    }, Msg::StudioRecorded)]);
                 }
                 if self.capture_path.is_some() && !self.capture_started && self.ticks >= 12 {
                     self.capture_started = true;
@@ -2994,7 +2899,6 @@ impl App {
                     });
                     return window::raw_id::<Msg>(id).map(Msg::Keyed);
                 }
-                if self.studio_page { return self.reveal_studio(studio::ROOT_NOTE); }
             }
             Msg::WindowFocus(id, focused) => {
                 if self.window == Some(id) {
@@ -3005,12 +2909,6 @@ impl App {
                     self.window_focused = focused;
                     self.own_minimize &= !focused;
                     if focused { self.shown_at = None; }
-                    if !focused {
-                        self.studio_scrubbing = false;
-                        self.studio_loop_drag = None;
-                        self.studio_stroke = None;
-                        self.studio_erasing = false;
-                    }
                 }
             }
             Msg::Minimized(id) => {
@@ -3035,10 +2933,6 @@ impl App {
                 if !self.tray_ok {
                     return Task::none();
                 }
-                self.studio_scrubbing = false;
-                self.studio_loop_drag = None;
-                self.studio_stroke = None;
-                self.studio_erasing = false;
                 self.engine.capture(false);
                 self.binding = None;
                 if !self.hint_shown {
@@ -3261,7 +3155,6 @@ impl App {
                 let before = self.page_key();
                 self.guide_page = page == 8;
                 self.soundpad_page = page == 4;
-                self.studio_page = page == 7;
                 // Page 3 is no longer a page: the headphone panel opens over Шумодав.
                 self.headphone_page = page == 3;
                 self.logs_page = page == 5;
@@ -3285,14 +3178,6 @@ impl App {
                 );
                 if self.logs_page {
                     return Task::batch([snap, self.load_logs(false)]);
-                }
-                if self.studio_page {
-                    let reveal = self.reveal_studio(studio::ROOT_NOTE);
-                    if self.ui_active() && self.studio_live && self.studio_loop && self.snapshot.state == 3
-                        && self.sound_playing.0 != studio::TRACK_ID && !self.studio_events.is_empty() {
-                        return Task::batch([snap, reveal, self.update(Msg::StudioRender(false))]);
-                    }
-                    return Task::batch([snap, reveal]);
                 }
                 return snap;
             }
@@ -3528,7 +3413,6 @@ impl App {
             }
             Msg::DiscordVolume(v) => {
                 self.controls.discord_volume = discord_volume_gain(v);
-                self.engine.sound_gain(studio::TRACK_ID, self.studio_gain());
                 self.focus = focus::effects::DISCORD_VOLUME;
                 self.changed();
             }
@@ -3982,7 +3866,7 @@ live:{}", self.engine.session_report());
                     return Task::none();
                 }
                 if !folder && self.sound_folder.is_none() {
-                    self.sound_note = "Сначала выберите папку со звуками.".into();
+                    self.say_sound(Tone::Info, "Сначала выберите папку со звуками.");
                     return Task::none();
                 }
                 self.sound_dialog = true;
@@ -4003,26 +3887,34 @@ live:{}", self.engine.session_report());
                         let Some(target) = self.sound_folder.clone() else {
                             return Task::none();
                         };
-                        match soundpad::import(&target, &paths) {
-                            Ok((copied, skipped)) => {
-                                let task = self.rescan_sounds();
-                                if self.sound_note.is_empty() {
-                                    self.sound_note = format!(
-                                        "Добавлено: {copied}{}",
-                                        if skipped > 0 {
-                                            format!(", пропущено (уже есть): {skipped}")
-                                        } else {
-                                            String::new()
-                                        }
-                                    );
+                        // Large or remote files copy off the UI thread; drops and the watch wait.
+                        self.sound_dialog = true;
+                        return perform(async move { soundpad::import(&target, &paths) }, Msg::SoundImported);
+                    }
+                    Err(e) => self.say_sound(Tone::Error, format!("Диалог не открылся: {e}")),
+                }
+            }
+            Msg::SoundImported(result) => {
+                self.sound_dialog = false;
+                // Files copied before a failure are in the folder too: rescan either way.
+                let task = self.rescan_sounds();
+                match result {
+                    Ok((copied, skipped)) => {
+                        if self.sound_note.is_empty() {
+                            let text = format!(
+                                "Добавлено: {copied}{}",
+                                if skipped > 0 {
+                                    format!(", пропущено (уже есть или не звук): {skipped}")
+                                } else {
+                                    String::new()
                                 }
-                                return task;
-                            }
-                            Err(e) => self.sound_note = format!("Не удалось добавить: {e}"),
+                            );
+                            self.say_sound(if copied > 0 { Tone::Done } else { Tone::Info }, text);
                         }
                     }
-                    Err(e) => self.sound_note = format!("Диалог не открылся: {e}"),
+                    Err(e) => self.say_sound(Tone::Error, format!("Не удалось добавить: {e}")),
                 }
+                return task;
             }
             Msg::SoundpadRefresh => {
                 self.focus = focus::soundpad::REFRESH;
@@ -4036,7 +3928,7 @@ live:{}", self.engine.session_report());
             }
             Msg::SoundpadHear(enabled) => {
                 self.sound_monitor = enabled;
-                self.focus = if self.studio_page { focus::studio::HEAR } else { focus::soundpad::HEAR };
+                self.focus = focus::soundpad::HEAR;
                 self.dirty = Some(Instant::now());
                 if !matches!(self.monitor, 1 | 2) {
                     self.monitor_all = false;
@@ -4064,9 +3956,6 @@ live:{}", self.engine.session_report());
             }
             Msg::SoundpadScroll(offset, height) => {
                 self.sound_scroll = (offset, height);
-            }
-            Msg::StudioScroll(offset, height) => {
-                self.studio_scroll = (offset, height);
             }
             Msg::SoundHover(i, entered) => {
                 if entered && i < self.sounds.len() {
@@ -4170,7 +4059,7 @@ live:{}", self.engine.session_report());
                 if name.is_empty() || name == self.sections[i].name {
                     self.section_name.clear();
                 } else if self.sections.iter().enumerate().any(|(j, s)| j != i && s.name == name) {
-                    self.sound_note = "Раздел с таким именем уже есть.".into();
+                    self.say_sound(Tone::Error, "Раздел с таким именем уже есть.");
                 } else {
                     self.sections[i].name = name;
                     self.section_name.clear();
@@ -4197,21 +4086,18 @@ live:{}", self.engine.session_report());
                 }
             }
             Msg::DragEnd => {
-                self.studio_scrubbing = false;
-                self.studio_loop_drag = None;
-                let studio_edited = self.studio_stroke.take().is_some();
                 if let (Some(i), Some(section)) = (self.dragging.take(), self.drag_over.take())
                     && let Some(sound) = self.sounds.get(i)
                     && let Some(target) = self.sections.get_mut(section)
                     && !target.files.contains(&sound.name)
                 {
                     target.files.push(sound.name.clone());
-                    self.sound_note = format!("«{}» добавлен в «{}»", sound.name, target.name);
+                    let text = format!("«{}» добавлен в «{}»", sound.name, target.name);
+                    self.say_sound(Tone::Done, text);
                     self.dirty = Some(Instant::now());
                 }
                 self.dragging = None;
                 self.drag_over = None;
-                if studio_edited && self.studio_live { return self.update(Msg::StudioRender(false)); }
             }
             Msg::SoundUnassign(i) => {
                 if let Some(section) = self.custom_section()
@@ -4224,305 +4110,17 @@ live:{}", self.engine.session_report());
             Msg::SoundpadStop => {
                 self.engine.sound_play(0);
                 self.sound_pending_play = None;
-                if self.studio_live && self.studio_loop {
-                    self.studio_loop = false;
-                    self.dirty = Some(Instant::now());
-                }
-                self.studio_live = false;
-                self.studio_rebuild = false;
-            }
-            Msg::StudioBpm(bpm) => {
-                self.studio_bpm = bpm.clamp(60, 200);
-                self.focus = focus::studio::BPM;
-                self.dirty = Some(Instant::now());
-                if self.studio_live { return self.update(Msg::StudioRender(false)); }
-            }
-            Msg::StudioVolume(value) => {
-                self.studio_volume = value.min(200);
-                self.engine.sound_gain(studio::TRACK_ID, self.studio_gain());
-                self.focus = focus::studio::VOLUME;
-                self.dirty = Some(Instant::now());
-            }
-            Msg::StudioZoom(index) => {
-                let old_pitch = 28.0 * studio::ZOOMS[self.studio_zoom] as f32 / 100.0;
-                let row = ((self.studio_scroll.0 + self.studio_scroll.1 / 2.0) / old_pitch) as usize;
-                let note = studio::FIRST_NOTE + (studio::NOTES - 1 - row.min(studio::NOTES - 1)) as u8;
-                self.studio_zoom = index.min(studio::ZOOMS.len() - 1);
-                self.focus = focus::studio::ZOOM;
-                self.dirty = Some(Instant::now());
-                return self.reveal_studio(note);
-            }
-            Msg::StudioLoopEnabled(enabled) => {
-                self.studio_loop = enabled;
-                self.focus = focus::studio::LOOP;
-                self.sync_studio_loop();
-                self.dirty = Some(Instant::now());
-                if enabled {
-                    self.studio_live = true;
-                    if !self.studio_events.is_empty() { return self.update(Msg::StudioRender(false)); }
-                }
-            }
-            Msg::StudioLoopStart(step) => {
-                let activate = !self.studio_loop;
-                self.studio_loop_start = step.min(self.studio_loop_end - 1);
-                self.studio_loop = true;
-                self.focus = focus::studio::LOOP_START;
-                self.sync_studio_loop();
-                self.dirty = Some(Instant::now());
-                if activate && !self.studio_events.is_empty() {
-                    self.studio_live = true;
-                    return self.update(Msg::StudioRender(false));
-                }
-            }
-            Msg::StudioLoopEnd(step) => {
-                let activate = !self.studio_loop;
-                self.studio_loop_end = step.clamp(self.studio_loop_start + 1, studio::STEPS);
-                self.studio_loop = true;
-                self.focus = focus::studio::LOOP_END;
-                self.sync_studio_loop();
-                self.dirty = Some(Instant::now());
-                if activate && !self.studio_events.is_empty() {
-                    self.studio_live = true;
-                    return self.update(Msg::StudioRender(false));
-                }
-            }
-            Msg::StudioLoopGrab(step) => {
-                let start_distance = step.abs_diff(self.studio_loop_start);
-                let end_distance = step.abs_diff(self.studio_loop_end - 1);
-                let start = start_distance < end_distance;
-                self.studio_loop_drag = Some(start);
-                return self.update(if start { Msg::StudioLoopStart(step) } else { Msg::StudioLoopEnd(step + 1) });
-            }
-            Msg::StudioLoopMove(step) => {
-                if let Some(start) = self.studio_loop_drag {
-                    return self.update(if start { Msg::StudioLoopStart(step) } else { Msg::StudioLoopEnd(step + 1) });
-                }
-            }
-            Msg::StudioBar(bar) => {
-                self.studio_bar = bar.min(studio::BARS - 1);
-                self.studio_follow = false;
-                self.focus = focus::studio::BAR_BASE + self.studio_bar;
-            }
-            Msg::StudioGrab(step) => {
-                self.studio_scrubbing = true;
-                self.focus = focus::studio::CURSOR;
-                self.seek_studio(step);
-            }
-            Msg::StudioDrag(step) => {
-                if self.studio_scrubbing { self.seek_studio(step); }
-            }
-            Msg::StudioSelect(name) => {
-                if self.studio_samples.contains(&name) {
-                    self.focus = focus::studio::SAMPLE_BASE + self.studio_samples.iter().position(|s| s == &name).unwrap();
-                    self.studio_selected = Some(name);
-                    if Self::window_size().width < 846.0 { self.studio_library_open = false;self.focus = focus::studio::LIBRARY; }
-                }
-            }
-            Msg::StudioLibraryToggle => {
-                self.studio_library_open = !self.studio_library_open;
-                self.focus = focus::studio::LIBRARY;
-            }
-            Msg::StudioCell(step, note) => {
-                if step < studio::STEPS && (studio::FIRST_NOTE..studio::FIRST_NOTE + studio::NOTES as u8).contains(&note)
-                    && let Some(sample) = &self.studio_selected {
-                    studio::toggle(&mut self.studio_events, step, note, sample);
-                    self.focus = focus::studio::CELL_BASE + (step % 16) * studio::NOTES + (note - studio::FIRST_NOTE) as usize;
-                    self.dirty = Some(Instant::now());
-                    if self.studio_live { return self.update(Msg::StudioRender(false)); }
-                }
-            }
-            Msg::StudioDrawStart(step, note) => {
-                if step >= studio::STEPS || !(studio::FIRST_NOTE..studio::FIRST_NOTE + studio::NOTES as u8).contains(&note) { return Task::none(); }
-                if let Some(sample) = self.studio_selected.clone() {
-                    let before = self.studio_events.clone();
-                    let own = before.iter().find(|e| e.note == note && (e.step as usize..e.step as usize + e.length as usize).contains(&step)
-                        && e.sample == sample);
-                    let anchor = own.map_or(step, |e| e.step as usize);
-                    if own.is_none() { studio::paint(&mut self.studio_events, step, step, note, &sample); }
-                    self.studio_stroke = Some(StudioStroke { anchor, note, sample, before });
-                    self.focus = focus::studio::CELL_BASE + (step % 16) * studio::NOTES + (note - studio::FIRST_NOTE) as usize;
-                    self.dirty = Some(Instant::now());
-                }
-            }
-            Msg::StudioCellEnter(step, note) => {
-                if let Some(stroke) = &self.studio_stroke && stroke.note == note {
-                    self.studio_events = stroke.before.clone();
-                    studio::paint(&mut self.studio_events, stroke.anchor, step, note, &stroke.sample);
-                    self.dirty = Some(Instant::now());
-                } else if self.studio_erasing && studio::erase(&mut self.studio_events, step, note) {
-                    self.dirty = Some(Instant::now());
-                }
-            }
-            Msg::StudioEraseStart(step, note) => {
-                self.studio_erasing = true;
-                if studio::erase(&mut self.studio_events, step, note) { self.dirty = Some(Instant::now()); }
-            }
-            Msg::StudioRightEnd => {
-                let edited = self.studio_erasing;
-                self.studio_erasing = false;
-                if edited && self.studio_live { return self.update(Msg::StudioRender(false)); }
-            }
-            Msg::StudioRecord => {
-                self.focus = focus::studio::RECORD;
-                let was_recording = self.engine.studio_recording();
-                if self.engine.studio_record(!was_recording) {
-                    self.studio_note = if was_recording { "Сохраняем запись…" } else { "Запись микрофона: до 20 секунд" }.into();
-                } else {
-                    self.studio_note = "Сначала запустите микрофон и выключите Mute".into();
-                }
-            }
-            Msg::StudioRecorded(result) => match result {
-                Ok(name) => {
-                    self.studio_samples = studio::scan(&self.studio_folder);
-                    self.studio_selected = Some(name);
-                    self.studio_note = "Сэмпл сохранён".into();
-                }
-                Err(e) => self.studio_note = format!("Не удалось сохранить запись: {e}"),
-            },
-            Msg::StudioImport => {
-                self.focus = focus::studio::IMPORT;
-                if self.studio_busy { return Task::none(); }
-                self.studio_busy = true;
-                return perform(async { engine::pick_paths(false) }, Msg::StudioPicked);
-            }
-            Msg::StudioPicked(result) => {
-                let files = match result {
-                    Ok(files) => files,
-                    Err(e) => {self.studio_busy=false;self.studio_note=e;return Task::none();}
-                };
-                if files.is_empty() { self.studio_busy=false; return Task::none(); }
-                let folder = self.studio_folder.clone();
-                return perform(async move {
-                    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-                    soundpad::import(&folder, &files).map(|_| ())
-                }, Msg::StudioImported);
-            }
-            Msg::StudioImported(result) => {
-                self.studio_busy = false;
-                self.studio_samples = studio::scan(&self.studio_folder);
-                if self.studio_selected.is_none() { self.studio_selected = self.studio_samples.first().cloned(); }
-                self.studio_note = result.map_or_else(|e| format!("Импорт: {e}"), |_| "Звуки добавлены".into());
-            }
-            Msg::StudioRender(export) => {
-                self.focus = if export { focus::studio::EXPORT } else { focus::studio::PLAY };
-                if self.studio_busy {
-                    if !export && self.studio_live { self.studio_rebuild = true; }
-                    return Task::none();
-                }
-                if self.studio_events.is_empty() { return Task::none(); }
-                if !export && self.snapshot.state != 3 {
-                    self.studio_note = "Сначала запустите виртуальный микрофон".into();
-                    return Task::none();
-                }
-                if !export { self.studio_live = true;self.studio_rebuild = false; }
-                self.studio_busy = true;
-                self.studio_note = "Собираем трек…".into();
-                let folder = self.studio_folder.clone();
-                let events = self.studio_events.clone();
-                let bpm = self.studio_bpm;
-                let gain = self.studio_gain();
-                let loop_range = self.studio_loop.then(|| (studio::frame_at(self.studio_loop_start, bpm),
-                    studio::frame_at(self.studio_loop_end, bpm)));
-                if !export { self.studio_play_bpm = bpm; }
-                let loader = self.engine.sound_loader();
-                return perform(async move {
-                    let audio = studio::render(&folder, bpm, &events)?;
-                    if export {
-                        let exports = folder.parent().unwrap().join("Треки");
-                        std::fs::create_dir_all(&exports).map_err(|e| e.to_string())?;
-                        let path = unique_path(&exports, "Трек.wav");
-                        let selected = loop_range.map_or(&audio[..], |(start, end)| &audio[start..end]);
-                        let selected: Vec<f32> = selected.iter().map(|v| (v * gain).clamp(-1.0, 1.0)).collect();
-                        soundpad::write_wav(&path, &selected)?;
-                        Ok(Some(path))
-                    } else {
-                        loader.load_studio(studio::TRACK_ID, &audio, gain, loop_range)?;
-                        Ok(None)
-                    }
-                }, move |r| Msg::StudioRendered(export, r));
-            }
-            Msg::StudioRendered(export, result) => {
-                self.studio_busy = false;
-                let rebuild = self.studio_rebuild && self.studio_live && self.studio_loop && result.is_ok();
-                self.studio_rebuild = false;
-                match result {
-                    Ok(Some(path)) => self.studio_note = format!("Сохранено: {}", path.display()),
-                    Ok(None) if !export && self.snapshot.state == 3 && self.studio_live => {
-                        if self.studio_cursor >= studio::STEPS as f32 { self.studio_cursor = 0.0; }
-                        if self.studio_loop && (self.studio_cursor < self.studio_loop_start as f32
-                            || self.studio_cursor >= self.studio_loop_end as f32) {
-                            self.studio_cursor = self.studio_loop_start as f32;
-                        }
-                        self.studio_follow = true;
-                        self.sync_studio_loop();
-                        self.engine.sound_gain(studio::TRACK_ID, self.studio_gain());
-                        self.engine.sound_restart(studio::TRACK_ID);
-                        self.engine.sound_seek(studio::TRACK_ID, self.studio_cursor * 15.0 / self.studio_play_bpm as f32);
-                        self.studio_note = "Трек отправлен в виртуальный микрофон".into();
-                    }
-                    Ok(None) if !export && !self.studio_live => self.studio_note = "Остановлено".into(),
-                    Ok(None) if !export => self.studio_note = "Микрофон остановлен — запустите его и повторите".into(),
-                    Ok(None) => {},
-                    Err(e) => self.studio_note = format!("Сборка трека: {e}"),
-                }
-                if rebuild { return self.update(Msg::StudioRender(false)); }
-            }
-            Msg::StudioClear => {
-                self.focus = focus::studio::CLEAR;
-                studio::clear_bar(&mut self.studio_events, self.studio_bar);
-                self.dirty = Some(Instant::now());
-                if self.studio_live {
-                    if self.studio_events.is_empty() { self.engine.sound_play(0); }
-                    else { return self.update(Msg::StudioRender(false)); }
-                }
-            }
-            Msg::StudioDeleteAsk(name) => {
-                if self.studio_samples.contains(&name) {
-                    self.studio_delete = Some(name);
-                    self.focus = focus::studio::DELETE_CANCEL;
-                }
-            }
-            Msg::StudioDeleteCancel => {
-                self.studio_delete = None;
-                self.focus = focus::studio::IMPORT;
-            }
-            Msg::StudioDeleteConfirm => {
-                let Some(name) = self.studio_delete.clone() else { return Task::none(); };
-                if self.studio_busy || !studio::valid_name(&name) { return Task::none(); }
-                self.studio_busy = true;
-                let folder = self.studio_folder.clone();
-                let target_name = name.clone();
-                return perform(async move {
-                    let deleted = folder.parent().unwrap().join("Удалённые");
-                    std::fs::create_dir_all(&deleted).map_err(|e| e.to_string())?;
-                    std::fs::rename(folder.join(&target_name), unique_path(&deleted, &target_name)).map_err(|e| e.to_string())
-                }, move |result| Msg::StudioDeleted(name, result));
-            }
-            Msg::StudioDeleted(name, result) => {
-                self.studio_busy = false;
-                match result {
-                    Ok(()) => {
-                        self.studio_delete = None;
-                        self.studio_samples.retain(|s| s != &name);
-                        self.studio_events.retain(|e| e.sample != name);
-                        if self.studio_selected.as_ref() == Some(&name) {
-                            self.studio_selected = self.studio_samples.first().cloned();
-                        }
-                        if self.sound_playing.0 == studio::TRACK_ID { self.engine.sound_play(0); }
-                        self.studio_note = format!("Звук перемещён в «Удалённые»: {name}");
-                        self.dirty = Some(Instant::now());
-                        if self.studio_live && !self.studio_events.is_empty() {
-                            return self.update(Msg::StudioRender(false));
-                        }
-                    }
-                    Err(e) => self.studio_note = format!("Не удалось удалить звук: {e}"),
-                }
             }
             Msg::SoundPlay(i) => {
                 let Some(sound) = self.sounds.get(i) else {
                     return Task::none();
                 };
                 self.focus = focus::soundpad::ROW_BASE + 3 * i;
+                // A stopped engine drops the request: say why nothing plays.
+                if self.snapshot.state != 3 {
+                    self.say_sound(Tone::Info, "Звуки идут в виртуальный микрофон, пока работает обработка: запустите её на «Шумодав».");
+                    return Task::none();
+                }
                 match sound.state {
                     SoundState::Loaded(_) => self.engine.sound_play(Self::sound_id(i)),
                     SoundState::Loading => self.sound_pending_play = Some(i),
@@ -4561,11 +4159,133 @@ live:{}", self.engine.session_report());
                         }
                     }
                     Err(e) => {
+                        let text = format!("Не удалось открыть «{}»: {e}", sound.name);
                         sound.state = SoundState::Failed(e);
                         if self.sound_pending_play == Some(i) {
                             self.sound_pending_play = None;
                         }
+                        self.say_sound(Tone::Error, text);
                     }
+                }
+            }
+            Msg::SoundLengths(generation, lengths) => {
+                if generation == self.sound_generation {
+                    for (name, length) in lengths {
+                        if let Some(sound) = self.sounds.iter_mut().find(|s| s.name == name) {
+                            sound.length = length;
+                        }
+                    }
+                }
+            }
+            Msg::SoundFolderChecked(listing) => {
+                // A rescan clears loaded clips and stops playback: wait while anything plays or is edited.
+                if listing != self.sound_listing && self.sound_folder.is_some() && !self.sound_busy()
+                    && self.sound_edit.is_none() && !self.sound_dialog && self.dragging.is_none()
+                    && self.binding.is_none() // the bind target is a row index a rescan reorders
+                {
+                    return self.rescan_sounds();
+                }
+            }
+            Msg::SoundpadOpenFolder => {
+                self.focus = focus::soundpad::OPEN_FOLDER;
+                if let Some(folder) = &self.sound_folder
+                    && let Err(error) = std::process::Command::new("explorer.exe").arg(folder).spawn()
+                {
+                    self.say_sound(Tone::Error, format!("Не удалось открыть папку: {error}"));
+                }
+            }
+            Msg::SoundSeek(fraction) => {
+                let (id, _, length) = self.sound_playing;
+                if id != 0 && length > 0.0 && fraction.is_finite() {
+                    self.engine.sound_seek(id, fraction.clamp(0.0, 0.999) * length);
+                }
+            }
+            Msg::SoundEdit(edit) => {
+                self.sound_delete_armed = false;
+                let closed = self.sound_edit;
+                self.sound_edit = edit.filter(|&i| i < self.sounds.len());
+                match self.sound_edit {
+                    Some(i) => {
+                        let name = &self.sounds[i].name;
+                        self.sound_edit_name = name.rsplit_once('.').map_or(name.as_str(), |(stem, _)| stem).to_owned();
+                        self.focus = focus::soundpad::EDIT_NAME;
+                        return iced::widget::operation::focus("sound-name");
+                    }
+                    None => {
+                        if let Some(i) = closed.filter(|&i| i < self.sounds.len()) { self.focus = focus::soundpad::ROW_BASE + 3 * i; }
+                        self.sound_edit_name.clear();
+                    }
+                }
+            }
+            Msg::SoundEditName(name) => {
+                self.sound_edit_name = name.chars().take(200).collect();
+                self.sound_delete_armed = false;
+                self.focus = focus::soundpad::EDIT_NAME;
+            }
+            Msg::SoundRename => {
+                let (Some(i), Some(folder)) = (self.sound_edit, self.sound_folder.clone()) else {
+                    return Task::none();
+                };
+                let old = self.sounds[i].name.clone();
+                match soundpad::rename(&folder, &old, &self.sound_edit_name) {
+                    Ok(new) => {
+                        if new != old {
+                            for section in &mut self.sections {
+                                for file in section.files.iter_mut().filter(|f| **f == old) {
+                                    file.clone_from(&new);
+                                }
+                            }
+                            let sound = &mut self.sounds[i];
+                            sound.path = folder.join(&new);
+                            sound.name.clone_from(&new);
+                            self.sound_listing = soundpad::listing(&folder);
+                            self.dirty = Some(Instant::now());
+                            self.say_sound(Tone::Done, format!("Переименовано: «{new}»"));
+                        }
+                        self.sound_edit = None;
+                        self.focus = focus::soundpad::ROW_BASE + 3 * i;
+                    }
+                    Err(e) => self.say_sound(Tone::Error, format!("Не удалось переименовать: {e}")),
+                }
+            }
+            Msg::SoundDelete => {
+                self.focus = focus::soundpad::EDIT_DELETE;
+                let (Some(i), Some(folder)) = (self.sound_edit, self.sound_folder.clone()) else {
+                    return Task::none();
+                };
+                if !self.sound_delete_armed {
+                    self.sound_delete_armed = true;
+                    return Task::none();
+                }
+                let name = self.sounds[i].name.clone();
+                match soundpad::remove(&folder, &name) {
+                    Ok(()) => {
+                        for section in &mut self.sections {
+                            section.files.retain(|f| *f != name);
+                        }
+                        self.focus = focus::soundpad::FILTER;
+                        let task = self.rescan_sounds();
+                        self.say_sound(Tone::Done, format!("«{name}» перемещён в «Удалённые» внутри папки"));
+                        return task;
+                    }
+                    Err(e) => {
+                        self.sound_delete_armed = false;
+                        self.say_sound(Tone::Error, format!("Не удалось удалить: {e}"));
+                    }
+                }
+            }
+            Msg::FilesHovered(hovered) => {
+                self.sound_drop_hover = hovered && self.soundpad_page;
+            }
+            Msg::FileDropped(path) => {
+                self.sound_drop_hover = false;
+                if !self.soundpad_page {
+                    return Task::none();
+                }
+                if self.sound_folder.is_none() {
+                    self.say_sound(Tone::Info, "Сначала выберите папку со звуками.");
+                } else if self.sound_drops.len() < 1000 {
+                    self.sound_drops.push(path);
                 }
             }
             Msg::ClipRecorded(result) => match result {
@@ -5060,7 +4780,6 @@ live:{}", self.engine.session_report());
                 focus::TAB_BASE,
                 focus::TAB_EFFECTS,
                 focus::TAB_SOUNDPAD,
-                focus::TAB_STUDIO,
                 focus::TAB_BASE + 1,
                 focus::TAB_BASE + 2,
             ];
@@ -5073,32 +4792,10 @@ live:{}", self.engine.session_report());
                 let mut items = vec![BACK, COPY, FOLDER, SEND];
                 items.extend(tabs);
                 items
-            } else if self.studio_page {
-                use focus::studio::*;
-                let compact = Self::window_size().width < 846.0;
-                let mut items = vec![RECORD, BPM, LOOP, LOOP_START, LOOP_END, ZOOM, VOLUME, HEAR, STOP, PLAY];
-                if compact { items.push(LIBRARY); }
-                if !compact || self.studio_library_open {
-                    items.push(IMPORT);
-                    for i in 0..self.studio_samples.len() { items.extend([SAMPLE_BASE + i, DELETE_BASE + i]); }
-                    if self.studio_delete.is_some() { items.extend([DELETE_CONFIRM, DELETE_CANCEL]); }
-                }
-                items.extend((0..studio::BARS).map(|i| BAR_BASE + i));
-                items.push(CURSOR);
-                items.push(CLEAR);
-                // One Tab stop for the roll; arrows move between its cells.
-                items.push(if (CELL_BASE..CELL_BASE + 16 * studio::NOTES).contains(&self.focus) {
-                    self.focus
-                } else {
-                    CELL_BASE + (studio::ROOT_NOTE - studio::FIRST_NOTE) as usize
-                });
-                items.push(EXPORT);
-                items.extend(tabs);
-                items
             } else if self.soundpad_page {
                 use focus::soundpad::*;
                 let mut items = if self.sound_folder.is_some() {
-                    vec![FILTER, SORT, ADD, FOLDER, REFRESH]
+                    vec![FILTER, SORT, ADD, FOLDER, REFRESH, OPEN_FOLDER]
                 } else {
                     vec![ADD, FOLDER, REFRESH]
                 };
@@ -5109,8 +4806,15 @@ live:{}", self.engine.session_report());
                         items.extend([SECTION_NAME, SECTION_DELETE]);
                     }
                     for i in self.visible_sounds() {
-                        items.extend([ROW_BASE + 3 * i, ROW_BASE + 3 * i + 1, ROW_BASE + 3 * i + 2]);
+                        if self.sound_edit == Some(i) {
+                            items.extend([EDIT_NAME, EDIT_SAVE, EDIT_DELETE, EDIT_CANCEL]);
+                        } else {
+                            items.extend([ROW_BASE + 3 * i, ROW_BASE + 3 * i + 1, ROW_BASE + 3 * i + 2, EDIT_BASE + i]);
+                        }
                     }
+                }
+                if self.sound_playing.0 != 0 {
+                    items.push(SEEK);
                 }
                 items.extend([STOP_BIND, VOLUME, NORMALIZE, HEAR]);
                 items.extend(tabs);
@@ -5252,19 +4956,13 @@ live:{}", self.engine.session_report());
                     }
                 }
             };
-            if self.studio_page && self.focus == focus::studio::CURSOR {
-                self.studio_bar = (self.studio_cursor as usize / 16).min(studio::BARS - 1);
-            }
             return Task::batch([
                 view::reveal_focus(),
-                if self.studio_page && (focus::studio::CELL_BASE..focus::studio::CELL_BASE + 16 * studio::NOTES).contains(&self.focus) {
-                    let row = (self.focus - focus::studio::CELL_BASE) % studio::NOTES;
-                    self.reveal_studio(studio::FIRST_NOTE + row as u8)
-                } else { Task::none() },
                 iced::widget::operation::focus(match self.focus {
                     focus::rvc::NAME => "rvc-name",
                     focus::soundpad::FILTER => "sound-filter",
                     focus::soundpad::SECTION_NAME => "section-name",
+                    focus::soundpad::EDIT_NAME => "sound-name",
                     focus::effects::CLIP_NAME => "clip-name",
                     focus::effects::REVERSE_WORD if self.reverse_edit => "reverse-word",
                     _ => "no-text-input",
@@ -5274,6 +4972,9 @@ live:{}", self.engine.session_report());
         if key == Key::Named(Named::Escape) && self.repair_confirm {return self.update(Msg::RepairCancel);}
         if key == Key::Named(Named::Escape) && self.clip_name.is_some() && self.clip_menu.is_some() {
             return self.update(Msg::ClipMenu(None));
+        }
+        if key == Key::Named(Named::Escape) && self.soundpad_page && self.sound_edit.is_some() {
+            return self.update(Msg::SoundEdit(None));
         }
         if key == Key::Named(Named::Escape) && self.reverse_edit {
             return self.update(Msg::ReverseEdit(false));
@@ -5288,7 +4989,7 @@ live:{}", self.engine.session_report());
             return self.update(Msg::Page(0));
         }
         if key == Key::Named(Named::Escape)
-            && (self.details || self.rvc_page || self.soundpad_page || self.effects_page || self.studio_page)
+            && (self.details || self.rvc_page || self.soundpad_page || self.effects_page)
         {
             return self.update(Msg::Page(0));
         }
@@ -5309,36 +5010,12 @@ live:{}", self.engine.session_report());
             if self.focus == focus::TAB_EFFECTS {
                 return self.update(Msg::Page(6));
             }
-            if self.focus == focus::TAB_STUDIO {
-                return self.update(Msg::Page(7));
-            }
         }
         let delta = match key {
             Key::Named(Named::ArrowLeft | Named::ArrowDown) => -1,
             Key::Named(Named::ArrowRight | Named::ArrowUp) => 1,
             _ => 0,
         };
-        if self.studio_page && self.focus == focus::studio::CURSOR && delta != 0 {
-            let step = (self.studio_cursor.floor() as i32 + delta).clamp(0, studio::STEPS as i32 - 1);
-            self.seek_studio(step as usize);
-            return Task::none();
-        }
-        if self.studio_page && (focus::studio::CELL_BASE..focus::studio::CELL_BASE + 16 * studio::NOTES).contains(&self.focus) {
-            let i = self.focus - focus::studio::CELL_BASE;
-            let (mut step, mut note) = (i / studio::NOTES, i % studio::NOTES);
-            match key {
-                Key::Named(Named::ArrowLeft) => step = step.saturating_sub(1),
-                Key::Named(Named::ArrowRight) => step = (step + 1).min(15),
-                Key::Named(Named::ArrowDown) => note = note.saturating_sub(1),
-                Key::Named(Named::ArrowUp) => note = (note + 1).min(studio::NOTES - 1),
-                _ => {},
-            }
-            let next = focus::studio::CELL_BASE + step * studio::NOTES + note;
-            if next != self.focus {
-                self.focus = next;
-                return self.reveal_studio(studio::FIRST_NOTE + note as u8);
-            }
-        }
         let message = if self.focus == focus::GUIDE && activate {
             Msg::Page(if self.guide_page { 0 } else { 8 })
         } else if self.logs_page {
@@ -5347,41 +5024,6 @@ live:{}", self.engine.session_report());
                 focus::logs::FOLDER if activate => Msg::LogsFolder,
                 focus::logs::SEND if activate => Msg::SendReport,
                 focus::logs::BACK if activate => Msg::Page(2),
-                _ => Msg::Noop,
-            }
-        } else if self.studio_page {
-            use focus::studio::*;
-            match self.focus {
-                RECORD if activate => Msg::StudioRecord,
-                IMPORT if activate => Msg::StudioImport,
-                BPM if delta != 0 => Msg::StudioBpm((self.studio_bpm as i32 + delta).clamp(60, 200) as u32),
-                BPM if activate => Msg::StudioBpm((self.studio_bpm + 1).min(200)),
-                LOOP if activate => Msg::StudioLoopEnabled(!self.studio_loop),
-                LOOP_START if delta != 0 => Msg::StudioLoopStart((self.studio_loop_start as i32 + delta).clamp(0, self.studio_loop_end as i32 - 1) as usize),
-                LOOP_START if activate => Msg::StudioLoopStart(self.studio_cursor as usize),
-                LOOP_END if delta != 0 => Msg::StudioLoopEnd((self.studio_loop_end as i32 + delta).clamp(self.studio_loop_start as i32 + 1, studio::STEPS as i32) as usize),
-                LOOP_END if activate => Msg::StudioLoopEnd(self.studio_cursor as usize + 1),
-                ZOOM if delta != 0 => Msg::StudioZoom((self.studio_zoom as i32 + delta).clamp(0, studio::ZOOMS.len() as i32 - 1) as usize),
-                ZOOM if activate => Msg::StudioZoom((self.studio_zoom + 1).min(studio::ZOOMS.len() - 1)),
-                VOLUME if delta != 0 => Msg::StudioVolume((self.studio_volume as i32 + delta * 10).clamp(0, 200) as u32),
-                VOLUME if activate => Msg::StudioVolume((self.studio_volume + 10).min(200)),
-                HEAR if activate => Msg::SoundpadHear(!self.sound_monitor),
-                STOP if activate => Msg::SoundpadStop,
-                PLAY if activate => Msg::StudioRender(false),
-                EXPORT if activate => Msg::StudioRender(true),
-                CLEAR if activate => Msg::StudioClear,
-                LIBRARY if activate => Msg::StudioLibraryToggle,
-                DELETE_CONFIRM if activate => Msg::StudioDeleteConfirm,
-                DELETE_CANCEL if activate => Msg::StudioDeleteCancel,
-                f if activate && (BAR_BASE..BAR_BASE + studio::BARS).contains(&f) => Msg::StudioBar(f - BAR_BASE),
-                f if activate && (SAMPLE_BASE..SAMPLE_BASE + self.studio_samples.len()).contains(&f) =>
-                    Msg::StudioSelect(self.studio_samples[f - SAMPLE_BASE].clone()),
-                f if activate && (DELETE_BASE..DELETE_BASE + self.studio_samples.len()).contains(&f) =>
-                    Msg::StudioDeleteAsk(self.studio_samples[f - DELETE_BASE].clone()),
-                f if activate && (CELL_BASE..CELL_BASE + 16 * studio::NOTES).contains(&f) => {
-                    let i = f - CELL_BASE;
-                    Msg::StudioCell(self.studio_bar * 16 + i / studio::NOTES, studio::FIRST_NOTE + (i % studio::NOTES) as u8)
-                }
                 _ => Msg::Noop,
             }
         } else if self.soundpad_page {
@@ -5408,6 +5050,15 @@ live:{}", self.engine.session_report());
                 }
                 SECTION_ADD if activate => Msg::SectionAdd,
                 SECTION_DELETE if activate => Msg::SectionDelete,
+                OPEN_FOLDER if activate => Msg::SoundpadOpenFolder,
+                SEEK if delta != 0 && self.sound_playing.2 > 0.0 => {
+                    let (_, position, length) = self.sound_playing;
+                    Msg::SoundSeek((position + 5.0 * delta as f32) / length)
+                }
+                EDIT_SAVE if activate => Msg::SoundRename,
+                EDIT_DELETE if activate => Msg::SoundDelete,
+                EDIT_CANCEL if activate => Msg::SoundEdit(None),
+                f if activate && f >= EDIT_BASE && f - EDIT_BASE < self.sounds.len() => Msg::SoundEdit(Some(f - EDIT_BASE)),
                 f if activate && f >= SECTION_BASE && f - SECTION_BASE < self.section_items().len() => {
                     Msg::SectionSelect(f - SECTION_BASE)
                 }
@@ -5699,6 +5350,9 @@ live:{}", self.engine.session_report());
                     iced::Event::Window(window::Event::Resized(_)) => {
                         return Some(Msg::Restored(id));
                     }
+                    iced::Event::Window(window::Event::FileHovered(_)) => return Some(Msg::FilesHovered(true)),
+                    iced::Event::Window(window::Event::FilesHoveredLeft) => return Some(Msg::FilesHovered(false)),
+                    iced::Event::Window(window::Event::FileDropped(path)) => return Some(Msg::FileDropped(path)),
                     _ => {}
                 }
                 match event {
@@ -5711,9 +5365,6 @@ live:{}", self.engine.session_report());
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
                     )) => Some(Msg::DragEnd),
-                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                        iced::mouse::Button::Right,
-                    )) => Some(Msg::StudioRightEnd),
                     iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
                         iced::mouse::Button::Left,
                     )) => Some(Msg::PointerDown),
@@ -5987,98 +5638,12 @@ mod controller_tests {
         assert!(app.morph.is_none() && app.intro.is_none());
     }
     #[test]
-    fn studio_page_edits_and_keyboard() {
-        use keyboard::{Key, Modifiers, key::Named};
-        let saved = "[studio]\nbpm=137\nevents=[{\"step\":0,\"note\":60,\"sample\":\"kick.wav\"}]";
-        let (mut app, _) = App::from_settings(Settings::for_test(saved)).unwrap().unwrap();
-        app.effects_monitor = false;
-        assert_eq!(app.studio_bpm, 137);
-        assert_eq!(app.studio_events.len(), 1);
-        app.studio_samples.push("kick.wav".into());
-        app.window = Some(App::open(1.0, None).0);
-        let _ = app.update(Msg::Page(7));
-        assert!(app.studio_page && !app.soundpad_page);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, focus::studio::RECORD);
-        app.focus = focus::studio::BPM;
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, focus::studio::LOOP);
-        for _ in 0..5 { let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false); }
-        assert_eq!(app.focus, focus::studio::HEAR);
-        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
-        assert!(app.sound_monitor && app.monitor_mode() == 5);
-        assert_eq!(app.focus, focus::studio::HEAR);
-        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
-        assert!(!app.sound_monitor);
-        let _ = app.update(Msg::StudioGrab(17));
-        assert_eq!((app.studio_cursor, app.studio_bar, app.focus), (17.0, 1, focus::studio::CURSOR));
-        assert!(app.studio_follow);
-        let _ = app.update(Msg::StudioDrag(18));
-        assert_eq!(app.studio_cursor, 18.0);
-        let _ = app.update(Msg::DragEnd);
-        let _ = app.update(Msg::StudioDrag(19));
-        assert_eq!(app.studio_cursor, 18.0, "releasing the ruler ends the drag");
-        let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
-        assert_eq!(app.studio_cursor, 17.0);
-        let _ = app.update(Msg::StudioSelect("kick.wav".into()));
-        let _ = app.update(Msg::StudioCell(1, 60));
-        assert_eq!(app.studio_events.len(), 2);
-        let _ = app.update(Msg::StudioBpm(145));
-        assert_eq!(app.studio_bpm, 145);
-        let _ = app.update(Msg::StudioBar(1));
-        assert!(!app.studio_follow, "a chosen bar must stay visible while another bar plays");
-        let _ = app.update(Msg::StudioCell(16, 61));
-        let _ = app.update(Msg::StudioCell(17, 36));
-        let _ = app.update(Msg::StudioCell(18, 83));
-        app.focus = focus::studio::CELL_BASE + (studio::ROOT_NOTE - studio::FIRST_NOTE) as usize;
-        let _ = app.key(Key::Named(Named::ArrowUp), Modifiers::empty(), false);
-        assert_eq!(app.focus, focus::studio::CELL_BASE + 25);
-        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
-        assert_eq!(app.focus, focus::studio::CELL_BASE + studio::NOTES + 25);
-        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
-        assert!(app.studio_events.iter().any(|e| e.step == 17 && e.note == 61));
-        let _ = app.update(Msg::StudioClear);
-        assert_eq!(app.studio_events.len(), 2);
-        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
-        assert!(!app.studio_page);
-    }
-    #[test]
-    fn studio_drag_loop_zoom_and_delete_confirmation() {
-        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
-        app.studio_samples.push("tone.wav".into());
-        app.studio_selected = Some("tone.wav".into());
-        let _ = app.update(Msg::StudioDrawStart(8, 60));
-        let _ = app.update(Msg::StudioCellEnter(11, 60));
-        assert_eq!((app.studio_events[0].step, app.studio_events[0].length), (8, 4));
-        let _ = app.update(Msg::StudioCellEnter(9, 60));
-        assert_eq!(app.studio_events[0].length, 2, "dragging back shortens the note");
-        let _ = app.update(Msg::DragEnd);
-        let _ = app.update(Msg::StudioEraseStart(9, 60));
-        assert!(app.studio_events.is_empty());
-        let _ = app.update(Msg::StudioRightEnd);
-        assert!(!app.studio_erasing);
-        app.studio_events.push(studio::Event { step: 8, note: 60, sample: "tone.wav".into(), length: 1 });
-        app.snapshot.state = 3;
-        let _ = app.update(Msg::StudioLoopEnabled(true));
-        assert!(app.studio_live && app.studio_loop && app.studio_busy, "enabling a loop must schedule playback");
-        app.studio_busy = false;
-        let _ = app.update(Msg::SoundpadStop);
-        assert!(!app.studio_live && !app.studio_loop, "Stop must release loop playback");
-        let _ = app.update(Msg::StudioLoopStart(16));
-        let _ = app.update(Msg::StudioLoopEnd(32));
-        assert!(app.studio_loop && (app.studio_loop_start, app.studio_loop_end) == (16, 32));
-        app.studio_busy = true;
-        let _ = app.update(Msg::StudioRender(false));
-        assert!(app.studio_rebuild, "edits during rendering must schedule a fresh loop");
-        app.studio_busy = false;
-        let _ = app.update(Msg::StudioVolume(170));
-        assert_eq!(app.studio_volume, 170);
-        let _ = app.update(Msg::StudioZoom(0));
-        assert_eq!(studio::ZOOMS[app.studio_zoom], 50);
-        let _ = app.update(Msg::StudioDeleteAsk("tone.wav".into()));
-        assert_eq!(app.studio_delete.as_deref(), Some("tone.wav"));
-        let _ = app.update(Msg::StudioDeleteCancel);
-        assert!(app.studio_delete.is_none());
+    fn removed_studio_settings_still_load() {
+        let old = "[studio]
+bpm=137
+events=[{\"step\":0,\"note\":60,\"sample\":\"kick.wav\"}]";
+        let (app, _) = App::from_settings(Settings::for_test(old)).unwrap().unwrap();
+        assert!(app.settings.text().contains("bpm=137"), "a removed page's section loads and stays untouched");
     }
     #[test]
     fn repair_requires_confirmation_and_exit_prevents_resume() {
@@ -6179,7 +5744,6 @@ mod controller_tests {
         assert_eq!((defaults.controls.slow, defaults.controls.fast, defaults.controls.pitch), (0.67, 1.67, 0), "first-install effect defaults");
         assert!(!defaults.controls.overload);
         assert!((defaults.controls.discord_volume - 0.08).abs() < 0.0001);
-        assert!((defaults.studio_gain() - 0.08).abs() < 0.0001);
         assert_eq!(
             discord_volume_percent(defaults.controls.discord_volume),
             100.0
@@ -6196,13 +5760,10 @@ mod controller_tests {
         .unwrap()
         .unwrap();
         assert!((new_scale.controls.discord_volume - 0.16).abs() < 0.0001);
-        assert!((new_scale.studio_gain() - 0.16).abs() < 0.0001);
 
         let (mut clamped, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         let _ = clamped.update(Msg::DiscordVolume(250.0));
         assert!((clamped.controls.discord_volume - 0.16).abs() < 0.0001);
-        let _ = clamped.update(Msg::StudioVolume(200));
-        assert!((clamped.studio_gain() - 0.32).abs() < 0.0001);
     }
     #[test]
     fn soundpad_volume_migrates_and_handles_an_old_version_edit() {
@@ -7045,6 +6606,80 @@ auto_update_on=0")).unwrap().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
+    fn soundpad_edit_drop_watch_and_stopped_play() {
+        use keyboard::{Key, Modifiers, key::Named};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".tmp/soundpad-edit-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        soundpad::test_wav(&dir.join("boom.wav"), 48_000, 1, 480);
+        soundpad::test_wav(&dir.join("zap.wav"), 48_000, 1, 480);
+        let (mut app, _) = App::from_settings(Settings::for_test(&format!(
+            "[soundpad]
+folder={}
+sections=Мемы:boom.wav", dir.display()))).unwrap().unwrap();
+        app.window = Some(App::open(1.0, None).0);
+        let _ = app.update(Msg::Page(4));
+        // A stopped engine drops play requests: the page says why instead of staying silent.
+        let _ = app.update(Msg::SoundPlay(0));
+        assert!(app.sound_tone == Tone::Info && app.sound_note.contains("запустите"));
+        assert_eq!(app.sounds[0].state, SoundState::Unloaded);
+        // Rename refuses an existing name, then renames the file and its section reference.
+        let _ = app.update(Msg::SoundEdit(Some(0)));
+        assert_eq!((app.sound_edit, app.sound_edit_name.as_str(), app.focus), (Some(0), "boom", focus::soundpad::EDIT_NAME));
+        let _ = app.update(Msg::SoundEditName("zap".into()));
+        let _ = app.update(Msg::SoundRename);
+        assert!(app.sound_tone == Tone::Error && app.sound_edit == Some(0), "an existing name is refused");
+        let _ = app.update(Msg::SoundEditName("bang".into()));
+        let _ = app.update(Msg::SoundRename);
+        assert!(dir.join("bang.wav").exists() && app.sound_edit.is_none());
+        assert_eq!((app.sounds[0].name.as_str(), app.sections[0].files.as_slice()), ("bang.wav", ["bang.wav".to_owned()].as_slice()));
+        // Delete needs a second press; Escape disarms; the file stays recoverable.
+        let _ = app.update(Msg::SoundEdit(Some(0)));
+        let _ = app.update(Msg::SoundDelete);
+        assert!(app.sound_delete_armed && dir.join("bang.wav").exists());
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert!(app.sound_edit.is_none() && app.soundpad_page);
+        assert_eq!(app.focus, focus::soundpad::ROW_BASE, "closing the editor returns focus to its row");
+        let _ = app.update(Msg::SoundEdit(Some(0)));
+        assert!(!app.sound_delete_armed);
+        let _ = app.update(Msg::SoundDelete);
+        let _ = app.update(Msg::SoundDelete);
+        assert!(!dir.join("bang.wav").exists() && dir.join("Удалённые").join("bang.wav").exists());
+        assert!(app.sounds.len() == 1 && app.sections[0].files.is_empty());
+        // Dropped files are imported together on the next tick; non-audio is skipped.
+        soundpad::test_wav(&dir.join("src/drop.wav"), 48_000, 1, 480);
+        std::fs::write(dir.join("src/readme.txt"), "x").unwrap();
+        let _ = app.update(Msg::FilesHovered(true));
+        assert!(app.sound_drop_hover);
+        let _ = app.update(Msg::FileDropped(dir.join("src/drop.wav")));
+        let _ = app.update(Msg::FileDropped(dir.join("src/readme.txt")));
+        assert!(!app.sound_drop_hover && app.sound_drops.len() == 2);
+        let _ = app.update(Msg::Tick);
+        assert!(app.sound_drops.is_empty() && app.sound_dialog, "the copy runs off the UI thread");
+        let dropped = [dir.join("src/drop.wav"), dir.join("src/readme.txt")];
+        let _ = app.update(Msg::SoundImported(soundpad::import(&dir, &dropped)));
+        assert!(!app.sound_dialog && dir.join("drop.wav").exists() && !dir.join("readme.txt").exists());
+        assert!(app.sounds.len() == 2 && app.sound_tone == Tone::Done);
+        // The watch rescans only when the folder really changed.
+        let generation = app.sound_generation;
+        let _ = app.update(Msg::SoundFolderChecked(soundpad::listing(&dir)));
+        assert_eq!(app.sound_generation, generation, "an unchanged folder keeps loaded clips");
+        soundpad::test_wav(&dir.join("new.wav"), 48_000, 1, 480);
+        let _ = app.update(Msg::SoundFolderChecked(soundpad::listing(&dir)));
+        assert_eq!(app.sounds.len(), 3);
+        // An unavailable folder keeps keys and volumes; they come back with the folder.
+        app.sounds[0].key = 0x70;
+        let parked = dir.with_file_name("soundpad-parked");
+        let _ = std::fs::remove_dir_all(&parked);
+        std::fs::rename(&dir, &parked).unwrap();
+        let _ = app.update(Msg::SoundFolderChecked(soundpad::listing(&dir)));
+        assert!(app.sound_tone == Tone::Error && app.sounds.len() == 3 && app.sounds[0].key == 0x70);
+        std::fs::rename(&parked, &dir).unwrap();
+        let _ = app.update(Msg::SoundFolderChecked(soundpad::listing(&dir)));
+        assert!(app.sounds.len() == 3 && app.sounds[0].key == 0x70);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
     fn soundpad_keys_volumes_and_keyboard() {
         use keyboard::{Key, Modifiers, key::Named};
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7095,7 +6730,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.sound_hover, None);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 67);
-        for expected in [68, 62, 61, 63, 20000, 69, 1000, 1001, 1002, 1003, 1004, 1005, 66, 64, 75, 65, 40] {
+        for expected in [68, 62, 61, 63, 100, 20000, 69, 1000, 1001, 1002, 50000, 1003, 1004, 1005, 50001, 66, 64, 75, 65, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }

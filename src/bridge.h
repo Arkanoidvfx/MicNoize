@@ -93,16 +93,10 @@ int32_t mnr_replace_file(const char* from,uint32_t from_len,const char* to,uint3
 void mnr_usage(uint64_t* cpu_100ns,uint64_t* working_set);
 // Soundpad. Clips are 48 kHz mono float, at most 5 minutes; id 0 means "stop" everywhere.
 int32_t mnr_sound_load(Mnr*,uint32_t id,const float* samples,uint32_t count,float gain);
-// Studio clips bypass the soundpad volume and can loop between sample frames [start,end).
-int32_t mnr_studio_load(Mnr*,uint32_t id,const float* samples,uint32_t count,float gain,uint32_t start,uint32_t end);
-int32_t mnr_sound_loop(Mnr*,uint32_t id,uint32_t start,uint32_t end);
-// Offline pitch shift: output has exactly count frames, preserving sample duration.
-int32_t mnr_studio_pitch(const float* input,uint32_t count,float scale,float* output);
 int32_t mnr_sound_gain(Mnr*,uint32_t id,float gain);
 void mnr_sound_clear(Mnr*);
 void mnr_sound_play(Mnr*,uint32_t id);
-void mnr_sound_restart(Mnr*,uint32_t id);
-// Seek the matching playing clip; a request sent immediately after play waits for its start.
+// Jump clip `id` to `seconds` with 5 ms fades once it plays; the next play request cancels it.
 int32_t mnr_sound_seek(Mnr*,uint32_t id,float seconds);
 void mnr_sound_volume(Mnr*,float volume);
 // Hotkeys for clips: keys use the effect binding encoding; an entry with id 0 is the stop key.
@@ -112,9 +106,6 @@ uint32_t mnr_sound_state(Mnr*,float* position,float* length);
 // Newest finished hold-effect recording (48 kHz mono float). Returns how many samples it has
 // and reports its generation; `out` may be null to ask for the size only.
 uint32_t mnr_last_clip(Mnr*,float* out,uint32_t capacity,uint32_t* generation);
-int32_t mnr_studio_record(Mnr*,int32_t enabled);
-int32_t mnr_studio_recording(Mnr*);
-uint32_t mnr_studio_clip(Mnr*,float* out,uint32_t capacity,uint32_t* generation);
 // Modal picker on the calling thread: mode 0 folder, 1 audio files (multi-select).
 // Writes newline-separated UTF-8 paths; returns 1, 0 when cancelled, -1 on error.
 int32_t mnr_pick_paths(int32_t mode,char* result,uint32_t capacity);

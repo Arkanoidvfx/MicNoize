@@ -108,22 +108,15 @@ unsafe extern "C" {
     fn mnr_replace_file(from: *const u8, fl: u32, to: *const u8, tl: u32) -> i32;
     fn mnr_usage(cpu: *mut u64, memory: *mut u64);
     fn mnr_sound_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32) -> i32;
-    fn mnr_studio_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32, start: u32, end: u32) -> i32;
-    fn mnr_sound_loop(p: usize, id: u32, start: u32, end: u32) -> i32;
-    fn mnr_studio_pitch(input: *const f32, count: u32, scale: f32, output: *mut f32) -> i32;
     fn mnr_sound_gain(p: usize, id: u32, gain: f32) -> i32;
     fn mnr_sound_clear(p: usize);
     fn mnr_sound_play(p: usize, id: u32);
-    fn mnr_sound_restart(p: usize, id: u32);
     fn mnr_sound_seek(p: usize, id: u32, seconds: f32) -> i32;
     fn mnr_sound_volume(p: usize, volume: f32);
     fn mnr_sound_bindings(p: usize, ids: *const u32, keys: *const u32, count: u32) -> i32;
     fn mnr_sound_state(p: usize, position: *mut f32, length: *mut f32) -> u32;
     fn mnr_pick_paths(mode: i32, result: *mut c_char, capacity: u32) -> i32;
     fn mnr_last_clip(p: usize, out: *mut f32, capacity: u32, generation: *mut u32) -> u32;
-    fn mnr_studio_record(p: usize, enabled: i32) -> i32;
-    fn mnr_studio_recording(p: usize) -> i32;
-    fn mnr_studio_clip(p: usize, out: *mut f32, capacity: u32, generation: *mut u32) -> u32;
 }
 /// Modal Windows picker; blocks the calling thread, so run it from a background task.
 pub fn pick_paths(folder: bool) -> Result<Vec<std::path::PathBuf>, String> {
@@ -150,25 +143,10 @@ impl Drop for NativeOwner {
 /// Decode tasks can finish after the controller; their handle keeps native storage alive.
 #[derive(Clone)]
 pub struct SoundLoader(Arc<NativeOwner>);
-pub fn studio_pitch(input: &[f32], scale: f32) -> Result<Vec<f32>, String> {
-    if input.is_empty() || input.len() > 20 * 48_000 { return Err("Неверная длина звука".into()); }
-    let mut output = vec![0.0; input.len()];
-    if unsafe { mnr_studio_pitch(input.as_ptr(), input.len() as u32, scale, output.as_mut_ptr()) } == 0 {
-        return Err("Не удалось изменить высоту звука".into());
-    }
-    Ok(output)
-}
 impl SoundLoader {
     pub fn load(&self, id: u32, samples: &[f32], gain: f32) -> Result<(), String> {
         if unsafe { mnr_sound_load(self.0.0, id, samples.as_ptr(), samples.len() as u32, gain) } == 0 {
             return Err("Движок отклонил звук".into());
-        }
-        Ok(())
-    }
-    pub fn load_studio(&self, id: u32, samples: &[f32], gain: f32, loop_range: Option<(usize, usize)>) -> Result<(), String> {
-        let (start, end) = loop_range.unwrap_or((0, 0));
-        if unsafe { mnr_studio_load(self.0.0, id, samples.as_ptr(), samples.len() as u32, gain, start as u32, end as u32) } == 0 {
-            return Err("Движок отклонил трек".into());
         }
         Ok(())
     }
@@ -748,15 +726,8 @@ impl Engine {
     pub fn sound_play(&self, id: u32) {
         unsafe { mnr_sound_play(self.p, id) }
     }
-    pub fn sound_restart(&self, id: u32) {
-        unsafe { mnr_sound_restart(self.p, id) }
-    }
     pub fn sound_seek(&self, id: u32, seconds: f32) -> bool {
         unsafe { mnr_sound_seek(self.p, id, seconds) != 0 }
-    }
-    pub fn sound_loop(&self, id: u32, range: Option<(usize, usize)>) -> bool {
-        let (start, end) = range.unwrap_or((0, 0));
-        unsafe { mnr_sound_loop(self.p, id, start as u32, end as u32) != 0 }
     }
     pub fn sound_volume(&self, volume: f32) {
         unsafe { mnr_sound_volume(self.p, volume) }
@@ -783,23 +754,6 @@ impl Engine {
         }
         let mut samples = vec![0.0; count as usize];
         let written = unsafe { mnr_last_clip(self.p, samples.as_mut_ptr(), count, &mut generation) };
-        samples.truncate(written.min(count) as usize);
-        Some((generation, samples))
-    }
-    pub fn studio_record(&self, enabled: bool) -> bool {
-        unsafe { mnr_studio_record(self.p, enabled as i32) != 0 }
-    }
-    pub fn studio_recording(&self) -> bool {
-        unsafe { mnr_studio_recording(self.p) != 0 }
-    }
-    pub fn studio_clip(&self, known: u32) -> Option<(u32, Vec<f32>)> {
-        let mut generation = 0;
-        let count = unsafe { mnr_studio_clip(self.p, std::ptr::null_mut(), 0, &mut generation) };
-        if generation == known || count == 0 { return None; }
-        let expected = generation;
-        let mut samples = vec![0.0; count as usize];
-        let written = unsafe { mnr_studio_clip(self.p, samples.as_mut_ptr(), count, &mut generation) };
-        if generation != expected || written != count { return None; }
         samples.truncate(written.min(count) as usize);
         Some((generation, samples))
     }
@@ -932,13 +886,13 @@ mod tests {
         let (app,initial)=crate::App::from_settings(crate::settings::Settings::for_test("")).unwrap().unwrap();
         drop(initial);
         let loader=app.engine.sound_loader();
-        let studio=loader.clone();
+        let second=loader.clone();
         let owner=Arc::downgrade(&loader.0);
         drop(app);
         assert_eq!(owner.strong_count(),2,"controller shutdown must retain outstanding loaders");
         std::thread::spawn(move || loader.load(1,&[0.125;480],1.0).unwrap()).join().unwrap();
         assert_eq!(owner.strong_count(),1);
-        std::thread::spawn(move || studio.load_studio(2,&[0.25;480],1.0,Some((0,480))).unwrap()).join().unwrap();
+        std::thread::spawn(move || second.load(2,&[0.25;480],1.0).unwrap()).join().unwrap();
         assert!(owner.upgrade().is_none(),"the last loader must release native storage");
     }
 

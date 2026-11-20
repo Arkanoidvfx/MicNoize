@@ -438,18 +438,6 @@ int main() {try {
         // and the mix bypasses Discord gain while staying out of the effect-only preview.
         mic::SoundPlayer player;std::array<float,480> sound{};
         auto clip=std::make_shared<mic::SoundClip>();clip->samples.assign(4800,0.5f);clip->gain=1;
-        mic::SoundPlayer fromCursor;fromCursor.start(7,clip);
-        require(fromCursor.seek(7,2400) && std::abs(fromCursor.position()-0.05f)<1e-6f,"Initial seek must start at the cursor");
-        fromCursor.render(sound.data(),480,1);require(sound[0]==0.5f,"Initial seek leaked the clip beginning");
-        auto loopClip=std::make_shared<mic::SoundClip>();loopClip->samples.assign(4800,0.5f);
-        loopClip->loopRange=(uint64_t(1200)<<32)|3600;loopClip->independentVolume=true;
-        mic::SoundPlayer looping;looping.start(8,loopClip);
-        require(looping.seek(8,1200) && std::abs(looping.position()-0.025f)<1e-6f,"Loop seek missed its start");
-        for(int i=0;i<6;++i)looping.render(sound.data(),480,0.05f);
-        require(looping.playing()==8 && looping.position()>0.025f && looping.position()<0.075f
-            && sound[300]>0.49f,"Loop must wrap in DSP without soundpad-volume attenuation");
-        looping.render(sound.data(),480,1,true);
-        require(sound[300]==0,"Mute must silence a looping clip");
         auto request=[&](unsigned id,uint64_t serial,bool restart){const auto packed=mic::SoundPlayer::pack(id,serial,restart);const auto lookup=player.request(packed);if(lookup){player.commit(packed);player.start(lookup,clip);}return lookup;};
         player.render(sound.data(),480,1);require(sound[0]==0 && player.playing()==0,"Idle player produced audio");
         require(request(3,1,false)==3,"First press must look up the clip");
@@ -457,6 +445,7 @@ int main() {try {
         std::array<uint8_t,480> soundFlags{};
         player.render(sound.data(),480,1.0f,false,soundFlags.data());require(sound[100]==0.5f && soundFlags[100]==0 && player.playing()==3 && player.length()==0.1f,"Clip did not play");
         player.render(sound.data(),480,0.5f);require(std::abs(sound[100]-0.25f)<1e-6,"Volume ignored");
+        player.render(sound.data(),480,1,true);require(sound[100]==0 && player.playing()==3,"Mute must silence a clip");
         require(!player.seek(4,2400) && player.seek(3,2400),"Seek must target the playing clip");
         player.render(sound.data(),480,1);
         require(sound[0]==0.5f && sound[239]<0.02f && sound[240]<0.001f

@@ -113,18 +113,6 @@ pub fn reveal_focus() -> Task<Msg> {
         )
     })
 }
-pub fn studio_reveal(note: u8, zoom: u8, viewport: f32) -> Task<Msg> {
-    iced::widget::operation::scroll_to(
-        "studio-roll",
-        iced::widget::operation::AbsoluteOffset { x: None, y: Some(studio_offset(note, zoom, viewport)) },
-    )
-}
-pub fn studio_offset(note: u8, zoom: u8, viewport: f32) -> f32 {
-    // The roll descends from B5. Keep the selected note near the middle at each scale.
-    let row = (studio::FIRST_NOTE + studio::NOTES as u8 - 1 - note) as f32;
-    let pitch = 28.0 * zoom as f32 / 100.0;
-    (row * pitch - (viewport - pitch) / 2.0).max(0.0)
-}
 fn focus_scroll_delta(top: f32, height: f32, viewport_top: f32, viewport_height: f32) -> f32 {
     if top < viewport_top + 8.0 {
         top - viewport_top - 8.0
@@ -157,7 +145,6 @@ mod glyph {
     pub const SETTINGS: &str = "\u{E713}";
     pub const EFFECTS: &str = "\u{E945}";
     pub const SOUNDPAD: &str = "\u{E8A9}";
-    pub const STUDIO: &str = "\u{E8D6}";
     pub const VOICE: &str = "\u{E77B}";
     pub const CHIP: &str = "\u{E9F5}";
     pub const OUTPUT: &str = "\u{E8BD}";
@@ -183,6 +170,8 @@ mod glyph {
     pub const CHECK: &str = "\u{E73E}";
     pub const LOGS: &str = "\u{E9D9}";
     pub const BACK: &str = "\u{E72B}";
+    pub const MORE: &str = "\u{E712}";
+    pub const OPEN: &str = "\u{E8A7}";
 }
 fn icon<'a>(glyph: &'a str, size: u32, color: Color) -> widget::Text<'a> {
     text(glyph).size(size).color(color).font(Font::with_name("Segoe MDL2 Assets"))
@@ -195,13 +184,10 @@ fn bold<'a>(s: impl Into<String>, size: u32, color: Color) -> widget::Text<'a> {
 }
 const MEDIUM: Font = Font { weight: iced::font::Weight::Medium, ..tacho::UI };
 const SEMIBOLD: Font = Font { weight: iced::font::Weight::Semibold, ..tacho::UI };
-// Type roles: page title (display face), lead under it, card heading (`bold`), column header (`overline`),
+// Type roles: page title (display face), card heading (`bold`), column header (`overline`),
 // body and field labels (`label`), interactive text (`medium`), explanatory hint (`caption`).
 fn title<'a>(s: &'a str) -> widget::Text<'a> {
     label(s, 24, INK).font(tacho::DISPLAY)
-}
-fn lead<'a>(s: impl Into<String>) -> widget::Text<'a> {
-    label(s, 13, DIM)
 }
 fn overline<'a>(s: impl Into<String>) -> widget::Text<'a> {
     label(s, 11, FAINT).font(SEMIBOLD)
@@ -487,15 +473,23 @@ fn toggler<'a>(on: bool, message: impl Fn(bool) -> Msg + 'a, enabled: bool) -> w
         })
 }
 /// Segmented level meter, the same vocabulary as the sliders.
-fn meter<'a>(level: f32, color: Color) -> Element<'a, Msg> {
+/// Segmented progress; with `seek`, a click on segment `i` jumps to `i / 40` of the clip.
+fn meter<'a>(level: f32, color: Color, seek: bool) -> Element<'a, Msg> {
     let segments = 40usize;
     let lit = (level.clamp(0.0, 1.0) * segments as f32).round() as usize;
     widget::Row::with_children((0..segments).map(|i| {
         let fill = if i < lit { color } else { Color::from_rgb8(0x26, 0x27, 0x2B) };
-        container(Space::new().width(Length::Fill).height(10))
+        let cell = container(Space::new().width(Length::Fill).height(10))
             .width(Length::Fill)
-            .style(move |_| container::Style { background: Some(fill.into()), ..Default::default() })
-            .into()
+            .style(move |_| container::Style { background: Some(fill.into()), ..Default::default() });
+        if seek {
+            mouse_area(cell)
+                .on_press(Msg::SoundSeek(i as f32 / segments as f32))
+                .interaction(iced::mouse::Interaction::Pointer)
+                .into()
+        } else {
+            cell.into()
+        }
     }))
     .spacing(2)
     .width(Length::Fill)
@@ -550,7 +544,7 @@ impl App {
         self.keys_down[(vk / 64 % 4) as usize] >> (vk % 64) & 1 != 0
     }
     fn page_main(&self) -> bool {
-        !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page && !self.studio_page && !self.guide_page
+        !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page && !self.guide_page
     }
 
     /// The window: the app, with the update morph layer on top (empty unless morphing). The
@@ -669,8 +663,6 @@ impl App {
             ].spacing(18).into()
         } else if self.logs_page {
             self.logs_view()
-        } else if self.studio_page {
-            self.studio_view()
         } else if self.soundpad_page {
             self.soundpad_view()
         } else if self.details {
@@ -772,7 +764,6 @@ impl App {
             item(glyph::MIC, "Шумодав", 0, self.page_main()),
             item(glyph::EFFECTS, "Эффекты", 6, self.effects_page),
             item(glyph::SOUNDPAD, "Саундпад", 4, self.soundpad_page),
-            item(glyph::STUDIO, "Студия", 7, self.studio_page),
             item(glyph::VOICE, "Смена голоса", 1, self.rvc_page),
             Space::new().height(Length::Fill),
         ]
@@ -2535,248 +2526,11 @@ impl App {
         .into()
     }
 
-    fn studio_view(&self) -> Element<'_, Msg> {
-        widget::responsive(|size| self.studio_layout(size.width)).height(Length::Shrink).into()
-    }
-
-    fn studio_layout(&self, width: f32) -> Element<'_, Msg> {
-        use focus::studio::*;
-        let compact = width < 650.0;
-        let cell_width = if compact { 16.0 } else { 27.0 };
-        let zoom = studio::ZOOMS[self.studio_zoom];
-        let pitch = 28.0 * zoom as f32 / 100.0;
-        let roll_height = if compact { 240.0 } else { 300.0 };
-        let recording = self.engine.studio_recording();
-        let mut library = column![
-            bold("Звуки", 14, INK),
-            label("Выберите сэмпл для нот", 11, DIM),
-            action(medium("Добавить файлы", 12, INK), Msg::StudioImport, self.focus == IMPORT, false)
-                .on_press_maybe((!self.studio_busy).then_some(Msg::StudioImport)),
-        ].spacing(7).width(if compact { Length::Fill } else { Length::Fixed(170.0) });
-        if compact {
-            library = library.push(action(medium("← К сетке", 11, INK), Msg::StudioLibraryToggle, self.focus == LIBRARY, false));
-        }
-        if let Some(name) = &self.studio_delete {
-            library = library.push(column![
-                label(format!("Убрать «{}» из проекта?", name.chars().take(14).collect::<String>()), 11, INK),
-                row![
-                    action(medium("Удалить", 11, RED), Msg::StudioDeleteConfirm, self.focus == DELETE_CONFIRM, false),
-                    action(medium("Отмена", 11, INK), Msg::StudioDeleteCancel, self.focus == DELETE_CANCEL, false),
-                ].spacing(5),
-                label("Файл останется в папке «Удалённые».", 10, DIM),
-            ].spacing(5));
-        }
-        for (i, name) in self.studio_samples.iter().enumerate() {
-            let selected = self.studio_selected.as_ref() == Some(name);
-            library = library.push(
-                row![
-                    action(medium(name.chars().take(16).collect::<String>(), 12, if selected { ORANGE_DARK } else { INK }),
-                        Msg::StudioSelect(name.clone()), self.focus == SAMPLE_BASE + i, selected).width(Length::Fill),
-                    action(medium("×", 14, RED), Msg::StudioDeleteAsk(name.clone()),
-                        self.focus == DELETE_BASE + i, false).on_press_maybe((!self.studio_busy).then_some(Msg::StudioDeleteAsk(name.clone()))),
-                ].spacing(3),
-            );
-        }
-        if self.studio_samples.is_empty() {
-            library = library.push(caption("Запишите микрофон или добавьте WAV, MP3, OGG, M4A."));
-        }
-        let library = scrollable(library).height(if compact { 160 } else { 330 });
-        let bar_label: Element<'_, Msg> = if compact {
-            action(medium("Звуки", 11, INK), Msg::StudioLibraryToggle, self.focus == LIBRARY, false).into()
-        } else { label("Такт", 12, DIM).into() };
-        let mut bars = row![bar_label].spacing(6).align_y(iced::Center);
-        for bar in 0..studio::BARS {
-            bars = bars.push(action(medium(format!("{}", bar + 1), 12, if bar == self.studio_bar { ORANGE_DARK } else { INK }),
-                Msg::StudioBar(bar), self.focus == BAR_BASE + bar, bar == self.studio_bar));
-        }
-        let mut loop_strip = row![container(label("Луп", 10, DIM)).width(50)].spacing(0).align_y(iced::Center);
-        for step in 0..studio::STEPS {
-            let inside = step >= self.studio_loop_start && step < self.studio_loop_end;
-            let edge = step == self.studio_loop_start || step + 1 == self.studio_loop_end;
-            let playing = self.sound_playing.0 == studio::TRACK_ID && self.studio_cursor as usize == step;
-            let cell = container(Space::new().height(10)).width(Length::FillPortion(1)).height(10)
-                .style(move |_| container::Style {
-                    background: Some((if playing { INK } else if inside && edge { ORANGE }
-                        else if inside && self.studio_loop { Color::from_rgb8(0xA6, 0x68, 0x39) }
-                        else { CARD2 }).into()),
-                    ..Default::default()
-                });
-            loop_strip = loop_strip.push(mouse_area(cell)
-                .on_press(Msg::StudioLoopGrab(step))
-                .on_right_press(Msg::StudioLoopStart(step))
-                .on_enter(Msg::StudioLoopMove(step))
-                .interaction(iced::mouse::Interaction::Grab));
-        }
-        let cursor_bar = (self.studio_cursor as usize / 16).min(studio::BARS - 1);
-        let cursor_here = cursor_bar == self.studio_bar;
-        let cursor_step = self.studio_cursor.min((studio::STEPS - 1) as f32) as usize % 16;
-        let mut header = row![container(label("Нота", 11, DIM)).width(50)].spacing(2).align_y(iced::Center);
-        for step in 0..16 {
-            let active = cursor_here && step == cursor_step;
-            let focused = active && self.focus == CURSOR;
-            let number = container(focus_target(numbers(format!("{:02}", self.studio_bar * 16 + step + 1), 10,
-                if active { ORANGE_DARK } else if step.is_multiple_of(4) { ORANGE } else { FAINT }), focused))
-                .width(cell_width).height(18).center_x(cell_width).center_y(18)
-                .style(move |_| container::Style {
-                    background: active.then(|| ORANGE.into()),
-                    border: outline(focused),
-                    ..Default::default()
-                });
-            header = header.push(mouse_area(number)
-                .on_press(Msg::StudioGrab(self.studio_bar * 16 + step))
-                .on_enter(Msg::StudioDrag(self.studio_bar * 16 + step))
-                .interaction(iced::mouse::Interaction::Grab));
-        }
-        let focused_row = self.focus.checked_sub(CELL_BASE)
-            .filter(|&i| i < 16 * studio::NOTES)
-            .map(|i| studio::NOTES - 1 - i % studio::NOTES);
-        let mounted = sound_rows(studio::NOTES, self.studio_scroll.0, self.studio_scroll.1, pitch, focused_row);
-        let mut events = [None; 16 * studio::NOTES];
-        for event in self.studio_events.iter().filter(|e| (e.step as usize) < (self.studio_bar + 1) * 16
-            && e.step as usize + e.length as usize > self.studio_bar * 16) {
-            if let Some(row_note) = event.note.checked_sub(studio::FIRST_NOTE)
-                && (row_note as usize) < studio::NOTES
-            {
-                for step in (event.step as usize).max(self.studio_bar * 16)
-                    ..(event.step as usize + event.length as usize).min((self.studio_bar + 1) * 16) {
-                    events[(step % 16) * studio::NOTES + row_note as usize] = Some(event);
-                }
-            }
-        }
-        let mut grid: widget::keyed::Column<'_, usize, Msg> = widget::keyed::Column::new().spacing(3);
-        let mut next = 0;
-        for at in mounted {
-            if at > next {
-                grid = grid.push(usize::MAX - next, Space::new().height((at - next) as f32 * pitch - 3.0));
-            }
-            next = at + 1;
-            let row_note = studio::NOTES - 1 - at;
-            let note = studio::FIRST_NOTE + row_note as u8;
-            let note_color = if note == studio::ROOT_NOTE { ORANGE } else if note.is_multiple_of(12) { INK } else { DIM };
-            let mut line = row![container(label(studio::note_name(note), 11, note_color)).width(50)].spacing(2).align_y(iced::Center);
-            for cell in 0..16 {
-                let step = self.studio_bar * 16 + cell;
-                let event = events[cell * studio::NOTES + row_note];
-                let active = event.is_some();
-                let own = event.is_some_and(|e| Some(&e.sample) == self.studio_selected.as_ref());
-                let focused = self.focus == CELL_BASE + cell * studio::NOTES + row_note;
-                let beat = cell.is_multiple_of(4);
-                let tile = container(focus_target(label(if event.is_some_and(|e| e.step as usize == step) { "●" }
-                    else if active { "━" } else { "·" }, if zoom == 50 { 10 } else { 13 },
-                    if own { ORANGE_DARK } else if active { INK } else { FAINT }), focused))
-                    .width(cell_width).height(pitch - 3.0).center_x(cell_width).center_y(pitch - 3.0)
-                    .style(move |_| container::Style {
-                        background: Some((if own { ORANGE } else if active { Color::from_rgb8(0x62, 0x67, 0x70) }
-                            else if beat { CARD2 } else { Color::from_rgb8(0x20, 0x21, 0x24) }).into()),
-                        border: outline(focused),
-                        ..Default::default()
-                    });
-                line = line.push(mouse_area(tile)
-                    .on_press(Msg::StudioDrawStart(step, note))
-                    .on_right_press(Msg::StudioEraseStart(step, note))
-                    .on_enter(Msg::StudioCellEnter(step, note))
-                    .interaction(iced::mouse::Interaction::Crosshair));
-            }
-            grid = grid.push(at, line);
-        }
-        if next < studio::NOTES {
-            grid = grid.push(usize::MAX - next, Space::new().height((studio::NOTES - next) as f32 * pitch - 3.0));
-        }
-        let roll = scrollable(grid).id("studio-roll")
-            .on_scroll(|v| Msg::StudioScroll(v.absolute_offset().y, v.bounds().height))
-            .height(roll_height).width(Length::Fill);
-        let roll: Element<'_, Msg> = if cursor_here {
-            let x = 52.0 + (self.studio_cursor - self.studio_bar as f32 * 16.0) * (cell_width + 2.0);
-            let line = row![Space::new().width(x).height(roll_height),
-                container(Space::new().width(2).height(roll_height)).width(2).style(|_| container::Style {
-                    background: Some(ORANGE.into()), ..Default::default()
-                })].height(roll_height);
-            widget::stack![roll, line].height(roll_height).width(Length::Fill).into()
-        } else { roll.into() };
-        let mut piano = column![
-            row![bars, Space::new().width(Length::Fill), action(medium("Очистить такт", 11, INK), Msg::StudioClear, self.focus == CLEAR, false)]
-                .align_y(iced::Center),
-        ].spacing(if compact { 5 } else { 7 });
-        if !compact { piano = piano.push(label("ЛКМ: протянуть ноту · ПКМ: стереть · Линейка: перемотка", 11, DIM)); }
-        let piano = piano.push(loop_strip).push(header).push(roll);
-        let workspace: Element<'_, Msg> = if compact {
-            if self.studio_library_open { library.into() } else { piano.into() }
-        } else {
-            row![library, container(piano).width(Length::Fill)].spacing(16).into()
-        };
-        let record = action(medium(if recording { "Остановить запись" } else { "Записать звук" }, 13,
-            if recording { INK } else { ORANGE_DARK }), Msg::StudioRecord, self.focus == RECORD, !recording);
-        let bpm = row![
-            label("BPM", 12, DIM),
-            action(medium("−", 15, INK), Msg::StudioBpm(self.studio_bpm.saturating_sub(1)), self.focus == BPM, false),
-            numbers(format!("{}", self.studio_bpm), 17, ORANGE),
-            action(medium("+", 15, INK), Msg::StudioBpm(self.studio_bpm + 1), self.focus == BPM, false),
-        ].spacing(7).align_y(iced::Center);
-        let actions = row![
-            frame(switch(self.sound_monitor, Msg::SoundpadHear, true), self.focus == HEAR),
-            label("Слышать самому", 12, DIM),
-            action(medium("Стоп", 12, INK), Msg::SoundpadStop, self.focus == STOP, false),
-            action(medium("Играть в Discord", 12, if self.studio_events.is_empty() { INK } else { ORANGE_DARK }), Msg::StudioRender(false), self.focus == PLAY, !self.studio_events.is_empty())
-                .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(false))),
-        ].spacing(7).align_y(iced::Center);
-        let transport: Element<'_, Msg> = if compact {
-            column![
-                row![bpm, Space::new().width(Length::Fill),
-                    action(medium("В Discord", 12, ORANGE_DARK), Msg::StudioRender(false), self.focus == PLAY, !self.studio_events.is_empty())
-                        .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(false)))].align_y(iced::Center),
-                row![record, Space::new().width(Length::Fill),
-                    frame(switch(self.studio_loop, Msg::StudioLoopEnabled, true), self.focus == LOOP),
-                    label("Луп", 11, DIM),
-                    frame(switch(self.sound_monitor, Msg::SoundpadHear, true), self.focus == HEAR),
-                    label("Себе", 11, DIM),
-                    action(medium("Стоп", 11, INK), Msg::SoundpadStop, self.focus == STOP, false)]
-                    .spacing(5).align_y(iced::Center),
-            ].spacing(7).into()
-        } else {
-            row![record, Space::new().width(16), bpm, Space::new().width(Length::Fill), actions]
-                .align_y(iced::Center).into()
-        };
-        let loop_tools = row![
-            frame(switch(self.studio_loop, Msg::StudioLoopEnabled, true), self.focus == LOOP),
-            label("Луп", 12, DIM),
-            action(medium(format!("От {:02}", self.studio_loop_start + 1), 11, INK),
-                Msg::StudioLoopStart(self.studio_cursor as usize), self.focus == LOOP_START, false),
-            action(medium(format!("До {:02}", self.studio_loop_end), 11, INK),
-                Msg::StudioLoopEnd(self.studio_cursor as usize + 1), self.focus == LOOP_END, false),
-        ].spacing(7).align_y(iced::Center);
-        let zoom_tools = row![
-            label("Ноты", 11, DIM),
-            action(medium("−", 14, INK), Msg::StudioZoom(self.studio_zoom.saturating_sub(1)), self.focus == ZOOM, false),
-            numbers(format!("{}%", zoom), 12, ORANGE),
-            action(medium("+", 14, INK), Msg::StudioZoom((self.studio_zoom + 1).min(studio::ZOOMS.len() - 1)), self.focus == ZOOM, false),
-        ].spacing(4).align_y(iced::Center);
-        let volume_tools = row![
-            label("Трек", 11, DIM),
-            action(medium("−", 14, INK), Msg::StudioVolume(self.studio_volume.saturating_sub(10)), self.focus == VOLUME, false),
-            numbers(format!("{}%", self.studio_volume), 12, ORANGE),
-            action(medium("+", 14, INK), Msg::StudioVolume((self.studio_volume + 10).min(200)), self.focus == VOLUME, false),
-        ].spacing(4).align_y(iced::Center);
-        let tools: Element<'_, Msg> = if compact {
-            column![loop_tools, row![zoom_tools, Space::new().width(16), volume_tools]].spacing(8).into()
-        } else {
-            row![loop_tools, Space::new().width(Length::Fill), zoom_tools,
-                Space::new().width(18), volume_tools].align_y(iced::Center).into()
-        };
-        let heading = row![title("Студия"), Space::new().width(Length::Fill), label("4 такта · C2–B5", 12, DIM)].align_y(iced::Center);
-        let footer = row![
-            action(medium("Сохранить WAV", 12, INK), Msg::StudioRender(true), self.focus == EXPORT, false)
-                .on_press_maybe((!self.studio_busy && !self.studio_events.is_empty()).then_some(Msg::StudioRender(true))),
-            label(&self.studio_note, 12, if self.studio_note.starts_with("Не удалось") || self.studio_note.starts_with("Сборка") { RED } else { DIM }),
-        ].spacing(12).align_y(iced::Center);
-        if compact {
-            column![heading, card(transport), card(workspace), card(tools), footer].spacing(9).into()
-        } else {
-            column![heading, lead("Соберите короткий трек и отправьте его в виртуальный микрофон."),
-                card(column![transport, tools].spacing(10)), card(workspace), footer].spacing(12).into()
-        }
-    }
-
     fn soundpad_view(&self) -> Element<'_, Msg> {
+        // Below ~760 px of page (the 960 px window) the fixed columns give way to names.
+        widget::responsive(|size| self.soundpad_layout(size.width < 760.0)).into()
+    }
+    fn soundpad_layout(&self, narrow: bool) -> Element<'_, Msg> {
         use focus::soundpad::*;
         let clock = self.clock();
         let (playing_id, position, length) = self.sound_playing;
@@ -2806,7 +2560,7 @@ impl App {
                         .style(input_style)),
                     self.focus == FILTER,
                 ))
-                .width(220),
+                .width(if narrow { 116 } else { 220 }),
             );
             toolbar = toolbar.push(frame(
                 repaint(self.sound_sort.to_string(), pick_list(SoundSort::ALL, Some(self.sound_sort), Msg::SoundpadSort)
@@ -2827,10 +2581,30 @@ impl App {
         let folder_name = self.sound_folder.as_ref().map(|f| f.to_string_lossy().into_owned());
         let mut body = column![toolbar].spacing(12);
         if let Some(name) = folder_name {
-            body = body.push(row![icon(glyph::FOLDER, 11, FAINT), label(name, 12, FAINT)].spacing(8).align_y(iced::Center));
+            let focused = self.focus == OPEN_FOLDER;
+            body = body.push(
+                button(focus_target(
+                    row![icon(glyph::FOLDER, 11, FAINT), label(name, 12, FAINT), icon(glyph::OPEN, 10, FAINT)].spacing(8).align_y(iced::Center),
+                    focused,
+                ))
+                .padding([2, 6])
+                .on_press(Msg::SoundpadOpenFolder)
+                .style(move |_, status| button::Style {
+                    background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
+                    text_color: INK,
+                    border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
+                    ..Default::default()
+                }),
+            );
         }
-        if !self.sound_note.is_empty() {
-            body = body.push(label(&self.sound_note, 12, if self.sound_note.starts_with("Добавлено") || self.sound_note.starts_with('«') { GREEN } else { DIM }));
+        if self.sound_drop_hover {
+            body = body.push(label("Отпустите файлы: звуки скопируются в папку саундпада", 12, ORANGE));
+        } else if !self.sound_note.is_empty() {
+            body = body.push(label(&self.sound_note, 12, match self.sound_tone {
+                super::Tone::Done => GREEN,
+                super::Tone::Error => RED,
+                super::Tone::Info => DIM,
+            }));
         }
         if self.sound_folder.is_none() {
             return body
@@ -2843,19 +2617,19 @@ impl App {
                     ]
                     .spacing(10),
                 ))
-                .push(self.soundpad_footer(clock, playing, playing_id, position, length))
+                .push(self.soundpad_footer(clock, playing, playing_id, position, length, narrow))
                 .into();
         }
         let custom = self.custom_section();
         body = body.push(
-            row![self.section_sidebar(custom), self.sound_list(&visible, custom, playing_id, position, length, clock)]
+            row![self.section_sidebar(custom, narrow), self.sound_list(&visible, custom, playing_id, position, clock, narrow)]
                 .spacing(16)
                 .height(Length::Fill),
         );
-        body.push(self.soundpad_footer(clock, playing, playing_id, position, length)).height(Length::Fill).into()
+        body.push(self.soundpad_footer(clock, playing, playing_id, position, length, narrow)).height(Length::Fill).into()
     }
     /// Now playing on top, the soundpad-wide controls below.
-    fn soundpad_footer(&self, clock: Clock, playing: bool, playing_id: u32, position: f32, length: f32) -> Element<'_, Msg> {
+    fn soundpad_footer(&self, clock: Clock, playing: bool, playing_id: u32, position: f32, length: f32, narrow: bool) -> Element<'_, Msg> {
         use focus::soundpad::*;
         let name = (playing_id != 0)
             .then(|| self.sounds.iter().enumerate().find(|(i, _)| super::App::sound_id(*i) == playing_id))
@@ -2879,7 +2653,7 @@ impl App {
                     numbers(if playing { format!("{} / {}", clock_text(position), clock_text(length)) } else { String::new() }, 12, DIM),
                 ]
                 .spacing(12),
-                meter(if playing && length > 0.0 { position / length } else { 0.0 }, ORANGE),
+                frame(meter(if playing && length > 0.0 { position / length } else { 0.0 }, ORANGE, playing && length > 0.0), self.focus == SEEK),
             ]
             .spacing(6)
             .width(Length::Fill),
@@ -2895,7 +2669,7 @@ impl App {
                 tacho(0.0..=200.0, self.sound_volume * 100.0, Msg::SoundpadVolume, clock).default(100.0).segments(18).compact().phase(0.0),
                 self.ring(self.focus == VOLUME),
             ))
-            .width(250),
+            .width(if narrow { 180 } else { 250 }),
             frame(switch(self.sound_normalize, Msg::SoundpadNormalize, true), self.focus == NORMALIZE),
             label("выравнивать", 12, DIM),
             frame(switch(self.sound_monitor, Msg::SoundpadHear, true), self.focus == HEAR),
@@ -2912,7 +2686,7 @@ impl App {
     }
     /// Left column: "all", automatic prefix groups, custom sections, and the editor of the
     /// selected custom section. Custom entries are drop targets while a clip is dragged.
-    fn section_sidebar(&self, custom: Option<usize>) -> Element<'_, Msg> {
+    fn section_sidebar(&self, custom: Option<usize>, narrow: bool) -> Element<'_, Msg> {
         use focus::soundpad::*;
         let items = self.section_items();
         let mut list = column![].spacing(2);
@@ -2971,7 +2745,7 @@ impl App {
             action(medium("+ Новый раздел", 12, DIM), Msg::SectionAdd, self.focus == SECTION_ADD, false).width(Length::Fill),
         ]
         .spacing(6)
-        .width(180)
+        .width(if narrow { 150 } else { 180 })
         .height(Length::Fill);
         if custom.is_some() {
             sidebar = sidebar.push(
@@ -2999,17 +2773,26 @@ impl App {
     }
     /// Header plus the virtualised clip list in its own scrollable (id "body" so keyboard
     /// focus reveal keeps working here).
-    fn sound_list(&self, visible: &[usize], custom: Option<usize>, playing_id: u32, position: f32, length: f32, clock: Clock) -> Element<'_, Msg> {
+    fn sound_list(&self, visible: &[usize], custom: Option<usize>, playing_id: u32, position: f32, clock: Clock, narrow: bool) -> Element<'_, Msg> {
         use focus::soundpad::*;
+        // Fixed columns, so the header lines up whatever key a row shows.
+        let (volume_width, key_width) = if narrow { (96.0, 116.0) } else { (130.0, 140.0) };
+        // Widths follow the row: grip and play icon, name with the length at its right edge
+        // (inside the play button's 6 px padding), volume, key, edit button, and ×.
         let header = row![
             Space::new().width(46),
-            overline("Звук").width(Length::Fill),
-            overline("Громкость").width(170),
-            overline("Клавиша").width(if custom.is_some() { 164 } else { 130 }),
+            row![overline("Звук").width(Length::Fill), overline("Длина")]
+                .padding(iced::Padding { right: 6.0, ..Default::default() })
+                .width(Length::Fill),
+            overline("Громкость").width(volume_width),
+            overline("Клавиша").width(key_width),
+            Space::new().width(if custom.is_some() { 58 } else { 24 }),
         ]
-        .spacing(10);
+        .spacing(10)
+        // The rows leave 10 px on the right for the floating scrollbar.
+        .padding(iced::Padding { right: 10.0, ..Default::default() });
         if self.sounds.is_empty() {
-            return column![header, label("В папке пока нет mp3, wav, ogg или m4a.", 13, DIM)].spacing(8).into();
+            return column![header, label("В папке пока нет mp3, wav, ogg или m4a. Нажмите «Добавить звуки» или перетащите файлы в окно.", 13, DIM)].spacing(8).into();
         }
         if visible.is_empty() {
             return column![
@@ -3039,11 +2822,12 @@ impl App {
             let dragged = self.dragging == Some(i);
             let stem = sound.name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&sound.name);
             let status = match &sound.state {
-                _ if lit => format!("{} / {}", clock_text(position), clock_text(length)),
+                _ if lit => clock_text(position), // the footer shows position / length
                 SoundState::Loaded(seconds) => clock_text(*seconds),
                 SoundState::Loading => "загрузка…".into(),
-                SoundState::Failed(e) => e.clone(),
-                SoundState::Unloaded => String::new(),
+                // The full error is in the note line above the list.
+                SoundState::Failed(_) => "ошибка".into(),
+                SoundState::Unloaded => sound.length.map(clock_text).unwrap_or_default(),
             };
             let failed = matches!(sound.state, SoundState::Failed(_));
             let play_focused = self.focus == ROW_BASE + 3 * i;
@@ -3063,7 +2847,10 @@ impl App {
                             border: Border { color: if lit { ORANGE } else { Color::from_rgb8(0x34, 0x35, 0x3A) }, width: 1.0, radius: 13.0.into() },
                             ..Default::default()
                         }),
-                    label(stem, 13, if lit { Color::from_rgb8(0xFF, 0xB2, 0x7A) } else { INK }).width(Length::Fill),
+                    // One line: a wrapped name overflows the fixed row height.
+                    container(label(stem, 13, if lit { Color::from_rgb8(0xFF, 0xB2, 0x7A) } else { INK }).wrapping(iced::widget::text::Wrapping::None))
+                        .width(Length::Fill)
+                        .clip(true),
                     numbers(status, 12, if failed { RED } else if lit { ORANGE } else { FAINT }),
                 ]
                 .spacing(10)
@@ -3096,7 +2883,7 @@ impl App {
                     tacho(0.0..=200.0, sound.volume as f32, move |v| Msg::SoundVolume(i, v), Clock { animate: false, ..clock })
                         .wheel(false)
                         .default(100.0)
-                        .segments(12)
+                        .segments(if narrow { 5 } else { 8 })
                         .compact(),
                     self.ring(volume_focused),
                 )
@@ -3104,8 +2891,50 @@ impl App {
                 Space::new().into()
             };
             let bind = self.bind_button(super::SOUND_BIND_BASE + i, sound.key, self.focus == ROW_BASE + 3 * i + 2, false, 130.0);
-            let mut line = row![grip, play, container(volume).width(170), bind].spacing(10).height(ROW_HEIGHT).align_y(iced::Center);
-            if custom.is_some() {
+            let edit_focused = self.focus == EDIT_BASE + i;
+            let edit: Element<'_, Msg> = if self.sound_hover == Some(i) || edit_focused {
+                button(focus_target(container(icon(glyph::MORE, 12, DIM)).center(Length::Fill), edit_focused))
+                    .width(24)
+                    .height(24)
+                    .padding(0)
+                    .on_press(Msg::SoundEdit(Some(i)))
+                    .style(move |_, status| button::Style {
+                        background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
+                        text_color: INK,
+                        border: Border { color: if edit_focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
+                        ..Default::default()
+                    })
+                    .into()
+            } else {
+                Space::new().width(24).into()
+            };
+            let mut line = row![grip, play, container(volume).width(volume_width), container(bind).width(key_width), edit].spacing(10).height(ROW_HEIGHT).align_y(iced::Center);
+            if self.sound_edit == Some(i) {
+                let small = |text: &'static str, color: Color, message: Msg, focused: bool, accent: bool| {
+                    action(medium(text, 12, color), message, focused, accent).padding([4, 10])
+                };
+                line = row![
+                    Space::new().width(14),
+                    container(frame(
+                        repaint(&self.sound_edit_name, text_input("Имя файла без расширения", &self.sound_edit_name)
+                            .id("sound-name")
+                            .size(12)
+                            .padding([5, 8])
+                            .on_input(Msg::SoundEditName)
+                            .on_submit(Msg::SoundRename)
+                            .style(input_style)),
+                        self.focus == EDIT_NAME,
+                    ))
+                    .width(Length::Fill),
+                    small("Переименовать", ORANGE_DARK, Msg::SoundRename, self.focus == EDIT_SAVE, true),
+                    small(if self.sound_delete_armed { "Точно удалить?" } else { "Удалить" }, RED, Msg::SoundDelete, self.focus == EDIT_DELETE, false),
+                    small("Отмена", INK, Msg::SoundEdit(None), self.focus == EDIT_CANCEL, false),
+                ]
+                .spacing(10)
+                .height(ROW_HEIGHT)
+                .align_y(iced::Center);
+            }
+            if custom.is_some() && self.sound_edit != Some(i) {
                 line = line.push(
                     button(container(icon(glyph::CLOSE, 9, RED)).center(Length::Fill))
                         .width(24)
@@ -3423,7 +3252,7 @@ mod tests {
             app.sound_folder = Some(PathBuf::from("test sounds"));
             app.sounds = (0..100).map(|i| Sound {
                 name: format!("Section {} - Sound {i:03}.wav", i / 5), path: PathBuf::new(),
-                key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Unloaded,
+                key: 0, volume: 100, played: 0, modified: 0, length: None, state: SoundState::Unloaded,
             }).collect();
         }
         let scale: f32 = std::env::var("MNR_SCROLL_BENCH_SCALE").ok()
@@ -3708,7 +3537,7 @@ mod tests {
         app.sound_folder = Some(PathBuf::from("test sounds"));
         app.sounds = (0..454).map(|i| Sound {
             name: format!("Section {} - Sound {i:03}.wav", i / 5), path: PathBuf::new(),
-            key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Unloaded,
+            key: 0, volume: 100, played: 0, modified: 0, length: None, state: SoundState::Unloaded,
         }).collect();
         for (name, page) in [("main", 0u8), ("effects", 6), ("soundpad", 4), ("rvc", 1), ("settings", 2), ("logs", 5)] {
             let _ = app.update(Msg::Page(page));
@@ -4103,10 +3932,11 @@ mod tests {
                 volume: 100,
                 played: 0,
                 modified: 0,
+                length: None,
                 state: SoundState::Loaded(1.4),
             }).collect();
             app.sound_playing = (App::clip_id(1, false), 0.56, 1.4);
-            for (name, page) in [("effects", 6u8), ("main", 0), ("settings", 2), ("studio", 7)] {
+            for (name, page) in [("effects", 6u8), ("main", 0), ("settings", 2)] {
                 let _ = app.update(Msg::Page(page));
                 app.page_shift = None;
                 scale.set(1.0);
@@ -4331,7 +4161,7 @@ mod tests {
         app.effects_page = true;
         app.clips = (0..6).map(|i| Sound {
             name: format!("Запись 2026-09-25 14-2{i}-0{i} (mix).wav"), path: PathBuf::new(),
-            key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
+            key: 0, volume: 100, played: 0, modified: 0, length: None, state: SoundState::Loaded(2.4),
         }).collect();
         render(&app, "effects");
         app.sound_playing = (super::App::clip_id(1, false), 1.0, 2.4);
@@ -4348,7 +4178,7 @@ mod tests {
         window.set((960.0, 680.0));
         render(&app, "effects-clip-sheet-min");
         app.sounds = ["gerych - a.mp3", "gerych - b.mp3", "nastya - c.mp3", "nastya - d.mp3"].map(|name| Sound {
-            name: name.into(), path: PathBuf::new(), key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Unloaded,
+            name: name.into(), path: PathBuf::new(), key: 0, volume: 100, played: 0, modified: 0, length: None, state: SoundState::Unloaded,
         }).into();
         app.clip_section = super::Selection::Group("gerych".into());
         render(&app, "effects-clip-sheet-group-min");
@@ -4386,11 +4216,44 @@ mod tests {
         app.sound_folder = Some(PathBuf::from(r"E:\Dropbox\sounds"));
         app.sounds = ["a chto", "a-a chevo", "aga spasiba", "aleeo", "bogdan - 48chasov", "bruh", "chto proishodit", "davay davay", "gerych - nu davay", "nastya - privet"]
             .iter().map(|n| Sound {
-                name: format!("{n}.wav"), path: PathBuf::new(), key: 0, volume: 100, played: 0, modified: 0,
+                name: format!("{n}.wav"), path: PathBuf::new(), key: 0, volume: 100, played: 0, modified: 0, length: None,
                 state: SoundState::Loaded(3.0),
             }).collect();
         app.sound_scroll = (0.0, 420.0);
         render(&app, "soundpad");
+        // Finished states: header lengths before decoding, a failed file, the row editor,
+        // a playing clip with the keyboard on its seek bar, a custom section, and a drag from Explorer.
+        app.sounds[1].state = SoundState::Unloaded;
+        app.sounds[1].length = Some(12.4);
+        app.sounds[2].state = SoundState::Failed("Формат не распознан".into());
+        app.say_sound(super::Tone::Error, "Не удалось открыть «aga spasiba.wav»: Формат не распознан");
+        app.sound_edit = Some(3);
+        app.sound_edit_name = "aleeo".into();
+        app.sound_delete_armed = true;
+        app.sound_hover = Some(4);
+        app.sound_playing = (App::sound_id(5), 1.2, 3.0);
+        app.focus = focus::soundpad::SEEK;
+        app.focus_visible = true;
+        for (w, h, name) in [(1040.0, 740.0, "soundpad-states"), (960.0, 680.0, "soundpad-states-min")] {
+            window.set((w, h));
+            render(&app, name);
+        }
+        app.sections = vec![soundpad::Section { name: "Мемы".into(), files: app.sounds.iter().map(|s| s.name.clone()).collect() }];
+        app.section = super::Selection::Custom(0);
+        app.sound_drop_hover = true;
+        render(&app, "soundpad-section-drop-min");
+        scale.set(2.0);
+        render(&app, "soundpad-section-drop-min-200pct");
+        scale.set(1.0);
+        window.set((1040.0, 740.0));
+        app.sections.clear();
+        app.section = super::Selection::All;
+        app.sound_drop_hover = false;
+        app.sound_edit = None;
+        app.sound_hover = None;
+        app.sound_playing = (0, 0.0, 0.0);
+        app.focus = focus::NONE;
+        app.focus_visible = false;
         app.soundpad_page = false;
         app.rvc_page = true;
         render(&app, "rvc");
@@ -4426,13 +4289,6 @@ mod tests {
         assert_eq!(sound_rows(3, 12_800.0, 640.0, 32.0, None), vec![0, 1, 2]);
         assert_eq!(sound_rows(3, 12_800.0, 640.0, 32.0, Some(1)), vec![0, 1, 2]);
         assert!(sound_rows(0, 0.0, 640.0, 32.0, Some(0)).is_empty());
-    }
-    #[test]
-    fn studio_roll_mounts_only_visible_notes() {
-        let rows = sound_rows(studio::NOTES, studio_offset(studio::ROOT_NOTE, 100, 300.0), 300.0, 28.0, Some(47));
-        assert!(rows.len() <= 22, "the roll must not rebuild all 48 note rows");
-        assert!(rows.contains(&23), "C4 starts in the viewport");
-        assert!(rows.contains(&47), "an off-screen keyboard target stays mounted");
     }
     #[test]
     fn clock_formats_minutes() {
